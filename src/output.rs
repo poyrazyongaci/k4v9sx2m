@@ -27,6 +27,17 @@ pub const CAMP_SCHEMA: [ColSpec; 7] = [
     ColSpec { name: "assisted_sessions", phys: Phys::Int64, logical: Logical::None, optional: false },
 ];
 
+/// The compact user_daily schema: 32-bit revenue. Rows that do not fit go
+/// to a second file with `USER_SCHEMA`.
+pub const USER_SCHEMA_COMPACT: [ColSpec; 6] = [
+    USER_SCHEMA[0],
+    USER_SCHEMA[1],
+    USER_SCHEMA[2],
+    USER_SCHEMA[3],
+    ColSpec { name: "revenue_cents", phys: Phys::Int32, logical: Logical::None, optional: false },
+    USER_SCHEMA[5],
+];
+
 /// Wide (64-bit counts) user_daily schema for the fallback path.
 const USER_SCHEMA_WIDE: [ColSpec; 6] = [
     USER_SCHEMA[0],

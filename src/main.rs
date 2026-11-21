@@ -10,6 +10,7 @@ mod sys;
 #[cfg(test)]
 mod tests;
 mod ts;
+mod usercols;
 
 use std::path::PathBuf;
 
@@ -18,6 +19,11 @@ static GLOBAL: alloc::Bump = alloc::Bump;
 
 fn main() {
     let started = std::time::Instant::now();
+    let epoch = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let timing = std::env::var_os("ENGINE_TIMING").is_some();
+    if timing {
+        eprintln!("[engine] start epoch {:.3}", epoch());
+    }
     let args: Vec<String> = std::env::args().collect();
     let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
     let (data, out) = if args.len() >= 3 {
@@ -36,6 +42,14 @@ fn main() {
     if naive_only || engine::run(&data, Some(&out), &lookups, &cfg, started).is_none() {
         let tables = naive::run(&data, &lookups);
         output::write_tables(&out, &tables);
+    }
+    // Off by default: measured in the container, it costs about 10 ms and
+    // saves nothing, because huge pages already make exit cheap.
+    if std::env::var("ENGINE_RELEASE").is_ok_and(|v| v == "1") {
+        sys::release_all(cfg.threads);
+    }
+    if timing {
+        eprintln!("[engine] exit at {:.1} ms, epoch {:.3}", started.elapsed().as_secs_f64() * 1e3, epoch());
     }
     sys::exit_now(0);
 }

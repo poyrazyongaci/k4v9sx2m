@@ -154,6 +154,13 @@ struct GroupMeta {
     chunks: Vec<ChunkMeta>,
 }
 
+#[cfg(target_os = "linux")]
+fn early_writeback() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ENGINE_WRITEBACK").map_or(true, |v| v != "0"))
+}
+
 pub struct PqFile {
     fd: i32,
     offset: u64,
@@ -270,6 +277,14 @@ impl PqFile {
             }
         }
         write_all_vectored(self.fd, &parts);
+        #[cfg(target_os = "linux")]
+        if early_writeback() {
+            // Ask the kernel to start writing these pages now, without
+            // waiting for them. See NOTES.md, exit cost.
+            unsafe {
+                libc::sync_file_range(self.fd, self.offset as i64, (offset - self.offset) as i64, libc::SYNC_FILE_RANGE_WRITE);
+            }
+        }
         self.groups.push(GroupMeta { rows: rows as u64, bytes: offset - self.offset, chunks });
         self.offset = offset;
     }
@@ -384,6 +399,17 @@ pub fn bitpack_run(values: impl Iterator<Item = u32>, count: usize, width: u32, 
         out.push(acc as u8);
     }
     out.resize(start + groups * width as usize, 0);
+}
+
+/// One RLE run of the hybrid encoding: `count` copies of `value`.
+pub fn rle_run(count: usize, value: u32, width: u32, out: &mut Vec<u8>) {
+    let mut v = (count as u64) << 1;
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+    out.extend_from_slice(&value.to_le_bytes()[..width.div_ceil(8) as usize]);
 }
 
 /// Definition levels for an optional flat column: a 4-byte length, then the

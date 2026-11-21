@@ -11,15 +11,15 @@
 //! 3. person: per person partition, group by person, sort by ts, sessionize,
 //!    attribute clicks, aggregate, and write user_daily row groups.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::common::*;
-use crate::ids::{self, cmp_ids, FALLBACK};
-use crate::output::{write_camp_rows, USER_SCHEMA};
-use crate::parquet::{as_bytes, bitpack_run, def_levels, plain_bytes, Page, PqFile};
+use crate::ids::{self, cmp_ids};
+use crate::output::write_camp_rows;
+use crate::usercols::UserOut;
 use crate::scan::{for_each_line, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
 use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, DateCache, BAD};
@@ -83,7 +83,6 @@ const CHUNK_BYTES: usize = 16384;
 const CLICK_BLOCK: usize = 16384;
 const WINDOW: usize = 1 << 16;
 const WINDOW_SLACK: usize = 4096;
-const FLUSH_ROWS: usize = 1 << 17;
 
 #[inline(always)]
 fn mix(k: u64) -> u64 {
@@ -526,6 +525,8 @@ struct Resolver<'a> {
 }
 
 const PTR_MASK: u64 = (1 << 48) - 1;
+/// How many link lookups are prefetched ahead of the one in use.
+const AHEAD: usize = 16;
 
 impl<'a> Resolver<'a> {
     /// Dedup one event partition and scatter its surviving valid events by
@@ -579,17 +580,20 @@ impl<'a> Resolver<'a> {
         let ev = &mut self.ev;
         for list in lists {
             list.for_each_chunk(|chunk| {
-                for block in chunk.chunks(32) {
-                    for entry in block {
-                        if entry.w3 != DEAD {
-                            links.prefetch(entry.ukey);
-                        }
+                // The link map is far bigger than the cache: keep a window
+                // of lookups in flight ahead of the one being used.
+                let n = chunk.len();
+                for entry in &chunk[..n.min(AHEAD)] {
+                    links.prefetch(entry.ukey);
+                }
+                for i in 0..n {
+                    if i + AHEAD < n {
+                        links.prefetch(chunk.get_unchecked(i + AHEAD).ukey);
                     }
-                    for entry in block {
-                        if entry.w3 != DEAD {
-                            let pkey = links.person(entry.ukey);
-                            ev.push((mix(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
-                        }
+                    let entry = chunk.get_unchecked(i);
+                    if entry.w3 != DEAD {
+                        let pkey = links.person(entry.ukey);
+                        ev.push((mix(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
                     }
                 }
             });
@@ -612,125 +616,23 @@ impl<'a> Resolver<'a> {
     unsafe fn clicks(&mut self, block: &[Click]) {
         let t = prof::start();
         let links = self.links;
-        for part in block.chunks(32) {
-            for click in part {
-                links.prefetch(click.key);
+        let n = block.len();
+        for click in &block[..n.min(AHEAD)] {
+            links.prefetch(click.key);
+        }
+        for i in 0..n {
+            if i + AHEAD < n {
+                links.prefetch(block.get_unchecked(i + AHEAD).key);
             }
-            for click in part {
-                let pkey = links.person(click.key);
-                self.cl.push((mix(pkey) >> self.shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
-            }
+            let click = block.get_unchecked(i);
+            let pkey = links.person(click.key);
+            self.cl.push((mix(pkey) >> self.shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
         }
         prof::add(6, t);
     }
 }
 
 // ---------------------------------------------------------------- phase 3
-
-/// user_daily rows of one thread, column by column, in Parquet PLAIN layout
-/// where that is free.
-struct UserCols {
-    ids: Vec<u8>,
-    day: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue: Vec<i64>,
-    /// Category id, or 0xFF for null.
-    top: Vec<u8>,
-}
-
-struct Sink<'a> {
-    path: PathBuf,
-    file: Option<PqFile>,
-    dict: Vec<u8>,
-    ncats: usize,
-    collect: Option<&'a Mutex<Vec<UserRow>>>,
-    cats: &'a [Vec<u8>],
-    rows_written: u64,
-}
-
-impl UserCols {
-    fn new() -> Self {
-        UserCols {
-            ids: Vec::with_capacity(FLUSH_ROWS * 14),
-            day: Vec::with_capacity(FLUSH_ROWS + 1024),
-            sessions: Vec::with_capacity(FLUSH_ROWS + 1024),
-            events: Vec::with_capacity(FLUSH_ROWS + 1024),
-            revenue: Vec::with_capacity(FLUSH_ROWS + 1024),
-            top: Vec::with_capacity(FLUSH_ROWS + 1024),
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, pkey: u64, day: i32, sessions: u32, events: u32, revenue: u64, top: u8) {
-        if pkey & FALLBACK == 0 {
-            let mut buf = [0u8; 16];
-            let len = ids::unpack_packed(pkey, &mut buf);
-            self.ids.reserve(16);
-            unsafe {
-                let at = self.ids.as_mut_ptr().add(self.ids.len());
-                (at as *mut u32).write_unaligned((len as u32).to_le());
-                std::ptr::copy_nonoverlapping(buf.as_ptr(), at.add(4), 9);
-                self.ids.set_len(self.ids.len() + 4 + len);
-            }
-        } else {
-            let mut bytes = Vec::new();
-            ids::unpack(pkey, &mut bytes);
-            plain_bytes(&bytes, &mut self.ids);
-        }
-        self.day.push(day);
-        self.sessions.push(sessions as i32);
-        self.events.push(events as i32);
-        self.revenue.push(revenue as i64);
-        self.top.push(top);
-    }
-
-    fn flush(&mut self, sink: &mut Sink) {
-        let n = self.day.len();
-        if let Some(collect) = sink.collect {
-            let mut rows = collect.lock().unwrap();
-            let mut at = 0;
-            for i in 0..n {
-                let len = u32::from_le_bytes(self.ids[at..at + 4].try_into().unwrap()) as usize;
-                rows.push(UserRow {
-                    user_id: self.ids[at + 4..at + 4 + len].to_vec(),
-                    day: self.day[i],
-                    sessions: i64::from(self.sessions[i]),
-                    events: i64::from(self.events[i]),
-                    revenue: self.revenue[i],
-                    top: (self.top[i] != 0xFF).then(|| sink.cats[self.top[i] as usize].clone()),
-                });
-                at += 4 + len;
-            }
-        } else {
-            let file = sink.file.get_or_insert_with(|| PqFile::create(&sink.path, &USER_SCHEMA));
-            let mut top = Vec::with_capacity(n / 4 + 64);
-            def_levels(self.top.iter().map(|&t| t != 0xFF), n, &mut top);
-            let present = self.top.iter().filter(|&&t| t != 0xFF).count();
-            let width = (usize::BITS - (sink.ncats.max(2) - 1).leading_zeros()).max(1);
-            top.push(width as u8);
-            bitpack_run(self.top.iter().filter(|&&t| t != 0xFF).map(|&t| u32::from(t)), present, width, &mut top);
-            file.write_row_group(
-                n,
-                &[
-                    vec![Page::plain(n, vec![&self.ids])],
-                    vec![Page::plain(n, vec![as_bytes(&self.day)])],
-                    vec![Page::plain(n, vec![as_bytes(&self.sessions)])],
-                    vec![Page::plain(n, vec![as_bytes(&self.events)])],
-                    vec![Page::plain(n, vec![as_bytes(&self.revenue)])],
-                    vec![Page::dict_page(sink.ncats, vec![&sink.dict]), Page::dict_indices(n, vec![&top])],
-                ],
-            );
-        }
-        sink.rows_written += n as u64;
-        self.ids.clear();
-        self.day.clear();
-        self.sessions.clear();
-        self.events.clear();
-        self.revenue.clear();
-        self.top.clear();
-    }
-}
 
 struct PersonPhase<'a> {
     fast: &'a Fast<'a>,
@@ -752,8 +654,7 @@ struct PersonPhase<'a> {
     touched: Vec<u8>,
     /// (campaign, day) -> [sessions, purchasing, revenue, assisted]
     agg: Vec<[u64; 4]>,
-    out: UserCols,
-    sink: Sink<'a>,
+    out: UserOut<'a>,
     /// Summed sessions and revenue of the rows emitted, for the self-check.
     check: (u64, u64),
 }
@@ -776,7 +677,7 @@ fn sort_u64(v: &mut [u64]) {
 }
 
 impl<'a> PersonPhase<'a> {
-    fn new(fast: &'a Fast<'a>, sink: Sink<'a>) -> Self {
+    fn new(fast: &'a Fast<'a>, out: UserOut<'a>) -> Self {
         PersonPhase {
             fast,
             tab_keys: Vec::new(),
@@ -794,8 +695,7 @@ impl<'a> PersonPhase<'a> {
             catsum: vec![0; 256],
             touched: Vec::new(),
             agg: vec![[0; 4]; (fast.ncamp + 1) * fast.ndays],
-            out: UserCols::new(),
-            sink,
+            out,
             check: (0, 0),
         }
     }
@@ -957,8 +857,7 @@ impl<'a> PersonPhase<'a> {
             cl_start = cl_end;
         }
         let t = prof::add(8, t);
-        if self.out.day.len() >= FLUSH_ROWS {
-            self.out.flush(&mut self.sink);
+        if self.out.flush_full() {
             prof::add(9, t);
         }
     }
@@ -978,10 +877,9 @@ impl<'a> PersonPhase<'a> {
             }
             self.touched.clear();
         }
-        let day = (self.fast.ws_day + i64::from(day_rel)) as i32;
         self.check.0 += u64::from(sessions);
         self.check.1 += revenue;
-        self.out.push(pkey, day, sessions, events, revenue, top);
+        self.out.push(pkey, day_rel, sessions, events, revenue, top);
     }
 
     #[inline(always)]
@@ -1166,6 +1064,10 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     timer.lap("setup", 0.0);
 
     // ---- phase 1
+    // Parsed chunks are unmapped by the worker that parsed them. Measured
+    // neutral on time at 20M, a little faster at 60M, and it halves peak
+    // RSS (the kernel no longer tears the mappings down inside exit).
+    let drop_pages = std::env::var("ENGINE_DROP").map_or(true, |v| v != "0");
     let next = AtomicUsize::new(0);
     let link_map: Mutex<Option<LinkMap>> = Mutex::new(None);
     let cpu_total = Mutex::new(0.0f64);
@@ -1202,8 +1104,14 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                                 prof::add(3, t);
                                 *link_map.lock().unwrap() = Some(map);
                             }
-                            Kind::Events => parser.run_chunk(event_files[job.file], job.start, job.end, Kind::Events),
-                            Kind::Clicks => parser.run_chunk(click_files[job.file], job.start, job.end, Kind::Clicks),
+                            Kind::Events => {
+                                parser.run_chunk(event_files[job.file], job.start, job.end, Kind::Events);
+                                sys::drop_pages(event_files[job.file], job.start, job.end, drop_pages);
+                            }
+                            Kind::Clicks => {
+                                parser.run_chunk(click_files[job.file], job.start, job.end, Kind::Clicks);
+                                sys::drop_pages(click_files[job.file], job.start, job.end, drop_pages);
+                            }
                         }
                     }
                     *cpu_total.lock().unwrap() += sys::thread_cpu();
@@ -1288,11 +1196,6 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let collected_ref = &collected;
     let mut agg = vec![[0u64; 4]; (fast.ncamp + 1) * fast.ndays];
     let mut total_rows = 0u64;
-    let mut dict = Vec::new();
-    for cat in &lk.cats {
-        plain_bytes(cat, &mut dict);
-    }
-    let dict = &dict;
     let out_dir = out.map(|o| o.join("user_daily"));
     let out_dir = &out_dir;
     let next = &next;
@@ -1302,16 +1205,9 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 scope.spawn(move || unsafe {
-                    let sink = Sink {
-                        path: out_dir.as_ref().map_or_else(PathBuf::new, |d| d.join(format!("part-{t}.parquet"))),
-                        file: None,
-                        dict: dict.clone(),
-                        ncats: lk.cats.len(),
-                        collect: cfg.collect.then_some(collected_ref),
-                        cats: &lk.cats,
-                        rows_written: 0,
-                    };
-                    let mut phase = PersonPhase::new(fast, sink);
+                    let user_out =
+                        UserOut::new(out_dir.as_deref(), t, lk, fast.ws_day, fast.ndays, cfg.collect.then_some(collected_ref));
+                    let mut phase = PersonPhase::new(fast, user_out);
                     let mut evs: Vec<List<Ev>> = Vec::with_capacity(threads);
                     let mut cls: Vec<List<Click>> = Vec::with_capacity(threads);
                     loop {
@@ -1325,14 +1221,11 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                         cls.extend(cl_lists.iter().map(|t| t[p]));
                         phase.partition(&evs, &cls);
                     }
-                    if !phase.out.day.is_empty() {
-                        phase.out.flush(&mut phase.sink);
-                    }
-                    if let Some(file) = phase.sink.file.take() {
-                        file.finish();
-                    }
+                    let t0 = prof::start();
+                    phase.out.finish();
+                    prof::add(9, t0);
                     *cpu_total.lock().unwrap() += sys::thread_cpu();
-                    (phase.agg, phase.sink.rows_written, phase.check)
+                    (phase.agg, phase.out.rows_written, phase.check)
                 })
             })
             .collect();
