@@ -91,6 +91,14 @@ fn mix(k: u64) -> u64 {
     x ^ (x >> 32)
 }
 
+/// A cheaper hash: one multiply, then the high half folded into the low.
+/// The top bits are the top bits of the product.
+#[inline(always)]
+fn mix1(k: u64) -> u64 {
+    let x = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^ (x >> 32)
+}
+
 /// Lookup tables derived from the catalogs for the fast paths.
 struct Fast<'a> {
     lk: &'a Lookups,
@@ -793,6 +801,10 @@ const PTR_MASK: u64 = (1 << 48) - 1;
 /// 256, 512, 1024 and 2048 bytes ahead give 374, 367, 355 and 366 CPU ms
 /// of dedup against 404 to 415 without.
 const DEDUP_AHEAD: usize = 1024;
+/// The same read-ahead for the second walk of the entries (person lookup).
+const EMIT_AHEAD: usize = 1024;
+/// And for the click blocks, which the parser wrote long before.
+const CLICK_AHEAD: usize = 1024;
 /// Link lookups run in blocks of this many records, one stage at a time.
 const BLOCK: usize = 128;
 
@@ -819,7 +831,7 @@ impl<'a> Resolver<'a> {
                     let ahead = entry as *const Entry as usize + DEDUP_AHEAD;
                     let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
                     prefetch(ahead as *const u8);
-                    let h = mix(entry.ekey);
+                    let h = mix1(entry.ekey);
                     let tag = h << 48;
                     let me = entry as *mut Entry;
                     let mut i = (h >> 20) as usize & mask;
@@ -858,9 +870,15 @@ impl<'a> Resolver<'a> {
         let mut hashes = [0u64; BLOCK];
         let mut starts = [0usize; BLOCK];
         for list in lists {
-            list.for_each_chunk(|chunk| {
+            list.for_each_chunk_ahead(|chunk, next| {
+                // The entries left the cache during the dedup walk: read
+                // ahead again, across chunk ends.
+                let end = chunk.as_ptr().add(chunk.len()) as usize;
                 for block in chunk.chunks(BLOCK) {
                     for (h, entry) in hashes.iter_mut().zip(block) {
+                        let ahead = entry as *const Entry as usize + EMIT_AHEAD;
+                        let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
+                        prefetch(ahead as *const u8);
                         *h = links.stage1(entry.ukey);
                     }
                     for (at, &h) in starts.iter_mut().zip(&hashes[..block.len()]) {
@@ -869,7 +887,7 @@ impl<'a> Resolver<'a> {
                     for (&at, entry) in starts.iter().zip(block) {
                         if entry.w3 != DEAD {
                             let pkey = links.stage3(at, entry.ukey);
-                            ev.push((mix(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                            ev.push((mix1(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
                         }
                     }
                 }
@@ -899,6 +917,8 @@ impl<'a> Resolver<'a> {
         let mut starts = [0usize; BLOCK];
         for part in block.chunks(BLOCK) {
             for (h, click) in hashes.iter_mut().zip(part) {
+                // A prefetch past the end of the block is harmless.
+                prefetch((click as *const Click as *const u8).wrapping_add(CLICK_AHEAD));
                 *h = links.stage1(click.key);
             }
             for (at, &h) in starts.iter_mut().zip(&hashes[..part.len()]) {
@@ -906,7 +926,7 @@ impl<'a> Resolver<'a> {
             }
             for (&at, click) in starts.iter().zip(part) {
                 let pkey = links.stage3(at, click.key);
-                cl.push((mix(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+                cl.push((mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
             }
         }
         prof::add(6, t);
