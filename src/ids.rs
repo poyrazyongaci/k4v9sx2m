@@ -69,6 +69,28 @@ pub unsafe fn pack(p: *const u8, len: usize) -> u64 {
     intern(std::slice::from_raw_parts(p, len))
 }
 
+/// `pack` for an ID whose bytes the caller already knows to be in 1..=127
+/// (stage 1 checks whole windows): the same key without the byte checks.
+#[inline(always)]
+pub unsafe fn pack_known(p: *const u8, len: usize) -> u64 {
+    if len <= 9 {
+        let v = load64(p) & *LEN_MASK.get_unchecked(len);
+        let ninth = u64::from(*p.add(8)) & (0u64.wrapping_sub(u64::from(len == 9)));
+        return (squeeze(v.swap_bytes()) << 7) | ninth;
+    }
+    intern(std::slice::from_raw_parts(p, len))
+}
+
+/// `pack`, by the short route when `known` says the bytes are in 1..=127.
+#[inline(always)]
+pub unsafe fn pack_in(p: *const u8, len: usize, known: bool) -> u64 {
+    if known {
+        pack_known(p, len)
+    } else {
+        pack(p, len)
+    }
+}
+
 /// Drop the high bit of each of eight bytes: 64 bits to 56, order kept.
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline(always)]
@@ -222,6 +244,13 @@ mod tests {
             b.extend_from_slice(b",\"\n0123456789abc");
             unsafe {
                 assert_eq!(pack(a.as_ptr(), id.len()), pack(b.as_ptr(), id.len()), "{id:?}");
+                // The short route gives the same key for every ID it may
+                // be used on.
+                if id.iter().all(|&c| (1..=127).contains(&c)) {
+                    assert_eq!(pack_known(a.as_ptr(), id.len()), pack(a.as_ptr(), id.len()), "{id:?}");
+                    assert_eq!(pack_known(b.as_ptr(), id.len()), pack(a.as_ptr(), id.len()), "{id:?}");
+                    assert_eq!(pack_in(b.as_ptr(), id.len(), true), pack_in(b.as_ptr(), id.len(), false), "{id:?}");
+                }
             }
         }
     }

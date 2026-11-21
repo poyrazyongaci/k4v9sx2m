@@ -67,6 +67,59 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+/// Running signed minimum of the bytes scanned. It stays above zero exactly
+/// while every byte is in 1..=127, which is what an ID needs to be packed
+/// without looking at its bytes again.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+type Lowest = core::arch::x86_64::__m256i;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+type Lowest = i8;
+
+#[inline(always)]
+unsafe fn lowest_start() -> Lowest {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        core::arch::x86_64::_mm256_set1_epi8(127)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        127
+    }
+}
+
+/// Fold the 64 bytes at `p` into the minimum.
+#[inline(always)]
+unsafe fn lowest_add(acc: Lowest, p: *const u8) -> Lowest {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        _mm256_min_epi8(acc, _mm256_min_epi8(a, b))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let mut m = acc;
+        for i in 0..64 {
+            m = m.min(*p.add(i) as i8);
+        }
+        m
+    }
+}
+
+#[inline(always)]
+unsafe fn lowest_above_zero(acc: Lowest) -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        _mm256_movemask_epi8(_mm256_cmpgt_epi8(acc, _mm256_setzero_si256())) == -1
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        acc > 0
+    }
+}
+
 /// Portable reference for `masks`; also what the tests compare against.
 #[allow(dead_code)]
 pub unsafe fn masks_scalar(p: *const u8) -> (u64, u64, u64) {
@@ -92,6 +145,9 @@ pub struct Scan {
     /// Positions of quotes with no delimiter on either side.
     pub badq: Vec<u32>,
     pub nd: usize,
+    /// Every byte of the window (and of the up to 63 bytes scanned past
+    /// it) is in 1..=127.
+    pub clean: bool,
 }
 
 const PAD: usize = 80;
@@ -151,6 +207,7 @@ impl Scan {
             fl: vec![0; window + 64 + PAD + 1],
             badq: vec![u32::MAX; window + 64 + PAD],
             nd: 0,
+            clean: false,
         }
     }
 
@@ -181,6 +238,7 @@ impl Scan {
         let mut prev_quote = 0u64;
         let mut pending = 0u64;
         let mut at = 0usize;
+        let mut lowest = lowest_start();
         *d.sub(1) = u32::MAX;
         *fl.sub(1) = if *base == b'"' { OPENS } else { 0 };
         while at < len {
@@ -189,6 +247,7 @@ impl Scan {
             // this a third of the scan is spent waiting on the two loads.
             crate::sys::prefetch(base.wrapping_add(at + AHEAD));
             let (mut cm, mut nm, mut qm) = masks(base.add(at));
+            lowest = lowest_add(lowest, base.add(at));
             let left = len - at;
             if left < 64 {
                 let keep = (1u64 << left) - 1;
@@ -263,6 +322,7 @@ impl Scan {
         }
         *bad.add(nbad) = u32::MAX;
         self.nd = nd;
+        self.clean = lowest_above_zero(lowest);
     }
 }
 
@@ -502,6 +562,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `clean` is never set when the window holds a byte outside 1..=127,
+    /// wherever that byte sits, and is set for plain text.
+    #[test]
+    fn clean_means_every_byte_is_plain() {
+        let mut state = 55;
+        let mut scan = Scan::new(4096);
+        for round in 0..6000 {
+            let n = 1 + (rng(&mut state) % 700) as usize;
+            let mut text = vec![b'\n'];
+            for _ in 0..n + 64 {
+                text.push(b"abcxyz019,\"\n\r \x01\x7f"[(rng(&mut state) % 16) as usize]);
+            }
+            text.extend_from_slice(&[b'a'; 96]);
+            let odd = round % 3 != 0;
+            if odd {
+                // One odd byte anywhere in the window, first and last
+                // positions included.
+                let at = match rng(&mut state) % 4 {
+                    0 => 0,
+                    1 => n - 1,
+                    _ => (rng(&mut state) % n as u64) as usize,
+                };
+                text[1 + at] = [0x00u8, 0x80, 0xFF, 0xC3][(rng(&mut state) % 4) as usize];
+            }
+            unsafe {
+                scan.scan(text.as_ptr().add(1), n);
+            }
+            assert_eq!(scan.clean, !odd, "round {round} len {n}");
+        }
+        // Zero padding right after the window only costs the shortcut.
+        let mut text = vec![b'\n'];
+        text.extend_from_slice(b"a,b\n");
+        text.extend_from_slice(&[0u8; 160]);
+        unsafe {
+            scan.scan(text.as_ptr().add(1), 4);
+        }
+        assert!(!scan.clean);
     }
 
     /// Lines shaped like the real files (field lengths, 20% quoted, some

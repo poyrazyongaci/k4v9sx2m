@@ -426,14 +426,15 @@ impl<'a> ParseState<'a> {
         let shift1 = self.shift1;
         let cache = &mut self.cache;
         let entries = &mut self.entries;
+        let known = scan.clean;
         for_each_line::<7>(scan, limit, |s, e| {
             let id_len = (e[0] - s[0]) as usize;
             if id_len == 0 {
                 return;
             }
-            let ekey = ids::pack(base.add(s[0] as usize), id_len);
+            let ekey = ids::pack_in(base.add(s[0] as usize), id_len, known);
             let user_len = (e[1] - s[1]) as usize;
-            let ukey = ids::pack(base.add(s[1] as usize), user_len);
+            let ukey = ids::pack_in(base.add(s[1] as usize), user_len, known);
             let mut ingest = parse_ts(base.add(s[3] as usize), (e[3] - s[3]) as usize, cache);
             let ts = parse_ts(base.add(s[2] as usize), (e[2] - s[2]) as usize, cache);
             let type_len = e[4] - s[4];
@@ -472,6 +473,7 @@ impl<'a> ParseState<'a> {
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
         let clicks = &mut self.clicks;
+        let known = scan.clean;
         for_each_line::<4>(scan, limit, |s, e| {
             let id_len = (e[0] - s[0]) as usize;
             let user_len = (e[1] - s[1]) as usize;
@@ -487,8 +489,8 @@ impl<'a> ParseState<'a> {
             if camp == u32::MAX {
                 return;
             }
-            let ckey = ids::pack(base.add(s[0] as usize), id_len);
-            let ukey = ids::pack(base.add(s[1] as usize), user_len);
+            let ckey = ids::pack_in(base.add(s[0] as usize), id_len, known);
+            let ukey = ids::pack_in(base.add(s[1] as usize), user_len, known);
             if clicks.last().is_none_or(|b| b.len() == CLICK_BLOCK) {
                 clicks.push(Vec::with_capacity(CLICK_BLOCK));
             }
@@ -499,12 +501,13 @@ impl<'a> ParseState<'a> {
     #[inline(never)]
     unsafe fn links(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let pairs = &mut self.pairs;
+        let known = scan.clean;
         for_each_line::<2>(scan, limit, |s, e| {
             let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
             if la == 0 || lb == 0 {
                 return;
             }
-            pairs.push((ids::pack(base.add(s[0] as usize), la), ids::pack(base.add(s[1] as usize), lb)));
+            pairs.push((ids::pack_in(base.add(s[0] as usize), la, known), ids::pack_in(base.add(s[1] as usize), lb, known)));
         })
     }
 
