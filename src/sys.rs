@@ -418,6 +418,13 @@ impl<T: Copy> Scatter<T> {
         self.free.len()
     }
 
+    /// Hand every spare chunk to `to`, if its chunks are the same size.
+    pub fn give_spare<U: Copy>(&mut self, to: &mut Scatter<U>) {
+        if self.chunk_bytes == to.chunk_bytes {
+            to.free.append(&mut self.free);
+        }
+    }
+
     pub fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Bump;
 
-const BIG: usize = 64 << 10;
+pub const BIG: usize = 64 << 10;
 const SLAB: usize = 1 << 30;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);

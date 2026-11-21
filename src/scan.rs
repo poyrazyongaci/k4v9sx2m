@@ -200,6 +200,39 @@ fn flag_bytes(before: u64, after: u64, nm: u64, delim: u64, skip: u32) -> u64 {
     }
 }
 
+/// `m` without its lowest set bit, as one `blsr`. Written plainly, the
+/// compiler turns most of the eight into a `lea` and an `and`.
+#[inline(always)]
+fn clear_lowest(m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi1"))]
+    unsafe {
+        let r: u64;
+        core::arch::asm!("blsr {r}, {m}", m = in(reg) m, r = lateout(reg) r, options(pure, nomem, nostack));
+        r
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi1")))]
+    {
+        m & m.wrapping_sub(1)
+    }
+}
+
+/// `m.trailing_zeros()` (64 for 0) as one `tzcnt`. The compiler puts a
+/// zeroing `xor` in front of each of its own to break a false dependency
+/// on the output register; that costs a front-end slot per delimiter.
+#[inline(always)]
+fn lowest_bit(m: u64) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi1"))]
+    unsafe {
+        let r: u64;
+        core::arch::asm!("tzcnt {r}, {m}", m = in(reg) m, r = lateout(reg) r, options(pure, nomem, nostack));
+        r as u32
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi1")))]
+    {
+        m.trailing_zeros()
+    }
+}
+
 /// Append the illegal quotes of the block at `at` to the list: the last
 /// byte of the previous block when `carried`, then the bits of `illegal`.
 #[cold]
@@ -485,8 +518,8 @@ impl Scan {
                 // Volatile keeps these eight plain stores. Left alone the
                 // compiler packs them into one vector with seven inserts,
                 // which is slower here.
-                out.add(i).write_volatile(base_pos + m.trailing_zeros());
-                m &= m.wrapping_sub(1);
+                out.add(i).write_volatile(base_pos + lowest_bit(m));
+                m = clear_lowest(m);
             }
             (fout as *mut u64).write_unaligned(flag_bytes(before, after, nm, delim, 0).to_le());
             if count > 8 {

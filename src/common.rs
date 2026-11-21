@@ -289,6 +289,116 @@ fn manifest_value(text: &[u8], key: &str) -> Option<i64> {
     parse_ts_naive(&rest[..close])
 }
 
+/// The two fields of every data line of a two-column catalog, as
+/// `data_lines` and `split_line(line, 2, _)` give them, skipping malformed
+/// lines. A file without quotes (the usual case) is split in one pass over
+/// its bytes; any quote sends the whole file through the reference readers.
+fn for_each_pair<'a>(bytes: &'a [u8], mut f: impl FnMut(&'a [u8], &'a [u8])) {
+    if bytes.contains(&b'"') {
+        let mut fields = Vec::new();
+        for line in data_lines(bytes) {
+            if split_line(line, 2, &mut fields) {
+                f(fields[0], fields[1]);
+            }
+        }
+        return;
+    }
+    let Some(header) = bytes.iter().position(|&b| b == b'\n') else {
+        return;
+    };
+    let mut start = header + 1;
+    let (mut comma, mut commas) = (0usize, 0u32);
+    let mut i = start;
+    while i <= bytes.len() {
+        let b = if i < bytes.len() { bytes[i] } else { b'\n' };
+        if b == b',' {
+            comma = i;
+            commas += 1;
+        } else if b == b'\n' {
+            // The empty remainder after a final line break is no line.
+            if i == bytes.len() && start == i {
+                break;
+            }
+            if commas == 1 {
+                f(&bytes[start..comma], &bytes[comma + 1..i]);
+            }
+            start = i + 1;
+            commas = 0;
+        }
+        i += 1;
+    }
+}
+
+/// A catalog file, mapped and never unmapped (empty if it is missing).
+/// Mapping it costs no copy and no fresh zeroed pages.
+fn catalog_bytes(path: &Path) -> &'static [u8] {
+    if !path.is_file() {
+        return &[];
+    }
+    let m = crate::sys::map_file(path);
+    unsafe { std::slice::from_raw_parts(m.ptr, m.len) }
+}
+
+/// Category names in order of first appearance, with an open-addressing
+/// index: a byte-wise hash, exact compares.
+struct NameTable<'a> {
+    names: Vec<&'a [u8]>,
+    /// Index of a name plus one; 0 is an empty slot.
+    slots: Vec<u32>,
+}
+
+impl<'a> NameTable<'a> {
+    /// Starts with `unknown` as name 0.
+    fn new() -> Self {
+        let mut t = NameTable { names: Vec::new(), slots: vec![0; 256] };
+        t.index(b"unknown");
+        t
+    }
+
+    /// Length and three bytes: constant time, and enough to spread a few
+    /// hundred category names; equality is always decided by the bytes.
+    fn hash(name: &[u8]) -> u64 {
+        let n = name.len();
+        let h = match n {
+            0 => 0,
+            _ => (n as u64) | u64::from(name[0]) << 16 | u64::from(name[n / 2]) << 24 | u64::from(name[n - 1]) << 32,
+        };
+        h.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn slot(&self, name: &[u8]) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut i = (Self::hash(name) >> 32) as usize & mask;
+        loop {
+            let at = self.slots[i];
+            if at == 0 || self.names[at as usize - 1] == name {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// The index of `name`, added if new.
+    fn index(&mut self, name: &'a [u8]) -> usize {
+        let i = self.slot(name);
+        if self.slots[i] != 0 {
+            return self.slots[i] as usize - 1;
+        }
+        self.names.push(name);
+        let id = self.names.len() - 1;
+        if self.names.len() * 2 > self.slots.len() {
+            self.slots = vec![0; self.slots.len() * 2];
+            for k in 0..self.names.len() {
+                let at = self.slot(self.names[k]);
+                self.slots[at] = k as u32 + 1;
+            }
+        } else {
+            self.slots[i] = id as u32 + 1;
+        }
+        id
+    }
+}
+
 pub fn load_lookups(data: &Path) -> Lookups {
     let manifest = std::fs::read(data.join("manifest.json"))
         .unwrap_or_else(|e| die(&format!("manifest.json: {e}")));
@@ -300,42 +410,18 @@ pub fn load_lookups(data: &Path) -> Lookups {
     // Products. The catalog is large (50,000 rows) and loading it is on the
     // clock, so the common shape `p<n>` goes to a dense table and only odd
     // ids pay for a hash map entry. Both hold exact ids.
-    let mut fields = Vec::new();
-    let product_bytes = std::fs::read(data.join("products.csv")).unwrap_or_default();
-    let mut names: Vec<&[u8]> = vec![b"unknown"];
-    let mut name_index: HashMap<&[u8], u32> = HashMap::new();
+    let product_bytes = catalog_bytes(&data.join("products.csv"));
+    let mut names = NameTable::new();
     let mut last = 0usize;
     let mut dense_raw: Vec<u32> = Vec::new();
     let mut odd_raw: Vec<(&[u8], u32)> = Vec::new();
-    for line in data_lines(&product_bytes) {
-        if !split_line(line, 2, &mut fields) || fields[0].is_empty() {
-            continue;
+    for_each_pair(product_bytes, |id, cat| {
+        if id.is_empty() {
+            return;
         }
-        let cat = fields[1];
-        // Few distinct categories: try the last one, then a short scan.
-        let idx = if names[last] == cat {
-            last
-        } else if names.len() <= 64 {
-            match names.iter().position(|n| *n == cat) {
-                Some(i) => i,
-                None => {
-                    names.push(cat);
-                    names.len() - 1
-                }
-            }
-        } else {
-            if name_index.is_empty() {
-                name_index = names.iter().enumerate().map(|(i, n)| (*n, i as u32)).collect();
-            }
-            let next = names.len() as u32;
-            let i = *name_index.entry(cat).or_insert(next);
-            if i == next {
-                names.push(cat);
-            }
-            i as usize
-        };
+        let idx = if names.names[last] == cat { last } else { names.index(cat) };
         last = idx;
-        match canonical_suffix(fields[0], b"p") {
+        match canonical_suffix(id, b"p") {
             Some(n) => {
                 let n = n as usize;
                 if dense_raw.len() <= n {
@@ -345,9 +431,10 @@ pub fn load_lookups(data: &Path) -> Lookups {
                     dense_raw[n] = idx as u32;
                 }
             }
-            None => odd_raw.push((fields[0], idx as u32)),
+            None => odd_raw.push((id, idx as u32)),
         }
-    }
+    });
+    let names = names.names;
     // Category ids are ranks in byte order, so the smaller id wins a tie.
     let mut order: Vec<u32> = (0..names.len() as u32).collect();
     order.sort_by_key(|&i| names[i as usize]);
@@ -363,20 +450,17 @@ pub fn load_lookups(data: &Path) -> Lookups {
         product_odd.entry(id.to_vec()).or_insert(rank[idx as usize]);
     }
 
-    let campaign_bytes = std::fs::read(data.join("campaigns.csv")).unwrap_or_default();
+    let campaign_bytes = catalog_bytes(&data.join("campaigns.csv"));
     let mut camp_ids = Vec::new();
     let mut camp_channels = Vec::new();
-    let mut campaigns = HashMap::new();
-    for line in data_lines(&campaign_bytes) {
-        if split_line(line, 2, &mut fields) && !fields[0].is_empty() {
-            if campaigns.contains_key(fields[0]) {
-                continue;
-            }
-            campaigns.insert(fields[0].to_vec(), camp_ids.len() as u32);
-            camp_ids.push(fields[0].to_vec());
-            camp_channels.push(fields[1].to_vec());
+    let mut campaigns = HashMap::with_capacity(campaign_bytes.len() / 8);
+    for_each_pair(campaign_bytes, |id, channel| {
+        if !id.is_empty() && !campaigns.contains_key(id) {
+            campaigns.insert(id.to_vec(), camp_ids.len() as u32);
+            camp_ids.push(id.to_vec());
+            camp_channels.push(channel.to_vec());
         }
-    }
+    });
     Lookups {
         window_start,
         window_end,
@@ -387,5 +471,40 @@ pub fn load_lookups(data: &Path) -> Lookups {
         camp_ids,
         camp_channels,
         campaigns,
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+
+    #[test]
+    fn for_each_pair_matches_split_line() {
+        let alphabet = b"ab1,\n\"\r p_";
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for round in 0..20_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = (state >> 58) as usize + round % 3;
+            let mut bytes = Vec::new();
+            for k in 0..len {
+                let r = state.rotate_left(7 * k as u32 + 3) ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                // Mostly quote-free files, so the fast path runs.
+                let mut b = alphabet[(r % alphabet.len() as u64) as usize];
+                if b == b'"' && round % 4 != 0 {
+                    b = b'a';
+                }
+                bytes.push(b);
+            }
+            let mut want = Vec::new();
+            let mut fields = Vec::new();
+            for line in data_lines(&bytes) {
+                if split_line(line, 2, &mut fields) {
+                    want.push((fields[0].to_vec(), fields[1].to_vec()));
+                }
+            }
+            let mut got = Vec::new();
+            for_each_pair(&bytes, |a, b| got.push((a.to_vec(), b.to_vec())));
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&bytes));
+        }
     }
 }

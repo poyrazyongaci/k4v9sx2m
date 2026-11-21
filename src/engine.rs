@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use crate::common::*;
 use crate::ids::{self, cmp_ids};
-use crate::output::write_camp_rows;
+use crate::output::{write_camp_cols, CampCols};
 use crate::usercols::UserOut;
 use crate::scan::{for_each_line, for_each_line_b, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
@@ -420,11 +420,18 @@ impl LinkMap {
 
     fn build(pairs: &[(u64, u64)]) -> LinkMap {
         // Room for twice the keys, so a bucket holds one to two on average.
+        Self::build_with_room(pairs, 8).0
+    }
+
+    /// `build`, and the memory of its work tables (node ids, keys,
+    /// parents, renamed pairs): dead, mostly faulted in already, and never
+    /// unmapped or reused, as `(address, bytes)` regions.
+    fn build_with_spare(pairs: &[(u64, u64)]) -> (LinkMap, Vec<(usize, usize)>) {
         Self::build_with_room(pairs, 8)
     }
 
     /// `room` is the table's key capacity in quarters of the key count.
-    fn build_with_room(pairs: &[(u64, u64)], room: usize) -> LinkMap {
+    fn build_with_room(pairs: &[(u64, u64)], room: usize) -> (LinkMap, Vec<(usize, usize)>) {
         // Pass 1: a dense node id per distinct ID, and union-find over them.
         let cap = (pairs.len() * 4).next_power_of_two().max(16);
         let ids = LinkMap::with_slots(cap, 0, false);
@@ -512,7 +519,20 @@ impl LinkMap {
                 }
             }
         }
-        map
+        // Vectors under `alloc::BIG` live in the system allocator and stay
+        // with it; the rest is bump memory that is never handed out again.
+        let mut spare = vec![(ids.slots as usize, (cap + 1) * 16)];
+        fn give<T>(v: Vec<T>, spare: &mut Vec<(usize, usize)>) {
+            let bytes = v.capacity() * std::mem::size_of::<T>();
+            if bytes >= crate::alloc::BIG {
+                let v = std::mem::ManuallyDrop::new(v);
+                spare.push((v.as_ptr() as usize, bytes));
+            }
+        }
+        give(keys, &mut spare);
+        give(parent, &mut spare);
+        give(renamed, &mut spare);
+        (map, spare)
     }
 }
 
@@ -1373,8 +1393,13 @@ impl<'a> Resolver<'a> {
         prof::add(5, t);
     }
 
-    unsafe fn clicks(&mut self, block: &[Click]) {
+    unsafe fn clicks(&mut self, raw: &ClickBlock) {
         let t = prof::start();
+        // Event jobs all come before click jobs, so the event scatter has
+        // no more use for its spare chunks. The first block alone needs a
+        // chunk for nearly every partition.
+        self.ev.give_spare(&mut self.cl);
+        let block = std::slice::from_raw_parts(raw.ptr, raw.len);
         let links = *self.links;
         let shift2 = self.shift2;
         let cl = &mut self.cl;
@@ -1394,7 +1419,35 @@ impl<'a> Resolver<'a> {
                 cl.push((mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
             }
         }
+        // The block is dead now. Its pages are faulted in already, so its
+        // memory becomes click chunks instead of fresh pages. Big blocks come
+        // from the bump allocator, which never reuses or frees them.
+        let bytes = self.cl.chunk_bytes();
+        let total = raw.cap * std::mem::size_of::<Click>();
+        let base = raw.ptr as *mut u8;
+        if total >= crate::alloc::BIG && base as usize % 64 == 0 {
+            for k in 0..total / bytes {
+                self.cl.recycle(base.add(k * bytes), bytes);
+            }
+        }
         prof::add(6, t);
+    }
+}
+
+/// A click block of the parse phase, owned by the resolve phase: the
+/// resolver that takes it reuses its memory once the clicks are scattered.
+struct ClickBlock {
+    ptr: *mut Click,
+    len: usize,
+    cap: usize,
+}
+unsafe impl Send for ClickBlock {}
+unsafe impl Sync for ClickBlock {}
+
+impl ClickBlock {
+    fn from_vec(v: Vec<Click>) -> Self {
+        let mut v = std::mem::ManuallyDrop::new(v);
+        ClickBlock { ptr: v.as_mut_ptr(), len: v.len(), cap: v.capacity() }
     }
 }
 
@@ -1593,8 +1646,10 @@ struct PersonPhase<'a> {
     cover: Vec<u64>,
     catsum: Vec<u64>,
     touched: Vec<u8>,
-    /// (campaign, day) -> [sessions, purchasing, revenue, 0]
-    agg: Vec<[u64; 4]>,
+    /// (campaign, day) -> [sessions | purchasing << 32, revenue]. Half the
+    /// bytes of four words, and one add per session for both counts: a
+    /// thread's cell counts stay far below 2^32 (fewer than 2^30 events).
+    agg: Vec<[u64; 2]>,
     /// (campaign, day) -> assisted sessions. Apart from `agg` and narrow:
     /// these cells are hit at random, far more often than the others, and
     /// this way they all stay in the cache.
@@ -1620,6 +1675,41 @@ const EV_PAD: usize = 64;
 #[inline(always)]
 fn person_hash(key: u64) -> u64 {
     key.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+}
+
+/// One session in the first word of a campaign cell (purchasing sessions
+/// count in its top half).
+const SESSION: u64 = 1;
+
+/// The campaign cells of a thread, or their sum over threads.
+#[derive(Default)]
+struct Cells {
+    agg: Vec<[u64; 2]>,
+    assists: Vec<u32>,
+}
+
+impl Cells {
+    /// Add `other` in. The sums stay exact: all sessions of a run number
+    /// fewer than 2^30, so the low half of the first word never carries.
+    fn add(&mut self, other: Cells) {
+        if self.agg.is_empty() {
+            *self = other;
+            return;
+        }
+        for (a, b) in self.agg.iter_mut().zip(&other.agg) {
+            a[0] += b[0];
+            a[1] += b[1];
+        }
+        for (a, b) in self.assists.iter_mut().zip(&other.assists) {
+            *a += b;
+        }
+    }
+
+    /// `[sessions, purchasing, revenue, assisted]` of cell `i`.
+    fn get(&self, i: usize) -> [u64; 4] {
+        let [w, revenue] = self.agg[i];
+        [w & 0xFFFF_FFFF, w >> 32, revenue, u64::from(self.assists[i])]
+    }
 }
 
 /// Sessions are compared with a click eight at a time.
@@ -2937,7 +3027,7 @@ impl<'a> PersonPhase<'a> {
             cover: vec![0; fast.ncamp],
             catsum: vec![0; 256],
             touched: Vec::new(),
-            agg: vec![[0; 4]; (fast.ncamp + 1) * fast.ndays],
+            agg: vec![[0; 2]; (fast.ncamp + 1) * fast.ndays],
             assists: vec![0; (fast.ncamp + 1) * fast.ndays],
             out,
             check: (0, 0),
@@ -3259,9 +3349,8 @@ impl<'a> PersonPhase<'a> {
                 *self.s_revenue.as_mut_ptr().add(at) = revenue;
             } else {
                 let cell = self.agg.get_unchecked_mut(organic * ndays + cur_day as usize);
-                cell[0] += 1;
-                cell[1] += u64::from(revenue > 0);
-                cell[2] += revenue;
+                cell[0] += SESSION | (u64::from(revenue > 0) << 32);
+                cell[1] += revenue;
             }
             i = j;
         }
@@ -3345,9 +3434,8 @@ impl<'a> PersonPhase<'a> {
         for k in 0..sessions {
             let revenue = *self.s_revenue.as_ptr().add(k);
             let cell = self.agg.get_unchecked_mut(*best_c.get_unchecked(k) as usize * ndays + *self.s_day.as_ptr().add(k) as usize);
-            cell[0] += 1;
-            cell[1] += u64::from(revenue > 0);
-            cell[2] += revenue;
+            cell[0] += SESSION | (u64::from(revenue > 0) << 32);
+            cell[1] += revenue;
         }
         true
     }
@@ -3422,9 +3510,8 @@ impl<'a> PersonPhase<'a> {
             win.hi = hi;
         }
         let cell = self.agg.get_unchecked_mut(credit * ndays + day);
-        cell[0] += 1;
-        cell[1] += u64::from(revenue > 0);
-        cell[2] += revenue;
+        cell[0] += SESSION | (u64::from(revenue > 0) << 32);
+        cell[1] += revenue;
     }
 
     /// Campaign `c` assisted the person's sessions `from..to`; `slot` is the
@@ -3446,12 +3533,9 @@ impl<'a> PersonPhase<'a> {
         }
     }
 
-    /// The campaign cells of this thread, assists folded in.
-    fn cells(&mut self) -> Vec<[u64; 4]> {
-        for (cell, &assists) in self.agg.iter_mut().zip(&self.assists) {
-            cell[3] = u64::from(assists);
-        }
-        std::mem::take(&mut self.agg)
+    /// The campaign cells of this thread and its assist counts.
+    fn cells(&mut self) -> Cells {
+        Cells { agg: std::mem::take(&mut self.agg), assists: std::mem::take(&mut self.assists) }
     }
 }
 
@@ -3731,6 +3815,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     // ---- phase 1
     let next = AtomicUsize::new(0);
     let link_map: Mutex<Option<LinkMap>> = Mutex::new(None);
+    let link_spare: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut entry_lists: Vec<Vec<List<Entry>>> = Vec::new();
     let mut click_blocks: Vec<Vec<Click>> = Vec::new();
     std::thread::scope(|scope| {
@@ -3761,9 +3846,10 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                                     parser.run_chunk(*m, 0, m.len, Kind::Links);
                                 }
                                 let t = prof::add(2, t);
-                                let map = LinkMap::build(&parser.st.pairs);
+                                let (map, spare) = LinkMap::build_with_spare(&parser.st.pairs);
                                 prof::add(3, t);
                                 *link_map.lock().unwrap() = Some(map);
+                                *link_spare.lock().unwrap() = spare;
                             }
                             Kind::Events => {
                                 parser.run_chunk(event_files[job.file], job.start, job.end, Kind::Events);
@@ -3798,12 +3884,19 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
         })
     });
     let links = link_map.into_inner().unwrap().unwrap();
+    // The dead node id table of the link build, cut into chunks: each
+    // resolver starts with an equal share, so the first partitions it
+    // scatters need fewer fresh pages.
+    let link_spare = link_spare.into_inner().unwrap();
+    let link_spare = &link_spare;
+    let share = AtomicUsize::new(0);
     let links = &links;
     timer.lap("parse", std::mem::take(&mut *cpu_total.lock().unwrap()));
 
     // ---- phase 2
     let next = AtomicUsize::new(0);
     let entry_lists = &entry_lists;
+    let click_blocks: Vec<ClickBlock> = click_blocks.into_iter().map(ClickBlock::from_vec).collect();
     let click_blocks = &click_blocks;
     let mut ev_lists: Vec<Vec<List<Ev>>> = Vec::new();
     let mut cl_lists: Vec<Vec<List<Click>>> = Vec::new();
@@ -3820,6 +3913,23 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                         shift2: 64 - bits2,
                         entry_chunk_bytes: Scatter::<Entry>::new(1, CHUNK_BYTES).chunk_bytes(),
                     };
+                    {
+                        let bytes = r.ev.chunk_bytes();
+                        let k = share.fetch_add(1, Ordering::Relaxed);
+                        let mut j = 0;
+                        for &(at, len) in link_spare {
+                            // Chunks start on a cache line.
+                            let first = (at + 63) & !63;
+                            let mut c = first;
+                            while c + bytes <= at + len {
+                                if j % threads == k {
+                                    r.ev.recycle(c as *mut u8, bytes);
+                                }
+                                j += 1;
+                                c += bytes;
+                            }
+                        }
+                    }
                     let mut lists: Vec<List<Entry>> = Vec::with_capacity(threads);
                     loop {
                         let at = next.fetch_add(1, Ordering::Relaxed);
@@ -3858,7 +3968,11 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let order = &order;
     let collected: Mutex<Vec<UserRow>> = Mutex::new(Vec::new());
     let collected_ref = &collected;
-    let mut agg = vec![[0u64; 4]; (fast.ncamp + 1) * fast.ndays];
+    // Each thread adds its cells in as it finishes, off the critical path
+    // but for the last one; the first thread's cells become the sum, so no
+    // fresh table is touched.
+    let shared_cells: Mutex<Cells> = Mutex::new(Cells::default());
+    let shared_cells = &shared_cells;
     let mut total_rows = 0u64;
     let out_dir = out.map(|o| o.join("user_daily"));
     let out_dir = &out_dir;
@@ -3888,50 +4002,46 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                     let t0 = prof::start();
                     phase.out.finish();
                     prof::add(9, t0);
+                    let cells = phase.cells();
+                    shared_cells.lock().unwrap().add(cells);
                     *cpu_total.lock().unwrap() += sys::thread_cpu();
-                    (phase.cells(), phase.out.rows_written, phase.check)
+                    (phase.out.rows_written, phase.check)
                 })
             })
             .collect();
         for h in handles {
-            let (part, rows, sums) = h.join().unwrap();
+            let (rows, sums) = h.join().unwrap();
             check.0 += sums.0;
             check.1 += sums.1;
-            for (a, b) in agg.iter_mut().zip(&part) {
-                for k in 0..4 {
-                    a[k] += b[k];
-                }
-            }
             total_rows += rows;
         }
     });
+    let cells = std::mem::take(&mut *shared_cells.lock().unwrap());
     timer.lap("person", std::mem::take(&mut *cpu_total.lock().unwrap()));
 
-    let mut tables = Tables::default();
+    // campaign_daily straight from the cells into columns, names borrowed;
+    // owned rows only when the caller collects the tables (tests).
+    let live = |i: usize| cells.agg[i][0] != 0 || cells.assists[i] != 0;
+    let used = (0..cells.agg.len()).filter(|&i| live(i)).count();
+    let mut camp = CampCols::with_capacity(used);
     for c in 0..=fast.ncamp {
-        for d in 0..fast.ndays {
-            let cell = agg[c * fast.ndays + d];
-            if cell[0] == 0 && cell[3] == 0 {
+        let row = c * fast.ndays..(c + 1) * fast.ndays;
+        if !row.clone().any(live) {
+            continue;
+        }
+        let (campaign, channel): (&[u8], &[u8]) =
+            if c == fast.ncamp { (b"organic", b"organic") } else { (&lk.camp_ids[c], &lk.camp_channels[c]) };
+        camp.campaign(campaign, channel);
+        for (d, i) in row.enumerate() {
+            if !live(i) {
                 continue;
             }
-            let (campaign, channel) = if c == fast.ncamp {
-                (b"organic".to_vec(), b"organic".to_vec())
-            } else {
-                (lk.camp_ids[c].clone(), lk.camp_channels[c].clone())
-            };
-            tables.camp.push(CampRow {
-                campaign,
-                channel,
-                day: (fast.ws_day + d as i64) as i32,
-                sessions: cell[0] as i64,
-                purchasing: cell[1] as i64,
-                revenue: cell[2] as i64,
-                assisted: cell[3] as i64,
-            });
+            let cell = cells.get(i);
+            camp.push((fast.ws_day + d as i64) as i32, cell[0] as i64, cell[1] as i64, cell[2] as i64, cell[3] as i64);
         }
     }
     if let Some(out) = out {
-        write_camp_rows(&out.join("campaign_daily/part-0.parquet"), &tables.camp);
+        write_camp_cols(&out.join("campaign_daily/part-0.parquet"), &camp);
         if total_rows == 0 {
             crate::output::write_user_rows(&out.join("user_daily/part-0.parquet"), &[]);
         }
@@ -3942,17 +4052,21 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     timer.lap("finish", 0.0);
     if cfg.timing {
         prof::report();
-        let camp = tables.camp.iter().fold((0i64, 0i64), |a, r| (a.0 + r.sessions, a.1 + r.revenue));
+        let sums = (camp.sessions.iter().sum::<i64>(), camp.revenue.iter().sum::<i64>());
         eprintln!(
             "[engine] self-check user_daily sessions {} revenue {} rows {}; campaign_daily sessions {} revenue {} rows {}; {}",
             check.0,
             check.1,
             total_rows,
-            camp.0,
-            camp.1,
-            tables.camp.len(),
-            if (check.0 as i64, check.1 as i64) == camp { "OK" } else { "MISMATCH" }
+            sums.0,
+            sums.1,
+            camp.len(),
+            if (check.0 as i64, check.1 as i64) == sums { "OK" } else { "MISMATCH" }
         );
+    }
+    let mut tables = Tables::default();
+    if cfg.collect {
+        tables.camp = camp.rows();
     }
     tables.user = collected.into_inner().unwrap();
     Some(tables)
@@ -4001,7 +4115,7 @@ mod link_tests {
             // The table as the engine builds it (at most half full), and a
             // denser one (up to 80% full) where far more buckets overflow.
             for room in [8, 5] {
-                let map = LinkMap::build_with_room(&pairs, room);
+                let map = LinkMap::build_with_room(&pairs, room).0;
                 let mut probes: Vec<u64> = parent.keys().copied().collect();
                 for _ in 0..(2 * pairs_n + 1000) {
                     probes.push(key(&mut state));
