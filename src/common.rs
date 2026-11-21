@@ -88,7 +88,6 @@ pub fn canonical_suffix(id: &[u8], prefix: &[u8]) -> Option<u32> {
 }
 
 pub fn die(msg: &str) -> ! {
-    crate::layout_pad!(crate::sys::layout::DIE_PAD);
     eprintln!("sessions: {msg}");
     std::process::exit(1);
 }
