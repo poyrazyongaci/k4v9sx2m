@@ -352,11 +352,42 @@ impl Directory {
     }
 }
 
+/// Four cache lines from `s` to `d` with non-temporal stores.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn stream4(s: *const u8, d: *mut u8) {
+    use core::arch::x86_64::*;
+    let v0 = _mm256_load_si256(s as *const __m256i);
+    let v1 = _mm256_load_si256(s.add(32) as *const __m256i);
+    let v2 = _mm256_load_si256(s.add(64) as *const __m256i);
+    let v3 = _mm256_load_si256(s.add(96) as *const __m256i);
+    let v4 = _mm256_load_si256(s.add(128) as *const __m256i);
+    let v5 = _mm256_load_si256(s.add(160) as *const __m256i);
+    let v6 = _mm256_load_si256(s.add(192) as *const __m256i);
+    let v7 = _mm256_load_si256(s.add(224) as *const __m256i);
+    // One asm block with constant offsets: the intrinsic takes its
+    // address in a register, so each store would cost an `lea`.
+    core::arch::asm!(
+        "vmovntdq [{d}], {v0}",
+        "vmovntdq [{d} + 32], {v1}",
+        "vmovntdq [{d} + 64], {v2}",
+        "vmovntdq [{d} + 96], {v3}",
+        "vmovntdq [{d} + 128], {v4}",
+        "vmovntdq [{d} + 160], {v5}",
+        "vmovntdq [{d} + 192], {v6}",
+        "vmovntdq [{d} + 224], {v7}",
+        d = in(reg) d,
+        v0 = in(ymm_reg) v0, v1 = in(ymm_reg) v1, v2 = in(ymm_reg) v2, v3 = in(ymm_reg) v3,
+        v4 = in(ymm_reg) v4, v5 = in(ymm_reg) v5, v6 = in(ymm_reg) v6, v7 = in(ymm_reg) v7,
+        options(nostack, preserves_flags),
+    );
+}
+
 /// Copy `lines` cache lines from an aligned staging buffer to an aligned
 /// destination with non-temporal stores: no read-for-ownership of the
 /// destination and no cache pollution.
 #[inline(always)]
-unsafe fn stream_lines(src: *const u8, dst: *mut u8, lines: usize) {
+unsafe fn stream_lines<const FOUR: bool>(src: *const u8, dst: *mut u8, lines: usize) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use core::arch::x86_64::*;
@@ -364,31 +395,27 @@ unsafe fn stream_lines(src: *const u8, dst: *mut u8, lines: usize) {
         // then one line a step: fewer loop instructions per line.
         let (mut s, mut d) = (src, dst);
         let end = src.add(lines * 64);
+        if FOUR && lines == 4 {
+            // The usual staging buffer: no loop. (Only where it measured
+            // fewer instructions: the parse scatter.)
+            stream4(s, d);
+            return;
+        }
         while s.add(256) <= end {
-            let v0 = _mm256_load_si256(s as *const __m256i);
-            let v1 = _mm256_load_si256(s.add(32) as *const __m256i);
-            let v2 = _mm256_load_si256(s.add(64) as *const __m256i);
-            let v3 = _mm256_load_si256(s.add(96) as *const __m256i);
-            let v4 = _mm256_load_si256(s.add(128) as *const __m256i);
-            let v5 = _mm256_load_si256(s.add(160) as *const __m256i);
-            let v6 = _mm256_load_si256(s.add(192) as *const __m256i);
-            let v7 = _mm256_load_si256(s.add(224) as *const __m256i);
-            _mm256_stream_si256(d as *mut __m256i, v0);
-            _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
-            _mm256_stream_si256(d.add(64) as *mut __m256i, v2);
-            _mm256_stream_si256(d.add(96) as *mut __m256i, v3);
-            _mm256_stream_si256(d.add(128) as *mut __m256i, v4);
-            _mm256_stream_si256(d.add(160) as *mut __m256i, v5);
-            _mm256_stream_si256(d.add(192) as *mut __m256i, v6);
-            _mm256_stream_si256(d.add(224) as *mut __m256i, v7);
+            stream4(s, d);
             s = s.add(256);
             d = d.add(256);
         }
         while s < end {
             let v0 = _mm256_load_si256(s as *const __m256i);
             let v1 = _mm256_load_si256(s.add(32) as *const __m256i);
-            _mm256_stream_si256(d as *mut __m256i, v0);
-            _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
+            core::arch::asm!(
+                "vmovntdq [{d}], {v0}",
+                "vmovntdq [{d} + 32], {v1}",
+                d = in(reg) d,
+                v0 = in(ymm_reg) v0, v1 = in(ymm_reg) v1,
+                options(nostack, preserves_flags),
+            );
             s = s.add(64);
             d = d.add(64);
         }
@@ -528,7 +555,7 @@ impl<T: Copy> Scatter<T> {
             self.grow(p);
             part = self.parts.as_mut_ptr().add(p);
         }
-        stream_lines(buf, (*part).dst, self.stage_bytes / 64);
+        stream_lines::<false>(buf, (*part).dst, self.stage_bytes / 64);
         (*part).dst = (*part).dst.add(self.stage_bytes);
     }
 
@@ -544,7 +571,7 @@ impl<T: Copy> Scatter<T> {
                 self.grow(p);
                 part = self.parts.as_mut_ptr().add(p);
             }
-            stream_lines(buf, (*part).dst, self.stage_bytes / 64);
+            stream_lines::<true>(buf, (*part).dst, self.stage_bytes / 64);
             (*part).dst = (*part).dst.add(self.stage_bytes);
         } else {
             *self.fill.get_unchecked_mut(p) = (n + 1) as u8;
@@ -578,7 +605,7 @@ impl<T: Copy> Scatter<T> {
         if n + 1 == self.per {
             *self.fill.get_unchecked_mut(p) = 0;
             let part = self.parts.as_mut_ptr().add(p);
-            stream_lines(buf, (*part).dst, self.stage_bytes / 64);
+            stream_lines::<false>(buf, (*part).dst, self.stage_bytes / 64);
             (*part).dst = (*part).dst.add(self.stage_bytes);
         } else {
             *self.fill.get_unchecked_mut(p) = (n + 1) as u8;

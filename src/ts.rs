@@ -389,6 +389,24 @@ const fn with_ingest(form: usize) -> Form2 {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 static FORMS2: [Form2; 3] = [with_ingest(0), with_ingest(1), with_ingest(2)];
 
+/// Field length to the byte offset of its entry in `FORMS2` (`LEN_FORM`
+/// times the entry size, so no multiply), `NO_FORM2` for none.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static LEN_FORM2: [u16; 32] = {
+    let mut t = [NO_FORM2; 32];
+    let mut len = 0;
+    while len < 32 {
+        if LEN_FORM[len] != NO_FORM {
+            t[len] = (LEN_FORM[len] as usize * std::mem::size_of::<Form2>()) as u16;
+        }
+        len += 1;
+    }
+    t
+};
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const NO_FORM2: u16 = u16::MAX;
+
 /// `ts` and `ingest_ts` of one event: what `parse_ts` and `parse_ingest`
 /// return for them. Each timestamp takes one 128-bit lane of the same
 /// instructions, so the pair costs little more than one of them.
@@ -402,11 +420,12 @@ pub unsafe fn parse_ts_ingest(
     cache: &mut DateCache,
 ) -> (i64, i64) {
     use core::arch::x86_64::*;
-    let form = if tlen < 32 { *LEN_FORM.get_unchecked(tlen) } else { NO_FORM };
-    if (form == NO_FORM) | (ilen != 20) {
+    let off = if tlen < 32 { *LEN_FORM2.get_unchecked(tlen) } else { NO_FORM2 };
+    if (off == NO_FORM2) | (ilen != 20) {
         return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
     }
-    let f = FORMS2.as_ptr().add(form as usize);
+    let f = FORMS2.as_ptr().byte_add(usize::from(off));
+    let form = *LEN_FORM.get_unchecked(tlen);
     // Both months (`ts` only if its form has one) must be in the cache.
     let (a, b) = (load64(tp), load64(ip));
     let (sa, sb) = (usize::from(a != cache.key[0]), usize::from(b != cache.key[0]));

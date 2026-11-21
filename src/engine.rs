@@ -160,6 +160,24 @@ fn mix1(k: u64) -> u64 {
     x ^ (x >> 32)
 }
 
+/// The hash of the link map and of the build's node table: one multiply
+/// with the high half folded in. Home bits come from 17 up, filter bits
+/// from the low 12 and from 43 up.
+#[inline(always)]
+fn link_hash(k: u64) -> u64 {
+    mix1(k)
+}
+
+/// The person partition of a person key: `mix1(pkey) >> shift2`. The fold
+/// of `mix1` only touches the low 32 bits and `shift2` is at least 50
+/// (`bits_for` gives at most 14 bits), so the top bits of the product are
+/// the same partition with no fold.
+#[inline(always)]
+fn person_part(pkey: u64, shift2: u32) -> usize {
+    debug_assert!(shift2 >= 32);
+    (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift2) as usize
+}
+
 /// The event partition of an event key: the top bits of one multiply. Every
 /// copy of an event must land in the same partition, so the line parsers
 /// all use this. Its own multiplier keeps it independent of `mix1`, whose
@@ -342,7 +360,7 @@ impl LinkMap {
     }
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        self.home_of(mix(key))
+        self.home_of(link_hash(key))
     }
     #[inline(always)]
     fn filter_word(&self, h: u64) -> *mut u64 {
@@ -354,12 +372,21 @@ impl LinkMap {
     }
     /// Where the lookup of a key with hash `h` starts: its home bucket if
     /// the filter says the key may be present, else the empty bucket.
+    /// As a byte offset into the table, so neither the prefetch nor the
+    /// probe shifts it: `home_of(h) * 64` straight from the hash bits.
     #[inline(always)]
     fn start(&self, h: u64) -> usize {
         let bits = Self::filter_bits(h);
         let maybe = unsafe { *self.filter_word(h) } & bits == bits;
+        const _: () = assert!(BUCKET * 16 == 64);
+        let home = (h >> 11) as usize & (self.mask << 6);
         // A coin toss: this must be a conditional move, never a branch.
-        std::hint::select_unpredictable(maybe, self.home_of(h), self.nowhere)
+        std::hint::select_unpredictable(maybe, home, self.nowhere << 6)
+    }
+    /// The bucket at byte offset `at`.
+    #[inline(always)]
+    fn bucket_at(&self, at: usize) -> *mut u64 {
+        unsafe { (self.slots as *mut u8).add(at) as *mut u64 }
     }
     /// Prefetch for the build, which probes before the filter exists.
     #[inline(always)]
@@ -372,15 +399,15 @@ impl LinkMap {
     /// bucket), `stage3` reads the bucket and returns the person.
     #[inline(always)]
     fn stage1(&self, key: u64) -> u64 {
-        let h = mix(key);
+        let h = link_hash(key);
         prefetch(self.filter_word(h));
         h
     }
     #[inline(always)]
     fn stage2(&self, h: u64) -> usize {
-        let i = self.start(h);
-        prefetch(self.bucket(i));
-        i
+        let at = self.start(h);
+        prefetch(self.bucket_at(at));
+        at
     }
     /// Which of the bucket's keys equal `key`, as a bit mask.
     #[inline(always)]
@@ -402,16 +429,16 @@ impl LinkMap {
         }
     }
     #[inline(always)]
-    fn stage3(&self, i: usize, key: u64) -> u64 {
+    fn stage3(&self, at: usize, key: u64) -> u64 {
         unsafe {
-            let b = self.bucket(i);
+            let b = self.bucket_at(at);
             let m = Self::matches(b, key);
             // Hit or miss is another coin toss. A full bucket without the
             // key is rare and goes out of line.
             let person = *b.add(BUCKET + (m.trailing_zeros() as usize & (BUCKET - 1)));
             let found = std::hint::select_unpredictable(m != 0, person, key);
             if (m == 0) & (*b.add(BUCKET - 1) != 0) {
-                return self.person_far(key, i);
+                return self.person_far(key, at >> 6);
             }
             found
         }
@@ -517,7 +544,7 @@ impl LinkMap {
                 prefetch(map.bucket(map.home(pair[0])));
             }
             for pair in block {
-                let h = mix(pair[0]);
+                let h = link_hash(pair[0]);
                 let mut i = map.home_of(h);
                 unsafe {
                     // Buckets fill from the front and nothing is ever
@@ -620,7 +647,7 @@ impl LinkMap {
         // memory is zero: key 0 is an empty slot, parent 0 is "root", any
         // other parent is that node's slot number plus one.
         let nodes = Shared(sys::anon(cap * 16) as *const [AtomicU64; 2]);
-        let home = |key: u64| (mix(key) >> 17) as usize & mask;
+        let home = |key: u64| (link_hash(key) >> 17) as usize & mask;
         let intern = |key: u64| -> usize {
             let mut i = home(key);
             loop {
@@ -737,7 +764,7 @@ impl LinkMap {
                                 prefetch(nodes.ptr(up as usize));
                             }
                             for (out, &(key, up)) in ready.iter_mut().zip(block) {
-                                let h = mix(key);
+                                let h = link_hash(key);
                                 *out = (key, key_of(find(up as usize)), h);
                                 prefetch(map.bucket(map.home_of(h)));
                                 prefetch(map.filter_word(h));
@@ -893,7 +920,7 @@ impl Emit {
             let mut rec = NO_RECORD;
             if entry.w3 != DEAD {
                 let pkey = links.stage3(at, entry.ukey);
-                rec = self.ev.push_named((mix1(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                rec = self.ev.push_named(person_part(pkey, shift2), Ev { pkey, v: entry.w3 });
             }
             // Exact as u64 whenever `ingest >= base`.
             let since = (entry.ingest as u64).wrapping_sub(base as u64);
@@ -934,7 +961,7 @@ impl Emit {
         }
         for (&at, click) in starts.iter().zip(block) {
             let pkey = links.stage3(at, click.key);
-            self.cl.push((mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+            self.cl.push(person_part(pkey, shift2), Click { key: pkey, ckey: click.ckey, tc: click.tc });
         }
         prof::add(10, t);
     }
@@ -1020,6 +1047,13 @@ impl<'a> ParseState<'a> {
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
         let clicks = &mut self.clicks;
+        // The free room of the last click block, as raw pointers: no length
+        // reload and no capacity check per click. Its length is set when it
+        // is full and when this window ends.
+        let (mut at, mut stop) = match clicks.last_mut() {
+            Some(v) => (v.as_mut_ptr().add(v.len()), v.as_mut_ptr().add(CLICK_BLOCK)),
+            None => (std::ptr::null_mut(), std::ptr::null_mut()),
+        };
         let emit: *mut Emit = match &mut self.emit {
             Some(e) => &mut **e,
             None => std::ptr::null_mut(),
@@ -1028,7 +1062,7 @@ impl<'a> ParseState<'a> {
             Some(e) => &mut **e,
             None => std::ptr::null_mut(),
         };
-        src.run::<4>(|base, b, known| {
+        let left = src.run::<4>(|base, b, known| {
             let id_len = b.len(0);
             let user_len = b.len(1);
             if id_len == 0 || user_len == 0 {
@@ -1054,11 +1088,22 @@ impl<'a> ParseState<'a> {
                 (*emit).click(click);
                 return;
             }
-            if clicks.last().is_none_or(|b| b.len() == CLICK_BLOCK) {
-                clicks.push(Vec::with_capacity(CLICK_BLOCK));
+            if at == stop {
+                if let Some(v) = clicks.last_mut() {
+                    v.set_len(CLICK_BLOCK);
+                }
+                let mut v = Vec::with_capacity(CLICK_BLOCK);
+                at = v.as_mut_ptr();
+                stop = at.add(CLICK_BLOCK);
+                clicks.push(v);
             }
-            clicks.last_mut().unwrap_unchecked().push(click);
-        })
+            at.write(click);
+            at = at.add(1);
+        });
+        if let Some(v) = clicks.last_mut() {
+            v.set_len(at.offset_from(v.as_ptr()) as usize);
+        }
+        left
     }
 
     #[inline(never)]
@@ -1555,7 +1600,7 @@ impl<'a> Resolver<'a> {
                     for (&at, entry) in starts.iter().zip(block) {
                         if entry.w3 != DEAD {
                             let pkey = links.stage3(at, entry.ukey);
-                            ev.push_hot(&hot, (mix1(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                            ev.push_hot(&hot, person_part(pkey, shift2), Ev { pkey, v: entry.w3 });
                         }
                     }
                 }
@@ -1600,7 +1645,7 @@ impl<'a> Resolver<'a> {
             }
             for (&at, click) in starts.iter().zip(part) {
                 let pkey = links.stage3(at, click.key);
-                cl.push_hot(&hot, (mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+                cl.push_hot(&hot, person_part(pkey, shift2), Click { key: pkey, ckey: click.ckey, tc: click.tc });
             }
         }
         // The block is dead now. Its pages are faulted in already, so its

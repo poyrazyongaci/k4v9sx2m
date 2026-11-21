@@ -135,34 +135,23 @@ fn blsr(x: u64) -> u64 {
     crate::scan::clear_lowest(x)
 }
 
-/// Delimiter positions, stored one by one and read back as one vector:
-/// eight stores and a load, where building the vector in registers takes
-/// about twenty instructions.
-#[repr(C, align(32))]
-struct Delims([u32; 8]);
-
-impl Delims {
-    #[inline(always)]
-    fn new(v: [u32; 8]) -> Self {
-        let mut d = Delims([0; 8]);
-        for (slot, x) in d.0.iter_mut().zip(v) {
-            *slot = x;
-        }
-        d
-    }
-}
-
-/// Starts and lengths of the fields from the delimiter positions `d`
-/// (`d[0]` is -1, the line break before the line; `d[k + 1]` ends field
-/// `k`) and the quoted fields `quoted` (bit `k`: field `k` is wrapped in
-/// quotes). Returns the fields of the first `N` that end before they start:
-/// a field that is one lone quote.
+/// Starts and lengths of the fields from the delimiter positions (`d[0]`
+/// is -1, the line break before the line; `d[k + 1]` ends field `k`), given
+/// as `front` and `back` plus `add` (two halves of four lanes, built in
+/// registers), and the quoted fields `quoted` (bit `k`: field `k` is
+/// wrapped in quotes). Returns the fields of the first `N` that end before
+/// they start: a field that is one lone quote.
 #[inline(always)]
-unsafe fn bounds<const N: usize>(d: &[u32; 8], quoted: u64, out: &mut Bounds) -> u32 {
+unsafe fn bounds<const N: usize>(front: [u32; 4], back: [u32; 4], add: u32, quoted: u64, out: &mut Bounds) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
     {
         use core::arch::x86_64::*;
-        let v = _mm256_load_si256(d.as_ptr() as *const __m256i);
+        let lo = _mm_setr_epi32(front[0] as i32, front[1] as i32, front[2] as i32, front[3] as i32);
+        let hi = _mm_add_epi32(
+            _mm_setr_epi32(back[0] as i32, back[1] as i32, back[2] as i32, back[3] as i32),
+            _mm_set1_epi32(add as i32),
+        );
+        let v = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
         let q8 = _pdep_u64(quoted, 0x0101_0101_0101_0101);
         let q = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(q8 as i64));
         let start = _mm256_sub_epi32(_mm256_add_epi32(v, q), _mm256_set1_epi32(-1));
@@ -174,6 +163,11 @@ unsafe fn bounds<const N: usize>(d: &[u32; 8], quoted: u64, out: &mut Bounds) ->
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
     {
+        let mut d = [0u32; 8];
+        for k in 0..4 {
+            d[k] = front[k];
+            d[k + 4] = back[k].wrapping_add(add);
+        }
         let mut lone = 0u32;
         for k in 0..8 {
             let q = ((quoted >> k) & 1) as u32;
@@ -222,9 +216,9 @@ pub unsafe fn event_line(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u3
     let cl = bzhi(cb, lb);
     // Refused: fewer than three commas in the first 64 bytes, a line break
     // before the third, no line break within 64 bytes of it (or past the
-    // 96 read), or not exactly six commas before the line break. (Each of
-    // the first three sets a bit above 5 in the count.)
-    let mut bad = u64::from((cl.count_ones() | (a2 & 64) | (lb & !63)) != 4);
+    // 96 read), or not exactly six commas before the line break. Any of
+    // them leaves a bit set.
+    let mut bad = u64::from((cl.count_ones() ^ 4) | (a2 & 64) | (lb & !63));
     let t = blsr(cl);
     let b3 = tz(t);
     let t = blsr(t);
@@ -243,8 +237,7 @@ pub unsafe fn event_line(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u3
     // Every quote of the line is the first or last byte of a field.
     let stray = (bzhi(qf, a2) & !(sf | (ef >> 1))) | (bzhi(qb, lb) & !(sb | (eb >> 1)));
     bad |= stray | (open ^ close);
-    let d = Delims::new([u32::MAX, a0, a1, a2, a2 + b3, a2 + b4, a2 + b5, a2 + lb]);
-    let lone = bounds::<7>(&d.0, open, out);
+    let lone = bounds::<7>([u32::MAX, a0, a1, a2], [b3, b4, b5, lb], a2, open, out);
     if (bad | u64::from(lone)) != 0 {
         return REFUSED;
     }
@@ -261,7 +254,7 @@ pub unsafe fn click_line(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u3
     let qf = u64::from(m.q[0]) | (u64::from(m.q[1]) << 32);
     let l = tz(nf);
     let cl = bzhi(cf, l);
-    let mut bad = u64::from((cl.count_ones() | (l & 64)) != 3);
+    let mut bad = u64::from((cl.count_ones() ^ 3) | (l & 64));
     let a0 = tz(cl);
     let t = blsr(cl);
     let a1 = tz(t);
@@ -272,8 +265,7 @@ pub unsafe fn click_line(p: *const u8, out: &mut Bounds, clean: &mut bool) -> u3
     let close = pext(qf << 1, e);
     let stray = bzhi(qf, l) & !(s | (e >> 1));
     bad |= stray | (open ^ close);
-    let d = Delims::new([u32::MAX, a0, a1, a2, l, l, l, l]);
-    let lone = bounds::<4>(&d.0, open, out);
+    let lone = bounds::<4>([u32::MAX, a0, a1, a2], [0; 4], l, open, out);
     if (bad | u64::from(lone)) != 0 {
         return REFUSED;
     }

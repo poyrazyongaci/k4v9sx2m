@@ -74,12 +74,28 @@ pub unsafe fn pack(p: *const u8, len: usize) -> u64 {
 #[inline(always)]
 pub unsafe fn pack_known(p: *const u8, len: usize) -> u64 {
     if len <= 9 {
-        let v = load64(p) & *LEN_MASK.get_unchecked(len);
-        let ninth = u64::from(*p.add(8)) & (0u64.wrapping_sub(u64::from(len == 9)));
-        return (squeeze(v.swap_bytes()) << 7) | ninth;
+        // All nine bytes packed, then the key bits past the ID cleared:
+        // the byte swap folds into the load (`movbe`), and one mask does
+        // the work of the length mask and the ninth byte select. Bytes 1
+        // to 8 go through `squeeze`, which drops their high bits; byte 0
+        // is the ID's own (in 1..=127) unless `len` is 0, and then the
+        // mask is 0.
+        let all = squeeze(load64(p.add(1)).swap_bytes()) | (u64::from(*p) << 56);
+        return all & *KEY_MASK.get_unchecked(len);
     }
     intern(std::slice::from_raw_parts(p, len))
 }
+
+/// The key bits of the first `len` bytes: 7 a byte from bit 62 down.
+const KEY_MASK: [u64; 10] = {
+    let mut m = [0u64; 10];
+    let mut len = 1;
+    while len <= 9 {
+        m[len] = ((1u64 << (7 * len)) - 1) << (63 - 7 * len);
+        len += 1;
+    }
+    m
+};
 
 /// `pack`, by the short route when `known` says the bytes are in 1..=127.
 #[inline(always)]
