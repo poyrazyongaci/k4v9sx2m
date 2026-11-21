@@ -12,5 +12,5 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
 FROM scratch
 COPY --from=build /sessions /sessions
 USER 1000:1000
-ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+ENV ENGINE_DENSE=1 DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
 CMD ["/sessions"]

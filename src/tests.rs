@@ -9,15 +9,26 @@ use crate::engine::{self, Config};
 use crate::naive;
 
 fn cfg(threads: usize, chunk: usize, bits: u32) -> Config {
-    Config { threads, timing: false, collect: true, chunk_bytes: chunk, p1_bits: Some(bits), p2_bits: Some(bits), onepass: true }
+    Config {
+        threads,
+        timing: false,
+        collect: true,
+        chunk_bytes: chunk,
+        p1_bits: Some(bits),
+        p2_bits: Some(bits),
+        onepass: true,
+        dense: false,
+        dense_slots: None,
+    }
 }
 
 fn compare(data: &Path, config: &Config) -> [i64; 5] {
     let lk = load_lookups(data);
     let want = naive::run(data, &lk);
-    // Both shapes of the engine, one-pass and three-phase.
+    // All shapes of the engine: one-pass, three-phase and dense.
     let other = Config { onepass: !config.onepass, ..*config };
-    for config in [config, &other] {
+    let dense = Config { dense: true, ..*config };
+    for config in [config, &other, &dense] {
         check_shape(data, config, &lk, &want);
     }
     [
@@ -29,11 +40,24 @@ fn compare(data: &Path, config: &Config) -> [i64; 5] {
     ]
 }
 
-fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) {
+/// Run one shape and compare it with the reference; true when the dense
+/// shape ran to the end.
+fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) -> bool {
     let mut got = engine::run(data, None, lk, config, std::time::Instant::now()).expect("fast engine declined");
     got.sort();
+    // The dense shape gives up only when its table fills or a click record
+    // cannot hold its fields; the tests that force that set a tiny table.
+    if config.dense && config.dense_slots.is_none() {
+        assert!(got.dense, "{}: the dense shape gave up", data.display());
+    }
     let data = Path::new(data);
-    let shape = if config.onepass { "one-pass" } else { "three-phase" };
+    let shape = if config.dense {
+        "dense"
+    } else if config.onepass {
+        "one-pass"
+    } else {
+        "three-phase"
+    };
     let data = &data.join(shape);
     if got.user != want.user {
         for (a, b) in got.user.iter().zip(&want.user) {
@@ -51,6 +75,7 @@ fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) {
         }
         panic!("{}: campaign_daily rows {} vs {}", data.display(), got.camp.len(), want.camp.len());
     }
+    got.dense
 }
 
 fn fixtures_dir() -> Option<PathBuf> {
@@ -926,5 +951,197 @@ fn duplicate_copies_match_reference() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     assert!(sessions > 10_000, "only {sessions} sessions");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn dense_cfg(threads: usize, chunk: usize, bits: u32, slots: Option<usize>) -> Config {
+    Config { dense: true, dense_slots: slots, ..cfg(threads, chunk, bits) }
+}
+
+fn write_dataset(dir: &Path, ws: i64, days: i64, events: &str, clicks: &str, links: &str) {
+    let _ = std::fs::remove_dir_all(dir);
+    for sub in ["events", "clicks", "links"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::write(
+        dir.join("manifest.json"),
+        format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(ws + days * DAY_MS)),
+    )
+    .unwrap();
+    std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\np3,toys\n").unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+    let header = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents";
+    std::fs::write(dir.join("events/part-0.csv"), format!("{header}\n{events}")).unwrap();
+    std::fs::write(dir.join("clicks/part-0.csv"), format!("click_id,user_id,campaign_id,ts\n{clicks}")).unwrap();
+    std::fs::write(dir.join("links/part-0.csv"), format!("user_id_a,user_id_b\n{links}")).unwrap();
+}
+
+/// The dense shape with ID tables from far too small (it must give up and
+/// the three-phase shape must answer) to roomy, and person partitions of
+/// four slots up, so the index width is small and many partitions share
+/// the persons. Exact in every case.
+#[test]
+fn dense_table_sizes_match_reference() {
+    let root = std::env::temp_dir().join(format!("sessions-dense-sizes-{}", std::process::id()));
+    let (mut ran, mut gave_up, mut tiny) = (0, 0, 0);
+    for seed in 0..12u64 {
+        let dir = root.join(format!("s{seed}"));
+        generate(&dir, seed + 500, [300, 3000][(seed % 2) as usize]);
+        if seed % 3 == 0 {
+            add_long_lines(&dir, seed);
+        }
+        let lk = load_lookups(&dir);
+        let want = naive::run(&dir, &lk);
+        for slots in [64usize, 256, 1024, 4096, 16384, 1 << 16] {
+            for (threads, chunk, bits) in [(4, 256, 6), (3, 5000, 2), (8, 1024, 10)] {
+                let config = dense_cfg(threads, chunk, bits, Some(slots));
+                if check_shape(&dir, &config, &lk, &want) {
+                    ran += 1;
+                    tiny += usize::from(slots >> bits.min(slots.trailing_zeros() - 2) <= 8);
+                } else {
+                    gave_up += 1;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(ran > 50 && gave_up > 20 && tiny > 10, "ran {ran}, gave up {gave_up}, tiny partitions {tiny}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A click record holds `index << cbits | campaign` in 32 bits. When the
+/// index and the campaign do not fit, the dense shape gives up before it
+/// touches anything, and the answer is still exact.
+#[test]
+fn dense_wide_index_gives_up() {
+    let dir = std::env::temp_dir().join(format!("sessions-dense-wide-{}", std::process::id()));
+    generate(&dir, 77, 300);
+    let lk = load_lookups(&dir);
+    let want = naive::run(&dir, &lk);
+    assert!(!check_shape(&dir, &dense_cfg(2, 4096, 1, Some(1 << 31)), &lk, &want));
+    assert!(check_shape(&dir, &dense_cfg(2, 4096, 1, Some(1 << 12)), &lk, &want));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Few IDs, many rows, many threads and tiny chunks: threads keep meeting
+/// the same new IDs at the same moment. IDs come first from events, from
+/// clicks, or only from links; a person may be named by an ID no row uses,
+/// and IDs that cannot be packed are linked to ones that can.
+#[test]
+fn dense_new_ids_race_and_match() {
+    let root = std::env::temp_dir().join(format!("sessions-dense-race-{}", std::process::id()));
+    for seed in 0..6u64 {
+        let mut r = Rng(seed + 9000);
+        let dir = root.join(format!("r{seed}"));
+        let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+        let users: Vec<String> = (0..24)
+            .map(|i| match i % 6 {
+                0 => format!("averyveryverylonguser{i}"),
+                1 => format!("u\u{00e9}{i}"),
+                _ => format!("u{i}"),
+            })
+            .collect();
+        let mut events = String::new();
+        for n in 0..6000 {
+            let t = ws + r.below(13 * DAY_MS as u64) as i64;
+            let ingest = t - t.rem_euclid(1000) + 1000 * (1 + r.below(100) as i64);
+            let kind = if r.chance(4) { "purchase" } else { "view" };
+            let u = &users[r.below(users.len() as u64) as usize];
+            events.push_str(&format!("e{n},{u},{t},{}Z,{kind},p{},{}\n", utc(ingest), 1 + r.below(3), 100 + r.below(900)));
+            if r.chance(20) {
+                // A later copy naming another user.
+                let v = &users[r.below(users.len() as u64) as usize];
+                events.push_str(&format!("e{n},{v},{t},{}Z,{kind},p1,500\n", utc(ingest + 5000)));
+            }
+        }
+        let mut clicks = String::new();
+        for k in 0..2000 {
+            // Click-only IDs too: never in an event.
+            let u = if r.chance(5) { format!("konly{}", r.below(5)) } else { users[r.below(users.len() as u64) as usize].clone() };
+            let t = ws - 2 * DAY_MS + r.below(15 * DAY_MS as u64) as i64;
+            clicks.push_str(&format!("k{k},{u},c_{},{t}\n", 1 + r.below(3)));
+        }
+        // u2..u5 are named by "Aname", which no row uses; the long ID and
+        // the non-ASCII ones are linked to packable IDs; click-only IDs are
+        // linked to event IDs; some IDs are only in links.
+        let mut links = String::from("u2,Aname\nu3,u2\nu4,u3\nu5,Aname\n");
+        links.push_str("averyveryverylonguser0,u7\nu\u{00e9}1,u8\naveryveryverylonguser6,u\u{00e9}7\n");
+        links.push_str("konly0,u9\nkonly1,u10\nlinkonly1,u11\nlinkonly2,linkonly3\nu12,zzlink\n");
+        write_dataset(&dir, ws, 14, &events, &clicks, &links);
+        let lk = load_lookups(&dir);
+        let want = naive::run(&dir, &lk);
+        for (threads, chunk) in [(16, 64), (12, 128), (32, 200), (7, 333)] {
+            assert!(check_shape(&dir, &dense_cfg(threads, chunk, 3, None), &lk, &want), "seed {seed}: dense gave up");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One person with hundreds of thousands of events over several linked
+/// IDs, with clicks and purchases, next to small people.
+#[test]
+fn dense_whale_matches_reference() {
+    let dir = std::env::temp_dir().join(format!("sessions-dense-whale-{}", std::process::id()));
+    let mut r = Rng(4242);
+    let ws = days_from_civil(2027, 1, 1) * DAY_MS;
+    let mut events = String::new();
+    for n in 0..300_000u64 {
+        let who = if n % 50 == 0 { format!("s{}", r.below(300)) } else { format!("w{}", r.below(5)) };
+        let t = ws + r.below(14 * DAY_MS as u64) as i64;
+        let kind = if r.chance(30) { "purchase" } else { "view" };
+        let ingest = t - t.rem_euclid(1000) + 2000;
+        events.push_str(&format!("e{n},{who},{t},{}Z,{kind},p{},{}\n", utc(ingest), 1 + r.below(3), 1 + r.below(5000)));
+        if r.chance(40) {
+            events.push_str(&format!("e{n},s1,{t},{}Z,view,p1,\n", utc(ingest + 1000)));
+        }
+    }
+    let mut clicks = String::new();
+    for k in 0..5000 {
+        let who = if k % 3 == 0 { format!("s{}", r.below(300)) } else { format!("w{}", r.below(5)) };
+        let t = ws - 7 * DAY_MS + r.below(21 * DAY_MS as u64) as i64;
+        clicks.push_str(&format!("k{k},{who},c_{},{t}\n", 1 + r.below(3)));
+    }
+    write_dataset(&dir, ws, 14, &events, &clicks, "w1,w0\nw2,w1\nw3,w4\nw4,w0\n");
+    let lk = load_lookups(&dir);
+    let want = naive::run(&dir, &lk);
+    let biggest: i64 = want.user.iter().filter(|r| r.user_id == b"w0").map(|r| r.events).sum();
+    assert!(biggest > 250_000, "whale has {biggest} events");
+    for (threads, chunk, bits) in [(8, 1 << 16, 3), (4, 4 << 20, 1)] {
+        assert!(check_shape(&dir, &dense_cfg(threads, chunk, bits, None), &lk, &want));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Times are 32-bit milliseconds from the click window start. A window of
+/// 42 days (49 with the click reach) fits and runs dense; 43 days does not,
+/// and the fast engine declines, so the reference answers.
+#[test]
+fn dense_long_window_falls_back() {
+    let root = std::env::temp_dir().join(format!("sessions-dense-long-{}", std::process::id()));
+    let ws = days_from_civil(2026, 1, 1) * DAY_MS;
+    for days in [42i64, 43] {
+        let dir = root.join(format!("d{days}"));
+        let mut r = Rng(days as u64);
+        let mut events = String::new();
+        for n in 0..3000 {
+            let t = ws + r.below((days * DAY_MS) as u64) as i64;
+            events.push_str(&format!("e{n},u{},{t},{}Z,view,p1,\n", r.below(40), utc(t - t.rem_euclid(1000) + 1000)));
+        }
+        let mut clicks = String::new();
+        for k in 0..500 {
+            let t = ws - 7 * DAY_MS + r.below(((days + 7) * DAY_MS) as u64) as i64;
+            clicks.push_str(&format!("k{k},u{},c_1,{t}\n", r.below(40)));
+        }
+        write_dataset(&dir, ws, days, &events, &clicks, "u1,u2\n");
+        let lk = load_lookups(&dir);
+        let config = dense_cfg(4, 4096, 2, None);
+        if days == 42 {
+            let want = naive::run(&dir, &lk);
+            assert!(check_shape(&dir, &config, &lk, &want));
+        } else {
+            assert!(engine::run(&dir, None, &lk, &config, std::time::Instant::now()).is_none());
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

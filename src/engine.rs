@@ -32,6 +32,8 @@ use crate::scan::{for_each_line, for_each_line_b, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
 use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, parse_ts_ingest, DateCache, BAD};
 
+mod dense;
+
 pub struct Config {
     pub threads: usize,
     pub timing: bool,
@@ -42,6 +44,10 @@ pub struct Config {
     pub p2_bits: Option<u32>,
     /// The one-pass shape (see the top of this file).
     pub onepass: bool,
+    /// The dense shape (see `dense.rs`); wins over `onepass`.
+    pub dense: bool,
+    /// Dense shape: slots of the ID table (a power of two), for tests.
+    pub dense_slots: Option<usize>,
 }
 
 impl Config {
@@ -55,6 +61,8 @@ impl Config {
             p1_bits: num("ENGINE_P1_BITS"),
             p2_bits: num("ENGINE_P2_BITS"),
             onepass: std::env::var("ENGINE_ONEPASS").is_ok_and(|v| v == "1"),
+            dense: std::env::var("ENGINE_DENSE").is_ok_and(|v| v == "1"),
+            dense_slots: std::env::var("ENGINE_DENSE_SLOTS").ok().and_then(|v| v.parse().ok()),
         }
     }
 }
@@ -786,6 +794,8 @@ struct ParseState<'a> {
     /// The one-pass shape: where parsed copies and clicks go instead of
     /// `entries` and `clicks`.
     emit: Option<Box<Emit>>,
+    /// The dense shape: the same, with person numbers.
+    dense: Option<Box<dense::DenseEmit>>,
 }
 
 /// Where a one-pass parser sends what it parsed: person lookups in blocks,
@@ -926,16 +936,21 @@ const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
 impl<'a> ParseState<'a> {
-    /// The event lines of a window. `ONE` is the one-pass shape: every
-    /// copy goes to `emit` for its person lookup, not to `entries`.
+    /// The event lines of a window. `MODE` 1 is the one-pass shape: every
+    /// copy goes to `emit` for its person lookup, not to `entries`; 2 is the
+    /// dense shape, where it goes to `dense`.
     #[inline(never)]
-    unsafe fn events<const ONE: bool>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+    unsafe fn events<const MODE: u8>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
         let cache = &mut self.cache;
         let entries = &mut self.entries;
         let emit: *mut Emit = match &mut self.emit {
+            Some(e) => &mut **e,
+            None => std::ptr::null_mut(),
+        };
+        let dense: *mut dense::DenseEmit = match &mut self.dense {
             Some(e) => &mut **e,
             None => std::ptr::null_mut(),
         };
@@ -980,7 +995,9 @@ impl<'a> ParseState<'a> {
                     w3 = (ts_rel << 32) | (price << 8) | u64::from(cat);
                 }
             }
-            if ONE {
+            if MODE == 2 {
+                (*dense).event(Entry { ekey, ukey, ingest, w3 });
+            } else if MODE == 1 {
                 (*emit).event(Entry { ekey, ukey, ingest, w3 });
             } else {
                 let part = event_part(ekey, shift1);
@@ -990,12 +1007,16 @@ impl<'a> ParseState<'a> {
     }
 
     #[inline(never)]
-    unsafe fn clicks<const ONE: bool>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+    unsafe fn clicks<const MODE: u8>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let fast = self.fast;
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
         let clicks = &mut self.clicks;
         let emit: *mut Emit = match &mut self.emit {
+            Some(e) => &mut **e,
+            None => std::ptr::null_mut(),
+        };
+        let dense: *mut dense::DenseEmit = match &mut self.dense {
             Some(e) => &mut **e,
             None => std::ptr::null_mut(),
         };
@@ -1018,7 +1039,11 @@ impl<'a> ParseState<'a> {
             let ckey = ids::pack_in(base.add(b.start(0)), id_len, known);
             let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
             let click = Click { key: ukey, ckey, tc: (rel << 32) | u64::from(camp) };
-            if ONE {
+            if MODE == 2 {
+                (*dense).click(click);
+                return;
+            }
+            if MODE == 1 {
                 (*emit).click(click);
                 return;
             }
@@ -1080,6 +1105,10 @@ impl<'a> ParseState<'a> {
                 }
                 let w3 = if valid { (ts_rel << 32) | pc } else { DEAD };
                 let entry = Entry { ekey, ukey, ingest: ingest.unwrap_or(i64::MAX), w3 };
+                if let Some(dense) = &mut self.dense {
+                    dense.event(entry);
+                    return;
+                }
                 match &mut self.emit {
                     Some(emit) => emit.event(entry),
                     None => self.entries.push(event_part(ekey, self.shift1), entry),
@@ -1102,6 +1131,10 @@ impl<'a> ParseState<'a> {
                     return;
                 }
                 let click = Click { key: ids::pack_slice(f[1]), ckey: ids::pack_slice(f[0]), tc: (rel << 32) | u64::from(camp) };
+                if let Some(dense) = &mut self.dense {
+                    dense.click(click);
+                    return;
+                }
                 if let Some(emit) = &mut self.emit {
                     emit.click(click);
                     return;
@@ -1126,11 +1159,14 @@ impl<'a> ParseState<'a> {
     #[inline(always)]
     unsafe fn consume(&mut self, kind: Kind, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let one = self.emit.is_some();
+        let dense = self.dense.is_some();
         match kind {
-            Kind::Events if one => self.events::<true>(base, scan, limit),
-            Kind::Events => self.events::<false>(base, scan, limit),
-            Kind::Clicks if one => self.clicks::<true>(base, scan, limit),
-            Kind::Clicks => self.clicks::<false>(base, scan, limit),
+            Kind::Events if dense => self.events::<2>(base, scan, limit),
+            Kind::Events if one => self.events::<1>(base, scan, limit),
+            Kind::Events => self.events::<0>(base, scan, limit),
+            Kind::Clicks if dense => self.clicks::<2>(base, scan, limit),
+            Kind::Clicks if one => self.clicks::<1>(base, scan, limit),
+            Kind::Clicks => self.clicks::<0>(base, scan, limit),
             Kind::Links => self.links(base, scan, limit),
         }
     }
@@ -1464,6 +1500,8 @@ struct Deduper<'a> {
     /// The note chunks of the partition at hand, by number from 1.
     bases: Vec<*mut Note>,
     ingest_base: i64,
+    /// The records are the dense shape's 8-byte words.
+    dense: bool,
 }
 
 impl<'a> Deduper<'a> {
@@ -1471,7 +1509,11 @@ impl<'a> Deduper<'a> {
     #[inline(always)]
     unsafe fn drop_record(&self, rec: u32) {
         if rec != NO_RECORD {
-            (*self.dir.record::<Ev>(rec)).v = DEAD;
+            if self.dense {
+                *self.dir.record::<u64>(rec) = dense::DROPPED;
+            } else {
+                (*self.dir.record::<Ev>(rec)).v = DEAD;
+            }
         }
     }
 
@@ -3618,6 +3660,7 @@ fn front_onepass(
             clicks: Vec::new(),
             pairs: Vec::new(),
             emit,
+            dense: None,
         },
         scan: Scan::new(WINDOW),
     };
@@ -3728,7 +3771,7 @@ fn front_onepass(
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| unsafe {
-                let mut dedup = Deduper { dir: directory, table: Vec::new(), bases: Vec::new(), ingest_base: note_base(fast.ws) };
+                let mut dedup = Deduper { dir: directory, table: Vec::new(), bases: Vec::new(), ingest_base: note_base(fast.ws), dense: false };
                 let mut lists: Vec<List<Note>> = Vec::with_capacity(threads);
                 loop {
                     let at = next.fetch_add(1, Ordering::Relaxed);
@@ -3808,6 +3851,11 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let drop_pages = std::env::var("ENGINE_DROP").map_or(true, |v| v != "0");
     let cpu_total = Mutex::new(0.0f64);
     let inputs = Inputs { events: &event_files, clicks: &click_files, links: &link_files };
+    if cfg.dense {
+        if let Some(tables) = dense::run(fast, lk, cfg, out, &inputs, &jobs, (bits1, bits2), drop_pages, &cpu_total, &mut timer) {
+            return Some(tables);
+        }
+    }
     let (ev_lists, cl_lists, unmapper) = if onepass {
         let (ev, cl) = front_onepass(fast, cfg, &inputs, &jobs, (bits1, bits2), drop_pages, &cpu_total, &mut timer);
         (ev, cl, None)
@@ -3831,6 +3879,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                             clicks: Vec::new(),
                             pairs: Vec::new(),
                             emit: None,
+                            dense: None,
                         },
                         scan: Scan::new(WINDOW),
                     };
@@ -4018,7 +4067,26 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     });
     let cells = std::mem::take(&mut *shared_cells.lock().unwrap());
     timer.lap("person", std::mem::take(&mut *cpu_total.lock().unwrap()));
+    if let Some(handle) = unmapper {
+        let _ = handle.join();
+    }
+    Some(finish(fast, lk, cfg, out, cells, total_rows, check, collected.into_inner().unwrap(), &mut timer))
+}
 
+/// After the person phase: campaign_daily from the summed cells, the empty
+/// user_daily file if no row was written, the self-check.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    fast: &Fast,
+    lk: &Lookups,
+    cfg: &Config,
+    out: Option<&Path>,
+    cells: Cells,
+    total_rows: u64,
+    check: (u64, u64),
+    collected: Vec<UserRow>,
+    timer: &mut Timer,
+) -> Tables {
     // campaign_daily straight from the cells into columns, names borrowed;
     // owned rows only when the caller collects the tables (tests).
     let live = |i: usize| cells.agg[i][0] != 0 || cells.assists[i] != 0;
@@ -4046,9 +4114,6 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
             crate::output::write_user_rows(&out.join("user_daily/part-0.parquet"), &[]);
         }
     }
-    if let Some(handle) = unmapper {
-        let _ = handle.join();
-    }
     timer.lap("finish", 0.0);
     if cfg.timing {
         prof::report();
@@ -4068,8 +4133,8 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     if cfg.collect {
         tables.camp = camp.rows();
     }
-    tables.user = collected.into_inner().unwrap();
-    Some(tables)
+    tables.user = collected;
+    tables
 }
 
 #[cfg(test)]

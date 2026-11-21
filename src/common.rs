@@ -36,6 +36,8 @@ pub struct CampRow {
 pub struct Tables {
     pub user: Vec<UserRow>,
     pub camp: Vec<CampRow>,
+    /// The fast engine ran its dense shape to the end (tests).
+    pub dense: bool,
 }
 
 impl Tables {
