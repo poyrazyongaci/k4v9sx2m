@@ -10,6 +10,9 @@ path = "src/main.rs"
 [dependencies]
 libc = { version = "0.2", default-features = false }
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ss_hot)"] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

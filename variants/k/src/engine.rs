@@ -29,6 +29,7 @@ use crate::ids::{self, cmp_ids};
 use crate::output::{write_camp_cols, CampCols};
 use crate::usercols::UserOut;
 use crate::fuse;
+use crate::kparse;
 use crate::scan::{for_each_line, for_each_line_b, Bounds, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
 use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, parse_ts_ingest, DateCache, BAD};
@@ -1163,6 +1164,11 @@ impl Emit {
     }
 }
 
+// With `--cfg ss_hot`: the section of `events`, 4096-byte aligned (see
+// `sys::layout`).
+#[cfg(all(ss_hot, target_arch = "x86_64"))]
+core::arch::global_asm!(".pushsection .text.hot_events,\"ax\",@progbits", ".p2align 12", ".popsection");
+
 const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -1172,7 +1178,14 @@ impl<'a> ParseState<'a> {
     /// copy goes to `emit` for its person lookup, not to `entries`; 2 is the
     /// dense shape, where it goes to `dense`.
     #[inline(never)]
+    #[cfg_attr(all(ss_hot, target_arch = "x86_64"), link_section = ".text.hot_events")]
     unsafe fn events<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
+        crate::layout_pad!(sys::layout::EVENTS_PAD);
+        self.events_body::<MODE, L>(src)
+    }
+
+    #[inline(always)]
+    unsafe fn events_body<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
@@ -1239,6 +1252,28 @@ impl<'a> ParseState<'a> {
 
     #[inline(never)]
     unsafe fn clicks<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
+        self.clicks_body::<MODE, L>(src)
+    }
+
+    /// The event and click loops of the default shape on the AVX-512
+    /// readers (`ENGINE_K`, see `kparse.rs`): the same loops, compiled with
+    /// the AVX-512 features so the classifier inlines.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,avx512f,avx512bw,avx512vl,avx512dq")]
+    unsafe fn events_k<L: Lines>(&mut self, src: L) -> usize {
+        self.events_body::<0, L>(src)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,avx512f,avx512bw,avx512vl,avx512dq")]
+    unsafe fn clicks_k<L: Lines>(&mut self, src: L) -> usize {
+        self.clicks_body::<0, L>(src)
+    }
+
+    #[inline(always)]
+    unsafe fn clicks_body<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
         let fast = self.fast;
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
@@ -1425,9 +1460,34 @@ impl<'a> ParseState<'a> {
     /// or later, or the start of a line that only `long_line` can take.
     #[inline(always)]
     unsafe fn consume_fused(&mut self, kind: Kind, m: Mapped, pos: usize, end: usize, scan: &mut Scan) -> usize {
-        let src = Fused { m, pos, end, scan };
         let one = self.emit.is_some();
         let dense = self.dense.is_some();
+        #[cfg(target_arch = "x86_64")]
+        if !one && !dense {
+            use kparse::{With, Vl, Zmm, Avx2, K_VL, K_ZMM, K_AVX2};
+            macro_rules! go {
+                ($k:ty) => {{
+                    let src: Fused<'_, With<$k>> = Fused { m, pos, end, scan, reader: std::marker::PhantomData };
+                    return match kind {
+                        Kind::Events => self.events_k(src),
+                        _ => self.clicks_k(src),
+                    };
+                }};
+            }
+            match kparse::mode() {
+                K_VL => go!(Vl),
+                K_ZMM => go!(Zmm),
+                K_AVX2 => {
+                    let src: Fused<'_, With<Avx2>> = Fused { m, pos, end, scan, reader: std::marker::PhantomData };
+                    return match kind {
+                        Kind::Events => self.events::<0, _>(src),
+                        _ => self.clicks::<0, _>(src),
+                    };
+                }
+                _ => {}
+            }
+        }
+        let src: Fused = Fused { m, pos, end, scan, reader: std::marker::PhantomData };
         match kind {
             Kind::Events if dense => self.events::<2, _>(src),
             Kind::Events if one => self.events::<1, _>(src),
@@ -1470,11 +1530,12 @@ impl Lines for Scanned<'_> {
 /// before. Returns where it stopped: at or past `end`, or at a line that
 /// no small window holds whole (too long, or the last line of the file
 /// without a line break).
-struct Fused<'s> {
+struct Fused<'s, R = kparse::Fuse> {
     m: Mapped,
     pos: usize,
     end: usize,
     scan: &'s mut Scan,
+    reader: std::marker::PhantomData<R>,
 }
 
 /// The window a refused line is read with.
@@ -1482,17 +1543,17 @@ const REFUSED_WINDOW: usize = 256;
 /// How far ahead of the reader the input is prefetched.
 const FUSED_AHEAD: usize = 1024;
 
-impl Lines for Fused<'_> {
+impl<R: kparse::Reader> Lines for Fused<'_, R> {
     #[inline(always)]
     unsafe fn run<const N: usize>(self, mut f: impl FnMut(*const u8, &Bounds, bool)) -> usize {
-        let Fused { m, mut pos, end, scan } = self;
+        let Fused { m, mut pos, end, scan, .. } = self;
         let mut b = Bounds::new();
         while pos < end {
             let p = m.ptr.add(pos);
             sys::prefetch(p.wrapping_add(FUSED_AHEAD));
             sys::prefetch(p.wrapping_add(FUSED_AHEAD + 64));
             let mut known = false;
-            let nl = if N == 7 { fuse::event_line(p, &mut b, &mut known) } else { fuse::click_line(p, &mut b, &mut known) };
+            let nl = R::line::<N>(p, &mut b, &mut known);
             let mut used = nl as usize + 1;
             if nl == fuse::REFUSED {
                 // One call site for `f`, so it is inlined.
@@ -4278,8 +4339,9 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     timer.lap("lookups", 0.0);
     prof::ON.store(cfg.timing, Ordering::Relaxed);
     let simd = crate::scan::init_simd();
+    let kmode = crate::kparse::init();
     if cfg.timing {
-        eprintln!("[engine] stage 1 simd mode {simd}");
+        eprintln!("[engine] stage 1 simd mode {simd}, k reader {kmode}");
     }
     let event_files: Vec<Mapped> = list_csv(&data.join("events")).iter().map(|p| sys::map_file(p)).collect();
     let click_files: Vec<Mapped> = list_csv(&data.join("clicks")).iter().map(|p| sys::map_file(p)).collect();
@@ -5031,7 +5093,7 @@ mod fused_tests {
         unsafe {
             while pos < len {
                 let start = buf.as_ptr();
-                let src = Fused { m, pos, end: len, scan: &mut scan };
+                let src: Fused = Fused { m, pos, end: len, scan: &mut scan, reader: std::marker::PhantomData };
                 pos = src.run::<N>(|p, b, k| collect::<N>(p, start, b, k, &mut out));
                 if pos < len {
                     let end = text[pos..].iter().position(|&c| c == b'\n').map_or(len, |i| pos + i);
