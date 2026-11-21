@@ -201,29 +201,99 @@ impl<'a> Fast<'a> {
 /// every linked ID whose person is not named by that ID itself. A miss
 /// means the ID is its own person. Open addressing, 16-byte slots, on huge
 /// pages where the kernel gives them.
+///
+/// Most IDs that are looked up are their own person's name and so are not
+/// in the map at all. A small blocked Bloom filter (two bits in one word
+/// per key, about a megabyte at 20M events) answers "not in the map"
+/// from the cache, so only likely hits pay for a probe of the big table. A
+/// filter miss is exact; a filter hit is always confirmed by the table.
+#[derive(Clone, Copy)]
 pub struct LinkMap {
     slots: *mut [u64; 2],
     mask: usize,
+    /// Index of a slot past the table that is always empty: where lookups
+    /// the filter rejected are sent, so the probe needs no extra branch.
+    nowhere: usize,
+    filter: *mut u64,
+    fmask: usize,
 }
 unsafe impl Send for LinkMap {}
 unsafe impl Sync for LinkMap {}
 
 impl LinkMap {
-    fn with_slots(cap: usize) -> LinkMap {
-        // Fresh anonymous memory is zero, and 0 is the empty key.
-        LinkMap { slots: sys::anon(cap * 16) as *mut [u64; 2], mask: cap - 1 }
+    /// A table of `cap` slots and a filter sized for `keys` keys.
+    fn with_slots(cap: usize, keys: usize) -> LinkMap {
+        // Fresh anonymous memory is zero, and 0 is the empty key. One extra
+        // slot at the end stays empty for ever (`nowhere`).
+        let words = (keys / 8).next_power_of_two().clamp(64, 1 << 21);
+        // The filter is small; put it on a 2 MiB boundary so one huge page
+        // can back it.
+        const HUGE: usize = 2 << 20;
+        let raw = sys::anon(words * 8 + HUGE) as usize;
+        let filter = ((raw + HUGE - 1) & !(HUGE - 1)) as *mut u64;
+        LinkMap { slots: sys::anon((cap + 1) * 16) as *mut [u64; 2], mask: cap - 1, nowhere: cap, filter, fmask: words - 1 }
+    }
+    #[inline(always)]
+    fn home_of(&self, h: u64) -> usize {
+        (h >> 17) as usize & self.mask
     }
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        (mix(key) >> 17) as usize & self.mask
+        self.home_of(mix(key))
     }
     #[inline(always)]
-    fn prefetch(&self, key: u64) {
+    fn filter_word(&self, h: u64) -> *mut u64 {
+        unsafe { self.filter.add((h >> 43) as usize & self.fmask) }
+    }
+    #[inline(always)]
+    fn filter_bits(h: u64) -> u64 {
+        (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
+    }
+    /// Where the lookup of a key with hash `h` starts: its home slot if
+    /// the filter says the key may be present, else the empty slot.
+    #[inline(always)]
+    fn start(&self, h: u64) -> usize {
+        let bits = Self::filter_bits(h);
+        let maybe = unsafe { *self.filter_word(h) } & bits == bits;
+        // A coin toss: this must be a conditional move, never a branch.
+        std::hint::select_unpredictable(maybe, self.home_of(h), self.nowhere)
+    }
+    /// Prefetch for the build, which probes before the filter exists.
+    #[inline(always)]
+    fn prefetch_home(&self, key: u64) {
         prefetch(unsafe { self.slots.add(self.home(key)) });
     }
+    /// A lookup in three stages, so that a block of them can overlap their
+    /// cache misses: `stage1` hashes the key and asks for its filter word,
+    /// `stage2` reads the filter and asks for the table slot (or for the
+    /// empty slot), `stage3` reads the slot and returns the person.
     #[inline(always)]
-    fn person(&self, key: u64) -> u64 {
-        let mut i = self.home(key);
+    fn stage1(&self, key: u64) -> u64 {
+        let h = mix(key);
+        prefetch(self.filter_word(h));
+        h
+    }
+    #[inline(always)]
+    fn stage2(&self, h: u64) -> usize {
+        let i = self.start(h);
+        prefetch(unsafe { self.slots.add(i) });
+        i
+    }
+    #[inline(always)]
+    fn stage3(&self, i: usize, key: u64) -> u64 {
+        let s = unsafe { *self.slots.add(i) };
+        // Hit or empty slot is another coin toss; a slot holding some other
+        // key is rare and goes out of line.
+        let found = std::hint::select_unpredictable(s[0] == key, s[1], key);
+        if (s[0] != key) & (s[0] != 0) {
+            return self.person_far(key, i);
+        }
+        found
+    }
+    /// The rest of the probe sequence after a first slot held another key.
+    #[inline(never)]
+    fn person_far(&self, key: u64, first: usize) -> u64 {
+        let mut i = (first + 1) & self.mask;
         loop {
             let s = unsafe { *self.slots.add(i) };
             if s[0] == key {
@@ -239,7 +309,7 @@ impl LinkMap {
     fn build(pairs: &[(u64, u64)]) -> LinkMap {
         // Pass 1: a dense node id per distinct ID, and union-find over them.
         let cap = (pairs.len() * 4).next_power_of_two().max(16);
-        let ids = LinkMap::with_slots(cap);
+        let ids = LinkMap::with_slots(cap, 0);
         let mut keys: Vec<u64> = Vec::with_capacity(pairs.len() * 2 + 16);
         let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 2 + 16);
         fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -255,8 +325,8 @@ impl LinkMap {
         }
         for block in pairs.chunks(16) {
             for &(a, b) in block {
-                ids.prefetch(a);
-                ids.prefetch(b);
+                ids.prefetch_home(a);
+                ids.prefetch_home(b);
             }
             for &(a, b) in block {
                 let mut node = [0u32; 2];
@@ -298,18 +368,20 @@ impl LinkMap {
                 renamed.push([keys[id as usize], keys[root as usize]]);
             }
         }
-        let map = LinkMap::with_slots((renamed.len() * 2).next_power_of_two().max(16));
+        let map = LinkMap::with_slots((renamed.len() * 2).next_power_of_two().max(16), renamed.len());
         for block in renamed.chunks(16) {
             for pair in block {
-                map.prefetch(pair[0]);
+                map.prefetch_home(pair[0]);
             }
             for pair in block {
-                let mut i = map.home(pair[0]);
+                let h = mix(pair[0]);
+                let mut i = map.home_of(h);
                 unsafe {
                     while (*map.slots.add(i))[0] != 0 {
                         i = (i + 1) & map.mask;
                     }
                     *map.slots.add(i) = *pair;
+                    *map.filter_word(h) |= Self::filter_bits(h);
                 }
             }
         }
@@ -354,7 +426,7 @@ impl<'a> ParseState<'a> {
         let shift1 = self.shift1;
         let cache = &mut self.cache;
         let entries = &mut self.entries;
-        for_each_line::<7>(base, scan, limit, |s, e| {
+        for_each_line::<7>(scan, limit, |s, e| {
             let id_len = (e[0] - s[0]) as usize;
             if id_len == 0 {
                 return;
@@ -400,7 +472,7 @@ impl<'a> ParseState<'a> {
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
         let clicks = &mut self.clicks;
-        for_each_line::<4>(base, scan, limit, |s, e| {
+        for_each_line::<4>(scan, limit, |s, e| {
             let id_len = (e[0] - s[0]) as usize;
             let user_len = (e[1] - s[1]) as usize;
             if id_len == 0 || user_len == 0 {
@@ -427,7 +499,7 @@ impl<'a> ParseState<'a> {
     #[inline(never)]
     unsafe fn links(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let pairs = &mut self.pairs;
-        for_each_line::<2>(base, scan, limit, |s, e| {
+        for_each_line::<2>(scan, limit, |s, e| {
             let (la, lb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
             if la == 0 || lb == 0 {
                 return;
@@ -525,8 +597,8 @@ struct Resolver<'a> {
 }
 
 const PTR_MASK: u64 = (1 << 48) - 1;
-/// How many link lookups are prefetched ahead of the one in use.
-const AHEAD: usize = 16;
+/// Link lookups run in blocks of this many records, one stage at a time.
+const BLOCK: usize = 128;
 
 impl<'a> Resolver<'a> {
     /// Dedup one event partition and scatter its surviving valid events by
@@ -575,25 +647,28 @@ impl<'a> Resolver<'a> {
             });
         }
         let t = prof::add(4, t);
-        let links = self.links;
+        // The link map is far bigger than the cache. Lookups go a block at
+        // a time, each stage for the whole block, so the misses of a block
+        // are all in flight together and every loop stays small.
+        let links = *self.links;
         let shift2 = self.shift2;
         let ev = &mut self.ev;
+        let mut hashes = [0u64; BLOCK];
+        let mut starts = [0usize; BLOCK];
         for list in lists {
             list.for_each_chunk(|chunk| {
-                // The link map is far bigger than the cache: keep a window
-                // of lookups in flight ahead of the one being used.
-                let n = chunk.len();
-                for entry in &chunk[..n.min(AHEAD)] {
-                    links.prefetch(entry.ukey);
-                }
-                for i in 0..n {
-                    if i + AHEAD < n {
-                        links.prefetch(chunk.get_unchecked(i + AHEAD).ukey);
+                for block in chunk.chunks(BLOCK) {
+                    for (h, entry) in hashes.iter_mut().zip(block) {
+                        *h = links.stage1(entry.ukey);
                     }
-                    let entry = chunk.get_unchecked(i);
-                    if entry.w3 != DEAD {
-                        let pkey = links.person(entry.ukey);
-                        ev.push((mix(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                    for (at, &h) in starts.iter_mut().zip(&hashes[..block.len()]) {
+                        *at = links.stage2(h);
+                    }
+                    for (&at, entry) in starts.iter().zip(block) {
+                        if entry.w3 != DEAD {
+                            let pkey = links.stage3(at, entry.ukey);
+                            ev.push((mix(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                        }
                     }
                 }
             });
@@ -615,18 +690,22 @@ impl<'a> Resolver<'a> {
 
     unsafe fn clicks(&mut self, block: &[Click]) {
         let t = prof::start();
-        let links = self.links;
-        let n = block.len();
-        for click in &block[..n.min(AHEAD)] {
-            links.prefetch(click.key);
-        }
-        for i in 0..n {
-            if i + AHEAD < n {
-                links.prefetch(block.get_unchecked(i + AHEAD).key);
+        let links = *self.links;
+        let shift2 = self.shift2;
+        let cl = &mut self.cl;
+        let mut hashes = [0u64; BLOCK];
+        let mut starts = [0usize; BLOCK];
+        for part in block.chunks(BLOCK) {
+            for (h, click) in hashes.iter_mut().zip(part) {
+                *h = links.stage1(click.key);
             }
-            let click = block.get_unchecked(i);
-            let pkey = links.person(click.key);
-            self.cl.push((mix(pkey) >> self.shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+            for (at, &h) in starts.iter_mut().zip(&hashes[..part.len()]) {
+                *at = links.stage2(h);
+            }
+            for (&at, click) in starts.iter().zip(part) {
+                let pkey = links.stage3(at, click.key);
+                cl.push((mix(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+            }
         }
         prof::add(6, t);
     }
@@ -994,11 +1073,13 @@ impl<'a> PersonPhase<'a> {
 
 // ---------------------------------------------------------------- driver
 
-fn bits_for(estimate: u64, forced: Option<u32>) -> u32 {
+/// Partition count, as a power of two, for about `per_part` estimated rows a
+/// partition.
+fn bits_for(estimate: u64, per_part: u64, forced: Option<u32>) -> u32 {
     match forced {
         Some(b) => b.clamp(1, 14),
         None => {
-            let parts = (estimate / 24_000).next_power_of_two().clamp(16, 4096);
+            let parts = (estimate / per_part).next_power_of_two().clamp(16, 4096);
             parts.trailing_zeros()
         }
     }
@@ -1041,8 +1122,13 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let threads = cfg.threads;
 
     let estimate = event_bytes / 64;
-    let bits1 = bits_for(estimate, cfg.p1_bits);
-    let bits2 = bits_for(estimate, cfg.p2_bits);
+    let bits1 = bits_for(estimate, 24_000, cfg.p1_bits);
+    // Person partitions: the scatter that fills them costs more per record
+    // the more partitions there are (measured: 1024, 2048 and 4096 at 20M
+    // events cost 150, 166 and 196 ms of resolve), while the person phase
+    // is flat up to about 40k events a partition. So half as many as the
+    // event side: 20k to 40k events each.
+    let bits2 = bits_for(estimate, 48_000, cfg.p2_bits);
     let (parts1, parts2) = (1usize << bits1, 1usize << bits2);
 
     // Jobs: the links job first, then event chunks (largest files first),
@@ -1292,4 +1378,66 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     }
     tables.user = collected.into_inner().unwrap();
     Some(tables)
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn rng(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mix(*state)
+    }
+
+    fn root(parent: &HashMap<u64, u64>, mut x: u64) -> u64 {
+        while let Some(&p) = parent.get(&x) {
+            if p == x {
+                break;
+            }
+            x = p;
+        }
+        x
+    }
+
+    /// The link map (filter, staged lookup, far probes) against a plain
+    /// union-find over a `HashMap`, for keys in the map and keys not in it.
+    #[test]
+    fn link_map_matches_union_find() {
+        let shapes = [(0usize, 8u64), (1, 4), (7, 16), (50, 60), (3000, 4000), (3000, 500), (200_000, 300_000)];
+        for (round, &(pairs_n, universe)) in shapes.iter().enumerate() {
+            let mut state = round as u64 + 1;
+            // Packed IDs are below 2^63 and never 0.
+            let key = |state: &mut u64| 1 + (rng(state) % universe).wrapping_mul(0x0001_0000_0100_0001) % (1 << 62);
+            let pairs: Vec<(u64, u64)> = (0..pairs_n).map(|_| (key(&mut state), key(&mut state))).collect();
+            let mut parent: HashMap<u64, u64> = HashMap::new();
+            for &(a, b) in &pairs {
+                parent.entry(a).or_insert(a);
+                parent.entry(b).or_insert(b);
+                let (ra, rb) = (root(&parent, a), root(&parent, b));
+                if ra != rb {
+                    let (lo, hi) = if cmp_ids(ra, rb).is_lt() { (ra, rb) } else { (rb, ra) };
+                    parent.insert(hi, lo);
+                }
+            }
+            let map = LinkMap::build(&pairs);
+            let mut probes: Vec<u64> = parent.keys().copied().collect();
+            for _ in 0..(2 * pairs_n + 1000) {
+                probes.push(key(&mut state));
+                probes.push(1 + rng(&mut state) % (1 << 62));
+            }
+            probes.push(0);
+            let mut renamed = 0;
+            for block in probes.chunks(BLOCK) {
+                let hashes: Vec<u64> = block.iter().map(|&k| map.stage1(k)).collect();
+                let starts: Vec<usize> = hashes.iter().map(|&h| map.stage2(h)).collect();
+                for (&k, &at) in block.iter().zip(&starts) {
+                    let want = if parent.contains_key(&k) { root(&parent, k) } else { k };
+                    assert_eq!(map.stage3(at, k), want, "round {round} key {k:#x}");
+                    renamed += usize::from(want != k);
+                }
+            }
+            assert!(pairs_n < 50 || renamed > pairs_n / 4, "round {round}: only {renamed} renamed keys probed");
+        }
+    }
 }

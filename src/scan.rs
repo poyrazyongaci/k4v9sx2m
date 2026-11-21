@@ -82,41 +82,112 @@ pub unsafe fn masks_scalar(p: *const u8) -> (u64, u64, u64) {
 
 pub struct Scan {
     /// Positions of commas and newlines, ascending, relative to the window.
-    pub d: Vec<u32>,
-    /// Positions of newlines.
-    pub nl: Vec<u32>,
+    /// Slot 0 stands for the line break before the window (position -1);
+    /// the positions start at slot 1. See `delims()`.
+    d: Vec<u32>,
+    /// One byte per delimiter, laid out like `d`: `CLOSES` when the byte
+    /// before the delimiter is a quote, `OPENS` when the byte after it is,
+    /// `NEWLINE` when the delimiter is a line break. See `flags()`.
+    fl: Vec<u8>,
     /// Positions of quotes with no delimiter on either side.
     pub badq: Vec<u32>,
     pub nd: usize,
-    pub nnl: usize,
 }
 
 const PAD: usize = 80;
+/// How far ahead of the scan the input is prefetched. Flat from 512 to
+/// 4096 bytes on the test box.
+const AHEAD: usize = 1024;
+
+/// The field that ends at this delimiter ends with a quote.
+const CLOSES: u8 = 1;
+/// The field that starts after this delimiter starts with a quote.
+const OPENS: u8 = 2;
+/// The delimiter is a line break, not a comma.
+const NEWLINE: u8 = 4;
+const CLOSES8: u64 = 0x0101_0101_0101_0101;
+const OPENS8: u64 = 0x0202_0202_0202_0202;
+const NEWLINE8: u64 = 0x0404_0404_0404_0404;
+
+/// Flag bytes of up to eight delimiters. `before` and `after` have bit `p`
+/// set when the byte before, or after, position `p` is a quote; `nm` when
+/// position `p` is a line break. `skip` delimiters of `delim` are passed
+/// over first.
+#[inline(always)]
+fn flag_bytes(before: u64, after: u64, nm: u64, delim: u64, skip: u32) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        use core::arch::x86_64::{_pdep_u64, _pext_u64};
+        let c = _pext_u64(before, delim) >> skip;
+        let o = _pext_u64(after, delim) >> skip;
+        let n = _pext_u64(nm, delim) >> skip;
+        _pdep_u64(c, CLOSES8) | _pdep_u64(o, OPENS8) | _pdep_u64(n, NEWLINE8)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut m = delim;
+        for _ in 0..skip {
+            m &= m.wrapping_sub(1);
+        }
+        let mut out = 0u64;
+        let mut i = 0;
+        while m != 0 && i < 8 {
+            let p = m.trailing_zeros();
+            let f = (((before >> p) & 1) * CLOSES as u64)
+                | (((after >> p) & 1) * OPENS as u64)
+                | (((nm >> p) & 1) * NEWLINE as u64);
+            out |= f << (8 * i);
+            m &= m - 1;
+            i += 1;
+        }
+        out
+    }
+}
 
 impl Scan {
     pub fn new(window: usize) -> Self {
         Scan {
-            d: vec![u32::MAX; window + 64 + PAD],
-            nl: vec![u32::MAX; window + 64 + PAD],
+            d: vec![u32::MAX; window + 64 + PAD + 1],
+            fl: vec![0; window + 64 + PAD + 1],
             badq: vec![u32::MAX; window + 64 + PAD],
             nd: 0,
-            nnl: 0,
         }
+    }
+
+    /// The delimiter positions. `delims().sub(1)` is readable and holds
+    /// `u32::MAX`: the line break before the window.
+    #[inline(always)]
+    pub fn delims(&self) -> *const u32 {
+        unsafe { self.d.as_ptr().add(1) }
+    }
+
+    /// The flag byte of each delimiter. `flags().sub(1)` is the flag of the
+    /// line break before the window.
+    #[inline(always)]
+    pub fn flags(&self) -> *const u8 {
+        unsafe { self.fl.as_ptr().add(1) }
     }
 
     /// Scan `len` bytes at `base`. The byte before `base` must be a line
     /// break (or the start of the file), and at least 64 bytes past
     /// `base + len` must be readable.
     pub unsafe fn scan(&mut self, base: *const u8, len: usize) {
-        debug_assert!(len + 64 + PAD <= self.d.len());
-        let d = self.d.as_mut_ptr();
-        let nl = self.nl.as_mut_ptr();
+        debug_assert!(len + 64 + PAD < self.d.len());
+        let d = self.d.as_mut_ptr().add(1);
+        let fl = self.fl.as_mut_ptr().add(1);
         let bad = self.badq.as_mut_ptr();
-        let (mut nd, mut nnl, mut nbad) = (0usize, 0usize, 0usize);
+        let (mut nd, mut nbad) = (0usize, 0usize);
         let mut prev_delim = 1u64;
+        let mut prev_quote = 0u64;
         let mut pending = 0u64;
         let mut at = 0usize;
+        *d.sub(1) = u32::MAX;
+        *fl.sub(1) = if *base == b'"' { OPENS } else { 0 };
         while at < len {
+            // The input comes straight from the page cache in 4 KiB pages,
+            // and the hardware prefetcher stops at every page end. Without
+            // this a third of the scan is spent waiting on the two loads.
+            crate::sys::prefetch(base.wrapping_add(at + AHEAD));
             let (mut cm, mut nm, mut qm) = masks(base.add(at));
             let left = len - at;
             if left < 64 {
@@ -142,20 +213,32 @@ impl Scan {
                 }
             }
             prev_delim = delim >> 63;
+            // Quote flags per delimiter, so stage 2 never looks at the
+            // bytes around a field. The byte after position 63 is the
+            // first of the next block.
+            let before = (qm << 1) | prev_quote;
+            let after = (qm >> 1) | (u64::from(*base.add(at + 64) == b'"') << 63);
+            prev_quote = qm >> 63;
 
             let base_pos = at as u32;
             let count = delim.count_ones() as usize;
             let mut m = delim;
             let out = d.add(nd);
+            let fout = fl.add(nd);
             for i in 0..8 {
-                *out.add(i) = base_pos + m.trailing_zeros();
+                // Volatile keeps these eight plain stores. Left alone the
+                // compiler packs them into one vector with seven inserts,
+                // which is slower here.
+                out.add(i).write_volatile(base_pos + m.trailing_zeros());
                 m &= m.wrapping_sub(1);
             }
+            (fout as *mut u64).write_unaligned(flag_bytes(before, after, nm, delim, 0).to_le());
             if count > 8 {
                 for i in 8..16 {
                     *out.add(i) = base_pos + m.trailing_zeros();
                     m &= m.wrapping_sub(1);
                 }
+                (fout.add(8) as *mut u64).write_unaligned(flag_bytes(before, after, nm, delim, 8).to_le());
                 if count > 16 {
                     let mut i = 16;
                     while m != 0 {
@@ -163,58 +246,103 @@ impl Scan {
                         m &= m - 1;
                         i += 1;
                     }
+                    let mut k = 16;
+                    while k < count {
+                        (fout.add(k) as *mut u64)
+                            .write_unaligned(flag_bytes(before, after, nm, delim, k as u32).to_le());
+                        k += 8;
+                    }
                 }
             }
             nd += count;
-
-            let ncount = nm.count_ones() as usize;
-            let mut m = nm;
-            let out = nl.add(nnl);
-            *out = base_pos + m.trailing_zeros();
-            m &= m.wrapping_sub(1);
-            *out.add(1) = base_pos + m.trailing_zeros();
-            m &= m.wrapping_sub(1);
-            if ncount > 2 {
-                let mut i = 2;
-                while m != 0 {
-                    *out.add(i) = base_pos + m.trailing_zeros();
-                    m &= m - 1;
-                    i += 1;
-                }
-            }
-            nnl += ncount;
             at += 64;
         }
-        // Sentinels: stage 2 reads up to 16 entries past the last delimiter.
+        // Sentinels: stage 2 reads up to 8 entries past the last delimiter.
         for i in 0..16 {
             *d.add(nd + i) = u32::MAX;
         }
-        *nl.add(nnl) = u32::MAX;
-        *nl.add(nnl + 1) = u32::MAX;
         *bad.add(nbad) = u32::MAX;
         self.nd = nd;
-        self.nnl = nnl;
     }
 }
 
-/// Field bounds of one line with `N` fields, quotes stripped, and whether
-/// the quoting is malformed. `d` points at the line's `N` delimiters.
+/// Field bounds, quotes stripped, of the `N` fields (at most 7) that the
+/// next `N` delimiters end, and whether that is not a well-formed line:
+/// one of the first `N - 1` delimiters is a line break, the `N`th is not,
+/// or a field has a quote at one end only or is one lone quote. `d` and
+/// `fl` point at the `N` delimiters and their flags; the entry before each
+/// belongs to the line break before the line. Only the first `N` slots of
+/// the result mean anything.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-pub unsafe fn fields<const N: usize>(base: *const u8, line_start: u32, d: *const u32) -> ([u32; N], [u32; N], u32) {
-    let mut s = [0u32; N];
-    let mut e = [0u32; N];
+pub unsafe fn fields<const N: usize>(d: *const u32, fl: *const u8) -> ([u32; 8], [u32; 8], u32) {
+    let mut s = [0u32; 8];
+    let mut e = [0u32; 8];
     let mut bad = 0u32;
-    let mut st = line_start;
     for i in 0..N {
-        let en = *d.add(i);
-        let open = u32::from(*base.add(st as usize) == b'"');
-        let close = u32::from(*base.offset(en as isize - 1) == b'"');
-        s[i] = st + open;
-        e[i] = en - close;
-        bad |= (open ^ close) | u32::from(en - close < st + open);
-        st = en + 1;
+        let open = u32::from(*fl.add(i).sub(1) & OPENS != 0);
+        let close = u32::from(*fl.add(i) & CLOSES != 0);
+        let newline = *fl.add(i) & NEWLINE != 0;
+        let st = (*d.add(i).sub(1)).wrapping_add(1) + open;
+        let en = *d.add(i) - close;
+        s[i] = st;
+        e[i] = en;
+        // A field that is one lone quote opens and closes, and ends
+        // before it starts.
+        bad |= (open ^ close) | u32::from(en < st) | u32::from(newline != (i == N - 1));
     }
     (s, e, bad)
+}
+
+/// The same with all fields at once: starts are the delimiters before plus
+/// one plus the open flag, ends the own delimiters minus the close flag.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn fields<const N: usize>(d: *const u32, fl: *const u8) -> ([u32; 8], [u32; 8], u32) {
+    use core::arch::x86_64::*;
+    debug_assert!(N <= 7);
+    // Byte k: the flags of delimiter k - 1 of the line.
+    let f = u64::from_le((fl.sub(1) as *const u64).read_unaligned());
+    let opens = (f >> 1) & CLOSES8;
+    let closes = f & CLOSES8;
+    let uneven = (opens ^ (closes >> 8)) & (u64::MAX >> (64 - 8 * N));
+    // Bytes 1..=N: commas, then the line break.
+    let breaks = (f & (NEWLINE8 >> (56 - 8 * N)) & !0xFF) ^ ((NEWLINE as u64) << (8 * N));
+    let v = _mm256_loadu_si256(d.sub(1) as *const __m256i);
+    let open = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(opens as i64));
+    let close = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(closes as i64));
+    let start = _mm256_sub_epi32(_mm256_add_epi32(v, open), _mm256_set1_epi32(-1));
+    let end = _mm256_permutevar8x32_epi32(_mm256_sub_epi32(v, close), _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7));
+    // A field that is one lone quote opens and closes, and ends before it
+    // starts.
+    let lone = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_sub_epi32(end, start))) as u32 & ((1 << N) - 1);
+    let mut s = [0u32; 8];
+    let mut e = [0u32; 8];
+    _mm256_storeu_si256(s.as_mut_ptr() as *mut __m256i, start);
+    _mm256_storeu_si256(e.as_mut_ptr() as *mut __m256i, end);
+    (s, e, lone | u32::from((uneven | breaks) != 0))
+}
+
+/// The line whose delimiters start at `d[di]` is not a well-formed line of
+/// the expected width, or fewer delimiters are left than a line needs.
+/// Skip to the end of that line: the new `(di, bq, line start)`, or `None`
+/// when no line break is left in the window.
+#[cold]
+#[inline(never)]
+unsafe fn skip_line(scan: &Scan, mut di: usize, mut bq: usize) -> Option<(usize, usize, u32)> {
+    let fl = scan.flags();
+    let badq = scan.badq.as_ptr();
+    while di < scan.nd && *fl.add(di) & NEWLINE == 0 {
+        di += 1;
+    }
+    if di >= scan.nd {
+        return None;
+    }
+    let p = *scan.delims().add(di);
+    while *badq.add(bq) < p {
+        bq += 1;
+    }
+    Some((di + 1, bq, p + 1))
 }
 
 /// Walk the complete lines of a scanned window. For each line that has
@@ -223,38 +351,31 @@ pub unsafe fn fields<const N: usize>(base: *const u8, line_start: u32, d: *const
 /// the first unconsumed line.
 #[inline(always)]
 pub unsafe fn for_each_line<const N: usize>(
-    base: *const u8,
     scan: &Scan,
     limit: u32,
     mut f: impl FnMut(&[u32; N], &[u32; N]),
 ) -> u32 {
-    let d = scan.d.as_ptr();
-    let nl = scan.nl.as_ptr();
+    let d = scan.delims();
+    let fl = scan.flags();
     let badq = scan.badq.as_ptr();
+    let nd = scan.nd;
     let mut di = 0usize;
     let mut bq = 0usize;
     let mut ls = 0u32;
-    for j in 0..scan.nnl {
-        if ls >= limit {
-            break;
-        }
-        let p = *nl.add(j);
-        if *d.add(di + N - 1) != p || *badq.add(bq) < p {
-            while *d.add(di) < p {
-                di += 1;
+    while ls < limit {
+        if di + N <= nd {
+            let p = *d.add(di + N - 1);
+            let (s, e, bad) = fields::<N>(d.add(di), fl.add(di));
+            if (bad == 0) & (*badq.add(bq) >= p) {
+                f(&*(s.as_ptr() as *const [u32; N]), &*(e.as_ptr() as *const [u32; N]));
+                di += N;
+                ls = p + 1;
+                continue;
             }
-            di += 1;
-            while *badq.add(bq) < p {
-                bq += 1;
-            }
-            ls = p + 1;
-            continue;
         }
-        let (s, e, bad) = fields::<N>(base, ls, d.add(di));
-        di += N;
-        ls = p + 1;
-        if bad == 0 {
-            f(&s, &e);
+        match skip_line(scan, di, bq) {
+            Some(next) => (di, bq, ls) = next,
+            None => break,
         }
     }
     ls
@@ -328,14 +449,149 @@ mod tests {
                         );
                     };
                     let end = match fields_n {
-                        2 => for_each_line::<2>(base, &scan, u32::MAX, |s, e| collect(s, e)),
-                        4 => for_each_line::<4>(base, &scan, u32::MAX, |s, e| collect(s, e)),
-                        _ => for_each_line::<7>(base, &scan, u32::MAX, |s, e| collect(s, e)),
+                        2 => for_each_line::<2>(&scan, u32::MAX, |s, e| collect(s, e)),
+                        4 => for_each_line::<4>(&scan, u32::MAX, |s, e| collect(s, e)),
+                        _ => for_each_line::<7>(&scan, u32::MAX, |s, e| collect(s, e)),
                     };
                     assert_eq!(end as usize, body_len);
                 }
                 assert_eq!(got, expect, "round {round} fields {fields_n}: {:?}", String::from_utf8_lossy(&text[1..body_len]));
             }
+        }
+    }
+
+    /// Every delimiter's flag byte says what the bytes around it are, at
+    /// every alignment to the 64-byte blocks, with one `Scan` reused.
+    #[test]
+    fn flags_match_bytes() {
+        let mut state = 21;
+        let mut scan = Scan::new(4096);
+        for round in 0..4000 {
+            let n = 1 + (rng(&mut state) % 600) as usize;
+            let alphabet: &[u8] = match round % 4 {
+                0 => b"\",\n",
+                1 => b"ab\"\",\n",
+                2 => b"abcdefgh\",",
+                _ => b"abcdefghijklmnopqrstuvwxyz0123456789\"\"\"\",,,,,\n",
+            };
+            let mut text = vec![b'\n'];
+            for _ in 0..n {
+                text.push(alphabet[(rng(&mut state) % alphabet.len() as u64) as usize]);
+            }
+            // Hostile bytes past the window must not leak into it.
+            text.extend_from_slice(&[b'"'; 160]);
+            unsafe {
+                let base = text.as_ptr().add(1);
+                scan.scan(base, n);
+                let body = &text[1..];
+                let want: Vec<u32> = (0..n as u32).filter(|&i| matches!(body[i as usize], b',' | b'\n')).collect();
+                assert_eq!(scan.nd, want.len(), "round {round}");
+                assert_eq!(*scan.delims().sub(1), u32::MAX);
+                assert_eq!(*scan.flags().sub(1) & OPENS != 0, body[0] == b'"');
+                for (k, &p) in want.iter().enumerate() {
+                    let p = p as usize;
+                    assert_eq!(*scan.delims().add(k), p as u32, "round {round}");
+                    let flag = *scan.flags().add(k);
+                    assert_eq!(flag & CLOSES != 0, p > 0 && body[p - 1] == b'"', "round {round} delimiter {k} at {p}");
+                    assert_eq!(flag & NEWLINE != 0, body[p] == b'\n', "round {round} delimiter {k} at {p}");
+                    // The byte after the window's last byte belongs to no
+                    // line of this window.
+                    if p + 1 < n {
+                        assert_eq!(flag & OPENS != 0, body[p + 1] == b'"', "round {round} delimiter {k} at {p}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lines shaped like the real files (field lengths, 20% quoted, some
+    /// malformed) cut into windows of every size: the walker and the plain
+    /// splitter agree, also on what is left for the next window.
+    #[test]
+    fn realistic_lines_match_split_line() {
+        let mut state = 33;
+        let mut scan = Scan::new(1 << 12);
+        for round in 0..1500 {
+            let fields_n = [2usize, 4, 7][round % 3];
+            let mut text = vec![b'\n'];
+            let lines = 1 + rng(&mut state) % 40;
+            for _ in 0..lines {
+                let width = match rng(&mut state) % 40 {
+                    0 => fields_n + 1,
+                    1 => fields_n - 1,
+                    2 => 0,
+                    _ => fields_n,
+                };
+                for i in 0..width {
+                    if i > 0 {
+                        text.push(b',');
+                    }
+                    let len = match rng(&mut state) % 10 {
+                        0 => 0,
+                        1 => 1,
+                        2 => 25 + rng(&mut state) % 50,
+                        _ => 3 + rng(&mut state) % 20,
+                    };
+                    let quoting = rng(&mut state) % 100;
+                    if quoting < 20 || quoting == 97 {
+                        text.push(b'"');
+                    }
+                    for _ in 0..len {
+                        text.push(b"abcxyz0189 :-TZ\r"[(rng(&mut state) % 16) as usize]);
+                    }
+                    if quoting == 96 {
+                        text.push(b'"');
+                        text.push(b'x');
+                    }
+                    if quoting < 20 || quoting == 98 {
+                        text.push(b'"');
+                    }
+                }
+                text.push(b'\n');
+            }
+            let body_len = text.len() - 1;
+            text.extend_from_slice(&[0u8; 160]);
+            let mut expect: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut tmp = Vec::new();
+            for line in text[1..body_len].split(|&b| b == b'\n') {
+                if split_line(line, fields_n, &mut tmp) {
+                    expect.push(tmp.iter().map(|f| f.to_vec()).collect());
+                }
+            }
+            // Walk it in windows of a random size, as run_chunk does.
+            let window = 100 + (rng(&mut state) % 3000) as usize;
+            let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut pos = 0usize;
+            unsafe {
+                while pos < body_len {
+                    let wlen = window.min(body_len - pos);
+                    let base = text.as_ptr().add(1 + pos);
+                    scan.scan(base, wlen);
+                    let mut collect = |s: &[u32], e: &[u32]| {
+                        got.push(
+                            (0..s.len())
+                                .map(|i| text[1 + pos + s[i] as usize..1 + pos + e[i] as usize].to_vec())
+                                .collect(),
+                        );
+                    };
+                    let used = match fields_n {
+                        2 => for_each_line::<2>(&scan, u32::MAX, |s, e| collect(s, e)),
+                        4 => for_each_line::<4>(&scan, u32::MAX, |s, e| collect(s, e)),
+                        _ => for_each_line::<7>(&scan, u32::MAX, |s, e| collect(s, e)),
+                    };
+                    if used == 0 {
+                        // A line longer than the window: take it whole.
+                        let end = text[1 + pos..1 + body_len].iter().position(|&b| b == b'\n').unwrap();
+                        if split_line(&text[1 + pos..1 + pos + end], fields_n, &mut tmp) {
+                            got.push(tmp.iter().map(|f| f.to_vec()).collect());
+                        }
+                        pos += end + 1;
+                    } else {
+                        pos += used as usize;
+                    }
+                }
+            }
+            assert_eq!(got, expect, "round {round} fields {fields_n} window {window}");
         }
     }
 }
