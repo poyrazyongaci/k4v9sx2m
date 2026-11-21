@@ -970,14 +970,14 @@ struct PersonPhase<'a> {
     tab: Vec<u32>,
     keys: Vec<u64>,
     counts: Vec<u32>,
-    /// Events per time bin, then the write cursor of each bin.
-    bins: Vec<u32>,
-    /// One word per event, `ts_rel << 32 | local person id`: in input order
-    /// and then in bin order.
+    /// One word per event, `ts_rel << 32 | local person id`, in input
+    /// order.
     words: Vec<u64>,
-    binned: Vec<u64>,
-    /// `ts_rel` of every event, person after person, each in bin order.
+    /// `ts_rel` of every event, person after person, in input order.
     ev: Vec<u32>,
+    /// The times of the person at hand, sorted, and scratch for sorting.
+    sorted: Vec<u32>,
+    sort_tmp: Vec<u32>,
     /// The purchases: `(value, local person id)` as they come, then the
     /// values person after person, with the end offset of each person.
     buys: Vec<(u64, u32)>,
@@ -1015,19 +1015,15 @@ struct PersonPhase<'a> {
     check: (u64, u64),
 }
 
-/// Events are never sorted by time. They are put in order of their time
-/// bin only: `ts_rel >> BIN_SHIFT`, bins of 2^20 ms. Two events of one bin
-/// are under 2^20 ms apart, which is less than the session gap, so a bin
-/// never holds a session break. A break can only fall between two
-/// consecutive non-empty bins of a person, and it does exactly when the
-/// smallest time of the later bin is more than the gap after the largest
-/// time of the earlier one: those two are neighbours in time order.
+/// The events of a person are only times here: each person's times are
+/// sorted on their own (`sort_times`), and a session ends where the next
+/// time is more than the gap later. The purchases (3% of the events)
+/// travel on the side, sorted by time per person, and a session takes
+/// those up to its last event when it closes.
 ///
-/// So the events of a person are only times here. The purchases (3% of the
-/// events) travel on the side, sorted by time per person, and a session
-/// takes those up to its last event when it closes.
-const BIN_SHIFT: u32 = 20;
-const _: () = assert!((1i64 << BIN_SHIFT) - 1 <= SESSION_GAP_MS);
+/// Times past the events of a person are read but never used: `ev` has
+/// this much padding.
+const EV_PAD: usize = 64;
 
 /// The hash of a person key inside one partition: the top bits of one
 /// multiply. The partition was chosen by `mix`, which shares no constant
@@ -1090,6 +1086,1019 @@ unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32
     (reached, tie)
 }
 
+/// Bitonic sorting network over 8 times in 1 register, ascending
+/// (generated: element `i` is lane `i % 8` of register `i / 8`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn bitonic1(v: &mut [core::arch::x86_64::__m256i; 1]) {
+    use core::arch::x86_64::*;
+    let mut v0 = v[0];
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    *v = [v0];
+}
+
+/// Bitonic sorting network over 16 times in 2 registers, ascending
+/// (generated: element `i` is lane `i % 8` of register `i / 8`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn bitonic2(v: &mut [core::arch::x86_64::__m256i; 2]) {
+    use core::arch::x86_64::*;
+    let (mut v0, mut v1) = (v[0], v[1]);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x55);
+    let lo = _mm256_min_epu32(v0, v1);
+    let hi = _mm256_max_epu32(v0, v1);
+    v0 = lo;
+    v1 = hi;
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xAA);
+    *v = [v0, v1];
+}
+
+/// Bitonic sorting network over 32 times in 4 registers, ascending
+/// (generated: element `i` is lane `i % 8` of register `i / 8`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn bitonic4(v: &mut [core::arch::x86_64::__m256i; 4]) {
+    use core::arch::x86_64::*;
+    let (mut v0, mut v1, mut v2, mut v3) = (v[0], v[1], v[2], v[3]);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x55);
+    let lo = _mm256_min_epu32(v0, v1);
+    let hi = _mm256_max_epu32(v0, v1);
+    v0 = lo;
+    v1 = hi;
+    let lo = _mm256_min_epu32(v2, v3);
+    let hi = _mm256_max_epu32(v2, v3);
+    v2 = hi;
+    v3 = lo;
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x55);
+    let lo = _mm256_min_epu32(v0, v2);
+    let hi = _mm256_max_epu32(v0, v2);
+    v0 = lo;
+    v2 = hi;
+    let lo = _mm256_min_epu32(v1, v3);
+    let hi = _mm256_max_epu32(v1, v3);
+    v1 = lo;
+    v3 = hi;
+    let lo = _mm256_min_epu32(v0, v1);
+    let hi = _mm256_max_epu32(v0, v1);
+    v0 = lo;
+    v1 = hi;
+    let lo = _mm256_min_epu32(v2, v3);
+    let hi = _mm256_max_epu32(v2, v3);
+    v2 = lo;
+    v3 = hi;
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xAA);
+    *v = [v0, v1, v2, v3];
+}
+
+/// Bitonic sorting network over 64 times in 8 registers, ascending
+/// (generated: element `i` is lane `i % 8` of register `i / 8`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn bitonic8(v: &mut [core::arch::x86_64::__m256i; 8]) {
+    use core::arch::x86_64::*;
+    let (mut v0, mut v1, mut v2, mut v3, mut v4, mut v5, mut v6, mut v7) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v4, 0xB1);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v5, 0xB1);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v6, 0xB1);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v7, 0xB1);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x66);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x3C);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v4, 0xB1);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v5, 0xB1);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v6, 0xB1);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_shuffle_epi32(v7, 0xB1);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x5A);
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v4, 0xB1);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v5, 0xB1);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v6, 0xB1);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v7, 0xB1);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x55);
+    let lo = _mm256_min_epu32(v0, v1);
+    let hi = _mm256_max_epu32(v0, v1);
+    v0 = lo;
+    v1 = hi;
+    let lo = _mm256_min_epu32(v2, v3);
+    let hi = _mm256_max_epu32(v2, v3);
+    v2 = hi;
+    v3 = lo;
+    let lo = _mm256_min_epu32(v4, v5);
+    let hi = _mm256_max_epu32(v4, v5);
+    v4 = lo;
+    v5 = hi;
+    let lo = _mm256_min_epu32(v6, v7);
+    let hi = _mm256_max_epu32(v6, v7);
+    v6 = hi;
+    v7 = lo;
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v4, 0xB1);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v5, 0xB1);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v6, 0xB1);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v7, 0xB1);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x55);
+    let lo = _mm256_min_epu32(v0, v2);
+    let hi = _mm256_max_epu32(v0, v2);
+    v0 = lo;
+    v2 = hi;
+    let lo = _mm256_min_epu32(v1, v3);
+    let hi = _mm256_max_epu32(v1, v3);
+    v1 = lo;
+    v3 = hi;
+    let lo = _mm256_min_epu32(v4, v6);
+    let hi = _mm256_max_epu32(v4, v6);
+    v4 = hi;
+    v6 = lo;
+    let lo = _mm256_min_epu32(v5, v7);
+    let hi = _mm256_max_epu32(v5, v7);
+    v5 = hi;
+    v7 = lo;
+    let lo = _mm256_min_epu32(v0, v1);
+    let hi = _mm256_max_epu32(v0, v1);
+    v0 = lo;
+    v1 = hi;
+    let lo = _mm256_min_epu32(v2, v3);
+    let hi = _mm256_max_epu32(v2, v3);
+    v2 = lo;
+    v3 = hi;
+    let lo = _mm256_min_epu32(v4, v5);
+    let hi = _mm256_max_epu32(v4, v5);
+    v4 = hi;
+    v5 = lo;
+    let lo = _mm256_min_epu32(v6, v7);
+    let hi = _mm256_max_epu32(v6, v7);
+    v6 = hi;
+    v7 = lo;
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_permute4x64_epi64(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x0F);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x33);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v4, 0xB1);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v5, 0xB1);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v6, 0xB1);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0x55);
+    let other = _mm256_shuffle_epi32(v7, 0xB1);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0x55);
+    let lo = _mm256_min_epu32(v0, v4);
+    let hi = _mm256_max_epu32(v0, v4);
+    v0 = lo;
+    v4 = hi;
+    let lo = _mm256_min_epu32(v1, v5);
+    let hi = _mm256_max_epu32(v1, v5);
+    v1 = lo;
+    v5 = hi;
+    let lo = _mm256_min_epu32(v2, v6);
+    let hi = _mm256_max_epu32(v2, v6);
+    v2 = lo;
+    v6 = hi;
+    let lo = _mm256_min_epu32(v3, v7);
+    let hi = _mm256_max_epu32(v3, v7);
+    v3 = lo;
+    v7 = hi;
+    let lo = _mm256_min_epu32(v0, v2);
+    let hi = _mm256_max_epu32(v0, v2);
+    v0 = lo;
+    v2 = hi;
+    let lo = _mm256_min_epu32(v1, v3);
+    let hi = _mm256_max_epu32(v1, v3);
+    v1 = lo;
+    v3 = hi;
+    let lo = _mm256_min_epu32(v4, v6);
+    let hi = _mm256_max_epu32(v4, v6);
+    v4 = lo;
+    v6 = hi;
+    let lo = _mm256_min_epu32(v5, v7);
+    let hi = _mm256_max_epu32(v5, v7);
+    v5 = lo;
+    v7 = hi;
+    let lo = _mm256_min_epu32(v0, v1);
+    let hi = _mm256_max_epu32(v0, v1);
+    v0 = lo;
+    v1 = hi;
+    let lo = _mm256_min_epu32(v2, v3);
+    let hi = _mm256_max_epu32(v2, v3);
+    v2 = lo;
+    v3 = hi;
+    let lo = _mm256_min_epu32(v4, v5);
+    let hi = _mm256_max_epu32(v4, v5);
+    v4 = lo;
+    v5 = hi;
+    let lo = _mm256_min_epu32(v6, v7);
+    let hi = _mm256_max_epu32(v6, v7);
+    v6 = lo;
+    v7 = hi;
+    let other = _mm256_permute4x64_epi64(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_permute4x64_epi64(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0xF0);
+    let other = _mm256_shuffle_epi32(v0, 0x4E);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v1, 0x4E);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v2, 0x4E);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v3, 0x4E);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v4, 0x4E);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v5, 0x4E);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v6, 0x4E);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v7, 0x4E);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0xCC);
+    let other = _mm256_shuffle_epi32(v0, 0xB1);
+    let lo = _mm256_min_epu32(v0, other);
+    let hi = _mm256_max_epu32(v0, other);
+    v0 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v1, 0xB1);
+    let lo = _mm256_min_epu32(v1, other);
+    let hi = _mm256_max_epu32(v1, other);
+    v1 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v2, 0xB1);
+    let lo = _mm256_min_epu32(v2, other);
+    let hi = _mm256_max_epu32(v2, other);
+    v2 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v3, 0xB1);
+    let lo = _mm256_min_epu32(v3, other);
+    let hi = _mm256_max_epu32(v3, other);
+    v3 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v4, 0xB1);
+    let lo = _mm256_min_epu32(v4, other);
+    let hi = _mm256_max_epu32(v4, other);
+    v4 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v5, 0xB1);
+    let lo = _mm256_min_epu32(v5, other);
+    let hi = _mm256_max_epu32(v5, other);
+    v5 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v6, 0xB1);
+    let lo = _mm256_min_epu32(v6, other);
+    let hi = _mm256_max_epu32(v6, other);
+    v6 = _mm256_blend_epi32(lo, hi, 0xAA);
+    let other = _mm256_shuffle_epi32(v7, 0xB1);
+    let lo = _mm256_min_epu32(v7, other);
+    let hi = _mm256_max_epu32(v7, other);
+    v7 = _mm256_blend_epi32(lo, hi, 0xAA);
+    *v = [v0, v1, v2, v3, v4, v5, v6, v7];
+}
+
+/// Sort the `n <= 8 * R` times at `src` into `8 * R` slots at `dst`, the
+/// slots past `n` holding `u32::MAX`. Reads `8 * R` values at `src`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn sort_net<const R: usize>(src: *const u32, n: usize, dst: *mut u32) {
+    use core::arch::x86_64::*;
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut v = [_mm256_setzero_si256(); R];
+    for (r, reg) in v.iter_mut().enumerate() {
+        let x = _mm256_loadu_si256(src.add(8 * r) as *const __m256i);
+        let real = _mm256_cmpgt_epi32(_mm256_set1_epi32(n as i32 - 8 * r as i32), lane);
+        *reg = _mm256_or_si256(x, _mm256_andnot_si256(real, _mm256_set1_epi32(-1)));
+    }
+    let p = v.as_mut_ptr();
+    match R {
+        1 => bitonic1(&mut *(p as *mut [__m256i; 1])),
+        2 => bitonic2(&mut *(p as *mut [__m256i; 2])),
+        4 => bitonic4(&mut *(p as *mut [__m256i; 4])),
+        _ => bitonic8(&mut *(p as *mut [__m256i; 8])),
+    }
+    for (r, reg) in v.iter().enumerate() {
+        _mm256_storeu_si256(dst.add(8 * r) as *mut __m256i, *reg);
+    }
+}
+
+/// Merge two sorted runs into `out`, choosing with a select, not a branch.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
+#[inline(always)]
+unsafe fn merge32(a: *const u32, na: usize, b: *const u32, nb: usize, out: *mut u32) {
+    let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+    while i < na && j < nb {
+        let (x, y) = (*a.add(i), *b.add(j));
+        let take_b = y < x;
+        *out.add(k) = if take_b { y } else { x };
+        i += usize::from(!take_b);
+        j += usize::from(take_b);
+        k += 1;
+    }
+    std::ptr::copy_nonoverlapping(a.add(i), out.add(k), na - i);
+    std::ptr::copy_nonoverlapping(b.add(j), out.add(k + na - i), nb - j);
+}
+
+/// Merge two sorted runs of `w` values each into `out` from both ends at
+/// once: two independent chains of selects, so twice the work per load
+/// latency. The front takes the `w` smallest, the back the `w` largest;
+/// neither can run past its runs, since `w` steps take at most `w` values
+/// of one run.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
+#[inline(always)]
+unsafe fn merge32_even(a: *const u32, b: *const u32, w: usize, out: *mut u32) {
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut ia, mut jb) = (w - 1, w - 1);
+    let mut back = 2 * w - 1;
+    for k in 0..w {
+        let (x, y) = (*a.add(i), *b.add(j));
+        let take_b = y < x;
+        *out.add(k) = if take_b { y } else { x };
+        i += usize::from(!take_b);
+        j += usize::from(take_b);
+        let (x, y) = (*a.add(ia), *b.add(jb));
+        let take_a = x > y;
+        *out.add(back) = if take_a { x } else { y };
+        ia = ia.wrapping_sub(usize::from(take_a));
+        jb = jb.wrapping_sub(usize::from(!take_a));
+        back = back.wrapping_sub(1);
+    }
+}
+
+/// People with at least this many events are put in order of time bin
+/// only (`bin_sort`).
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
+const BIN_EVENTS: usize = 512;
+
+/// Bins of 2^20 ms. Two events of one bin are under 2^20 ms apart, which is
+/// less than the session gap, so a bin never holds a session break. A break
+/// can only fall between two consecutive non-empty bins of a person, and it
+/// does exactly when the smallest time of the later bin is more than the
+/// gap after the largest time of the earlier one.
+const BIN_SHIFT: u32 = 20;
+const _: () = assert!((1i64 << BIN_SHIFT) - 1 <= SESSION_GAP_MS);
+
 /// The run of events in the bin of `ev[i]` that starts at `i`, up to `n`:
 /// its smallest and largest time and its end. `ev` is readable for
 /// `LANES` values past `n`.
@@ -1142,6 +2151,160 @@ unsafe fn bin_run(ev: *const u32, i: usize, n: usize) -> (u32, u32, usize) {
     (first, latest, j)
 }
 
+/// The session of a person in bin order (`bin_sort`) that starts at `i`:
+/// its end, first time and last time.
+#[inline(always)]
+unsafe fn session_end_binned(s: *const u32, i: usize, n: usize) -> (usize, u32, u32) {
+    let (start, mut last, mut j) = bin_run(s, i, n);
+    while j < n {
+        let (lo, hi, next) = bin_run(s, j, n);
+        if lo - last > SESSION_GAP_MS as u32 {
+            break;
+        }
+        last = hi;
+        j = next;
+    }
+    (j, start, last)
+}
+
+/// The `n` times at `src` into `dst` in order of their time bin, by one
+/// counting pass over the bins the person spans. `hist` is scratch.
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
+#[inline(never)]
+unsafe fn bin_sort(src: *const u32, n: usize, dst: *mut u32, hist: &mut Vec<u32>) {
+    let times = std::slice::from_raw_parts(src, n);
+    let lo = times.iter().fold(u32::MAX, |a, &t| a.min(t)) >> BIN_SHIFT;
+    let hi = times.iter().fold(0, |a, &t| a.max(t)) >> BIN_SHIFT;
+    hist.clear();
+    hist.resize((hi - lo) as usize + 1, 0);
+    for &t in times {
+        *hist.get_unchecked_mut(((t >> BIN_SHIFT) - lo) as usize) += 1;
+    }
+    let mut sum = 0u32;
+    for c in hist.iter_mut() {
+        let k = *c;
+        *c = sum;
+        sum += k;
+    }
+    for &t in times {
+        let w = hist.get_unchecked_mut(((t >> BIN_SHIFT) - lo) as usize);
+        *dst.add(*w as usize) = t;
+        *w += 1;
+    }
+}
+
+/// The `n` times at `src` (readable for `EV_PAD` past `n`), sorted, or for
+/// `BIN_EVENTS` and more in bin order only (then true). The result is
+/// readable for `LANES` past `n`. Up to 64 times: one sorting network.
+/// Below `BIN_EVENTS`: networks of 64, then merges without branches.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn sort_times(src: *const u32, n: usize, dst: &mut Vec<u32>, tmp: &mut Vec<u32>) -> (*const u32, bool) {
+    let room = n.div_ceil(64) * 64 + LANES;
+    if dst.capacity() < room {
+        dst.reserve(room);
+    }
+    let d = dst.as_mut_ptr();
+    if n <= 8 {
+        sort_net::<1>(src, n, d);
+        return (d, false);
+    }
+    if n <= 16 {
+        sort_net::<2>(src, n, d);
+        return (d, false);
+    }
+    sort_big(src, n, dst, tmp)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(never)]
+unsafe fn sort_big(src: *const u32, n: usize, dst: &mut Vec<u32>, tmp: &mut Vec<u32>) -> (*const u32, bool) {
+    let d = dst.as_mut_ptr();
+    if n <= 32 {
+        sort_net::<4>(src, n, d);
+        return (d, false);
+    }
+    if n >= BIN_EVENTS {
+        bin_sort(src, n, d, tmp);
+        return (d, true);
+    }
+    let room = n.div_ceil(64) * 64 + LANES;
+    if tmp.capacity() < room {
+        tmp.reserve(room);
+    }
+    let t = tmp.as_mut_ptr();
+    {
+        let m = n.div_ceil(64) * 64;
+        let mut at = 0;
+        while at < n {
+            sort_net::<8>(src.add(at), n - at, d.add(at));
+            at += 64;
+        }
+        let (mut from, mut to) = (d, t);
+        let mut width = 64;
+        while width < m {
+            let mut lo = 0;
+            while lo < m {
+                let mid = (lo + width).min(m);
+                let hi = (lo + 2 * width).min(m);
+                if hi - mid == width {
+                    merge32_even(from.add(lo), from.add(mid), width, to.add(lo));
+                } else {
+                    merge32(from.add(lo), mid - lo, from.add(mid), hi - mid, to.add(lo));
+                }
+                lo = hi;
+            }
+            std::mem::swap(&mut from, &mut to);
+            width *= 2;
+        }
+        (from, false)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn sort_times(src: *const u32, n: usize, dst: &mut Vec<u32>, _tmp: &mut Vec<u32>) -> (*const u32, bool) {
+    dst.clear();
+    dst.extend_from_slice(std::slice::from_raw_parts(src, n));
+    dst.sort_unstable();
+    dst.resize(n + LANES, u32::MAX);
+    (dst.as_ptr(), false)
+}
+
+/// The end of the session that starts at `i` among the `n` sorted times
+/// at `s`: the first `k > i` more than the gap after `k - 1`, or `n`.
+/// `s` is readable for `LANES` past `n`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn session_end(s: *const u32, i: usize, n: usize) -> usize {
+    use core::arch::x86_64::*;
+    // Unsigned compare by flipping the top bit.
+    let flip = _mm256_set1_epi32(i32::MIN);
+    let gap = _mm256_set1_epi32((SESSION_GAP_MS as u32 ^ 0x8000_0000) as i32);
+    let mut k = i + 1;
+    while k < n {
+        let a = _mm256_loadu_si256(s.add(k) as *const __m256i);
+        let b = _mm256_loadu_si256(s.add(k - 1) as *const __m256i);
+        let over = _mm256_cmpgt_epi32(_mm256_xor_si256(_mm256_sub_epi32(a, b), flip), gap);
+        let m = _bzhi_u32(_mm256_movemask_ps(_mm256_castsi256_ps(over)) as u32, (n - k).min(LANES) as u32);
+        if m != 0 {
+            return k + m.trailing_zeros() as usize;
+        }
+        k += LANES;
+    }
+    n
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+unsafe fn session_end(s: *const u32, i: usize, n: usize) -> usize {
+    let mut k = i + 1;
+    while k < n && *s.add(k) - *s.add(k - 1) <= SESSION_GAP_MS as u32 {
+        k += 1;
+    }
+    k
+}
+
 #[inline(always)]
 fn sort_u64(v: &mut [u64]) {
     if v.len() <= 20 {
@@ -1166,10 +2329,10 @@ impl<'a> PersonPhase<'a> {
             tab: Vec::new(),
             keys: Vec::new(),
             counts: Vec::new(),
-            bins: Vec::new(),
             words: Vec::new(),
-            binned: Vec::new(),
             ev: Vec::new(),
+            sorted: Vec::new(),
+            sort_tmp: Vec::new(),
             buys: Vec::new(),
             bcounts: Vec::new(),
             bought: Vec::new(),
@@ -1233,19 +2396,14 @@ impl<'a> PersonPhase<'a> {
         let mut mask = cap - 1;
         let mut shift = 64 - cap.trailing_zeros();
         let mut people = 0usize;
-        // `ts_rel < wlen`, so the last bin is that of `wlen - 1`.
-        let nbins = ((self.fast.wlen - 1) >> BIN_SHIFT) as usize + 1;
-        self.bins.clear();
-        self.bins.resize(nbins, 0);
         self.words.clear();
         self.words.reserve(n);
         self.buys.clear();
         let words = self.words.as_mut_ptr();
-        let bins = self.bins.as_mut_ptr();
         let mut at = 0usize;
 
-        // Pass 1: a local id per person, how many events each person has
-        // and each time bin has, and one word per event.
+        // Pass 1: a local id per person, how many events each person has,
+        // and one word per event.
         for list in evs {
             list.for_each_chunk(|chunk| {
                 for rec in chunk.iter() {
@@ -1272,7 +2430,6 @@ impl<'a> PersonPhase<'a> {
                         i = (i + 1) & mask;
                     };
                     *counts.add(id as usize) += 1;
-                    *bins.add((rec.v >> (32 + BIN_SHIFT)) as usize) += 1;
                     *words.add(at) = (rec.v & !0xFFFF_FFFF) | u64::from(id);
                     at += 1;
                     if rec.v as u32 != 0 {
@@ -1284,23 +2441,7 @@ impl<'a> PersonPhase<'a> {
         self.words.set_len(n);
         self.keys.set_len(people + 1);
         self.counts.set_len(people);
-        // Pass 2: the whole partition into bin order.
-        let mut sum = 0u32;
-        for c in self.bins.iter_mut() {
-            let k = *c;
-            *c = sum;
-            sum += k;
-        }
-        self.binned.clear();
-        self.binned.reserve(n);
-        self.binned.set_len(n);
-        for &word in &self.words {
-            let w = self.bins.get_unchecked_mut((word >> (32 + BIN_SHIFT)) as usize);
-            *self.binned.get_unchecked_mut(*w as usize) = word;
-            *w += 1;
-        }
-        // Pass 3: a stable scatter by person, so each person's events are
-        // in bin order.
+        // Pass 2: the times person after person.
         // counts -> start offsets (counts[i] becomes the write cursor).
         let mut sum = 0u32;
         for c in self.counts.iter_mut() {
@@ -1309,11 +2450,10 @@ impl<'a> PersonPhase<'a> {
             sum += k;
         }
         self.ev.clear();
-        // Padding: the run finder reads a block of `LANES` past any start.
-        self.ev.reserve(n + LANES);
-        self.ev.set_len(n + LANES);
+        self.ev.reserve(n + EV_PAD);
+        self.ev.set_len(n + EV_PAD);
         self.ev[n..].fill(0);
-        for &word in &self.binned {
+        for &word in &self.words {
             let w = self.counts.get_unchecked_mut(word as u32 as usize);
             *self.ev.get_unchecked_mut(*w as usize) = (word >> 32) as u32;
             *w += 1;
@@ -1456,7 +2596,6 @@ impl<'a> PersonPhase<'a> {
         let ws_in_day = self.fast.ws_in_day;
         let ndays = self.fast.ndays;
         let organic = self.fast.ncamp;
-        let gap = SESSION_GAP_MS as u32;
         let n = ev.len();
         let clicked = !cl.is_empty();
         if clicked {
@@ -1474,69 +2613,61 @@ impl<'a> PersonPhase<'a> {
         let (mut opened, mut slots) = (0u32, 0usize);
         let mut cur_day = u32::MAX;
         let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
-        // The open session: its start and the largest time seen in it.
-        let (mut start, mut last) = (0u32, 0u32);
+        let (s, binned) = sort_times(ev.as_ptr(), n, &mut self.sorted, &mut self.sort_tmp);
         let mut i = 0usize;
-        loop {
-            // One run of events in the same bin, and its extremes.
-            let (first, latest, j) = if i < n { bin_run(ev.as_ptr(), i, n) } else { (u32::MAX, 0, i) };
-            // `first` is past every time when the events have run out.
-            if i == 0 || first - last > gap {
-                if i != 0 {
-                    // The session is complete: its purchases are those not
-                    // taken yet that are no later than its last event.
-                    let mut revenue = 0u64;
-                    while buy < buy_end && (*self.bought.get_unchecked(buy) >> 32) as u32 <= last {
-                        let pc = *self.bought.get_unchecked(buy) as u32;
-                        let price = u64::from(pc >> 8);
-                        let cat = (pc & 0xFF) as u8;
-                        revenue += price;
-                        let sum = self.catsum.get_unchecked_mut(cat as usize);
-                        if *sum == 0 {
-                            self.touched.push(cat);
-                        }
-                        *sum += price;
-                        buy += 1;
-                    }
-                    d_revenue += revenue;
-                    if clicked {
-                        // Click times are relative to window_start - 7
-                        // days, so a session start S is S + reach on that
-                        // clock.
-                        let at = opened as usize - 1;
-                        *self.s_at.as_mut_ptr().add(at) = start + CLICK_REACH_MS as u32;
-                        *self.s_day.as_mut_ptr().add(at) = cur_day;
-                        *self.s_revenue.as_mut_ptr().add(at) = revenue;
-                    } else {
-                        let cell = self.agg.get_unchecked_mut(organic * ndays + cur_day as usize);
-                        cell[0] += 1;
-                        cell[1] += u64::from(revenue > 0);
-                        cell[2] += revenue;
-                    }
+        while i < n {
+            let (j, start, last) = if binned {
+                session_end_binned(s, i, n)
+            } else {
+                let j = session_end(s, i, n);
+                (j, *s.add(i), *s.add(j - 1))
+            };
+            let day_rel = ((u64::from(start) + ws_in_day) / DAY_MS as u64) as u32;
+            if day_rel != cur_day {
+                if cur_day != u32::MAX {
+                    self.emit(pkey, cur_day, d_sessions, d_events, d_revenue);
                 }
-                if i == n {
-                    break;
-                }
-                start = first;
-                let day_rel = ((u64::from(start) + ws_in_day) / DAY_MS as u64) as u32;
-                if day_rel != cur_day {
-                    if cur_day != u32::MAX {
-                        self.emit(pkey, cur_day, d_sessions, d_events, d_revenue);
-                    }
-                    cur_day = day_rel;
-                    d_sessions = 0;
-                    d_events = 0;
-                    d_revenue = 0;
-                    *self.slot_day.get_unchecked_mut(slots) = day_rel;
-                    *self.slot_first.get_unchecked_mut(slots) = opened;
-                    slots += 1;
-                    *self.slot_first.get_unchecked_mut(slots) = u32::MAX;
-                }
-                d_sessions += 1;
-                opened += 1;
+                cur_day = day_rel;
+                d_sessions = 0;
+                d_events = 0;
+                d_revenue = 0;
+                *self.slot_day.get_unchecked_mut(slots) = day_rel;
+                *self.slot_first.get_unchecked_mut(slots) = opened;
+                slots += 1;
+                *self.slot_first.get_unchecked_mut(slots) = u32::MAX;
             }
-            last = latest;
+            d_sessions += 1;
+            opened += 1;
             d_events += (j - i) as u32;
+            // The purchases of the session: those not taken yet that are
+            // no later than its last event.
+            let mut revenue = 0u64;
+            while buy < buy_end && (*self.bought.get_unchecked(buy) >> 32) as u32 <= last {
+                let pc = *self.bought.get_unchecked(buy) as u32;
+                let price = u64::from(pc >> 8);
+                let cat = (pc & 0xFF) as u8;
+                revenue += price;
+                let sum = self.catsum.get_unchecked_mut(cat as usize);
+                if *sum == 0 {
+                    self.touched.push(cat);
+                }
+                *sum += price;
+                buy += 1;
+            }
+            d_revenue += revenue;
+            if clicked {
+                // Click times are relative to window_start - 7 days, so a
+                // session start S is S + reach on that clock.
+                let at = opened as usize - 1;
+                *self.s_at.as_mut_ptr().add(at) = start + CLICK_REACH_MS as u32;
+                *self.s_day.as_mut_ptr().add(at) = cur_day;
+                *self.s_revenue.as_mut_ptr().add(at) = revenue;
+            } else {
+                let cell = self.agg.get_unchecked_mut(organic * ndays + cur_day as usize);
+                cell[0] += 1;
+                cell[1] += u64::from(revenue > 0);
+                cell[2] += revenue;
+            }
             i = j;
         }
         if cur_day != u32::MAX {
@@ -2171,5 +3302,64 @@ mod long_line_tests {
         }
         // A megabyte of commas is rejected at the first comma too many.
         assert!(split_long::<7>(&vec![b','; 1 << 20]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    fn rng(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mix(*state)
+    }
+
+    /// Every size class of `sort_times` against the standard sort, with
+    /// times that repeat, sit near the top of the range, and span the gap.
+    #[test]
+    fn sort_times_and_session_end_match_scalar() {
+        let mut state = 7u64;
+        let (mut dst, mut tmp) = (Vec::new(), Vec::new());
+        for n in (1..=200).chain([255, 256, 257, 511, 640, 1000, 1023, 1024, 1025, 3000, 70_000]) {
+            for round in 0..4 {
+                let spread = [100u64, 4_000_000, 1 << 32, 50][round];
+                let base = if round == 2 { 0 } else { u32::MAX as u64 - spread - 1 };
+                let mut src: Vec<u32> = (0..n).map(|_| (base + rng(&mut state) % spread) as u32).collect();
+                src.extend(std::iter::repeat_n(0xDEAD_BEEF, EV_PAD));
+                let mut want = src[..n].to_vec();
+                want.sort_unstable();
+                let (s, binned) = unsafe { sort_times(src.as_ptr(), n, &mut dst, &mut tmp) };
+                let got = unsafe { std::slice::from_raw_parts(s, n) }.to_vec();
+                // The AVX2 build puts big people in bin order only; the
+                // portable build always sorts fully.
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                assert_eq!(binned, n >= BIN_EVENTS);
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                assert!(!binned);
+                if binned {
+                    assert!(got.windows(2).all(|w| w[0] >> BIN_SHIFT <= w[1] >> BIN_SHIFT), "n {n} round {round}");
+                    let mut sorted = got.clone();
+                    sorted.sort_unstable();
+                    assert_eq!(sorted, want, "n {n} round {round}");
+                } else {
+                    assert_eq!(got, want, "n {n} round {round}");
+                }
+                let mut i = 0;
+                while i < n {
+                    let (j, start, last) = if binned {
+                        unsafe { session_end_binned(s, i, n) }
+                    } else {
+                        let j = unsafe { session_end(s, i, n) };
+                        (j, got[i], got[j - 1])
+                    };
+                    let mut k = i + 1;
+                    while k < n && want[k] - want[k - 1] <= SESSION_GAP_MS as u32 {
+                        k += 1;
+                    }
+                    assert_eq!((j, start, last), (k, want[i], want[k - 1]), "n {n} round {round} at {i}");
+                    i = j;
+                }
+            }
+        }
     }
 }
