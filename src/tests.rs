@@ -19,6 +19,7 @@ fn cfg(threads: usize, chunk: usize, bits: u32) -> Config {
         onepass: true,
         dense: false,
         dense_slots: None,
+        fused: true,
     }
 }
 
@@ -28,7 +29,9 @@ fn compare(data: &Path, config: &Config) -> [i64; 5] {
     // All shapes of the engine: one-pass, three-phase and dense.
     let other = Config { onepass: !config.onepass, ..*config };
     let dense = Config { dense: true, ..*config };
-    for config in [config, &other, &dense] {
+    // And the two-stage reader for events and clicks.
+    let staged = Config { fused: !config.fused, onepass: false, ..*config };
+    for config in [config, &other, &dense, &staged] {
         check_shape(data, config, &lk, &want);
     }
     [

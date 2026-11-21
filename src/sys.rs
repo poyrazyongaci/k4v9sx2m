@@ -241,6 +241,12 @@ impl<T> List<T> {
             at = next;
         }
     }
+    /// The chunks as an iterator of slices, for loops that keep their state
+    /// in locals rather than in a closure's captures.
+    #[inline]
+    pub unsafe fn chunks(&self) -> Chunks<T> {
+        Chunks { at: self.head, _t: PhantomData }
+    }
     /// Hand every chunk's memory to `f`. The list must not be used again.
     pub unsafe fn release(&self, mut f: impl FnMut(*mut u8)) {
         let mut at = self.head;
@@ -258,6 +264,27 @@ impl<T> List<T> {
             at = (*at).next;
         }
         n
+    }
+}
+
+pub struct Chunks<T> {
+    at: *mut ChunkHdr,
+    _t: PhantomData<T>,
+}
+
+impl<T: 'static> Iterator for Chunks<T> {
+    type Item = &'static [T];
+    #[inline]
+    fn next(&mut self) -> Option<&'static [T]> {
+        if self.at.is_null() {
+            return None;
+        }
+        unsafe {
+            let len = (*self.at).len as usize;
+            let data = (self.at as *const u8).add(HDR) as *const T;
+            self.at = (*self.at).next;
+            Some(std::slice::from_raw_parts(data, len))
+        }
     }
 }
 
@@ -319,9 +346,37 @@ unsafe fn stream_lines(src: *const u8, dst: *mut u8, lines: usize) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use core::arch::x86_64::*;
-        for i in 0..lines * 2 {
-            let v = _mm256_load_si256(src.add(32 * i) as *const __m256i);
-            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, v);
+        // Four lines a step (a staging buffer is usually 4 or 12 lines),
+        // then one line a step: fewer loop instructions per line.
+        let (mut s, mut d) = (src, dst);
+        let end = src.add(lines * 64);
+        while s.add(256) <= end {
+            let v0 = _mm256_load_si256(s as *const __m256i);
+            let v1 = _mm256_load_si256(s.add(32) as *const __m256i);
+            let v2 = _mm256_load_si256(s.add(64) as *const __m256i);
+            let v3 = _mm256_load_si256(s.add(96) as *const __m256i);
+            let v4 = _mm256_load_si256(s.add(128) as *const __m256i);
+            let v5 = _mm256_load_si256(s.add(160) as *const __m256i);
+            let v6 = _mm256_load_si256(s.add(192) as *const __m256i);
+            let v7 = _mm256_load_si256(s.add(224) as *const __m256i);
+            _mm256_stream_si256(d as *mut __m256i, v0);
+            _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
+            _mm256_stream_si256(d.add(64) as *mut __m256i, v2);
+            _mm256_stream_si256(d.add(96) as *mut __m256i, v3);
+            _mm256_stream_si256(d.add(128) as *mut __m256i, v4);
+            _mm256_stream_si256(d.add(160) as *mut __m256i, v5);
+            _mm256_stream_si256(d.add(192) as *mut __m256i, v6);
+            _mm256_stream_si256(d.add(224) as *mut __m256i, v7);
+            s = s.add(256);
+            d = d.add(256);
+        }
+        while s < end {
+            let v0 = _mm256_load_si256(s as *const __m256i);
+            let v1 = _mm256_load_si256(s.add(32) as *const __m256i);
+            _mm256_stream_si256(d as *mut __m256i, v0);
+            _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
+            s = s.add(64);
+            d = d.add(64);
         }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]

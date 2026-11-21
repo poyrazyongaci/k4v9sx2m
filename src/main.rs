@@ -1,6 +1,7 @@
 mod alloc;
 mod common;
 mod engine;
+mod fuse;
 mod ids;
 mod naive;
 mod output;

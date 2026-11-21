@@ -28,7 +28,8 @@ use crate::common::*;
 use crate::ids::{self, cmp_ids};
 use crate::output::{write_camp_cols, CampCols};
 use crate::usercols::UserOut;
-use crate::scan::{for_each_line, for_each_line_b, Scan};
+use crate::fuse;
+use crate::scan::{for_each_line, for_each_line_b, Bounds, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
 use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, parse_ts_ingest, DateCache, BAD};
 
@@ -48,6 +49,9 @@ pub struct Config {
     pub dense: bool,
     /// Dense shape: slots of the ID table (a power of two), for tests.
     pub dense_slots: Option<usize>,
+    /// Event and click lines by the one-pass reader (`fuse.rs`). On by
+    /// default where AVX2 and BMI2 are compiled in; `ENGINE_FUSE=0|1`.
+    pub fused: bool,
 }
 
 impl Config {
@@ -63,6 +67,11 @@ impl Config {
             onepass: std::env::var("ENGINE_ONEPASS").is_ok_and(|v| v == "1"),
             dense: std::env::var("ENGINE_DENSE").is_ok_and(|v| v == "1"),
             dense_slots: std::env::var("ENGINE_DENSE_SLOTS").ok().and_then(|v| v.parse().ok()),
+            fused: match std::env::var("ENGINE_FUSE").as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")),
+            },
         }
     }
 }
@@ -940,7 +949,7 @@ impl<'a> ParseState<'a> {
     /// copy goes to `emit` for its person lookup, not to `entries`; 2 is the
     /// dense shape, where it goes to `dense`.
     #[inline(never)]
-    unsafe fn events<const MODE: u8>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+    unsafe fn events<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
@@ -954,8 +963,7 @@ impl<'a> ParseState<'a> {
             Some(e) => &mut **e,
             None => std::ptr::null_mut(),
         };
-        let known = scan.clean;
-        for_each_line_b::<7>(scan, limit, |b| {
+        src.run::<7>(|base, b, known| {
             let id_len = b.len(0);
             if id_len == 0 {
                 return;
@@ -1007,7 +1015,7 @@ impl<'a> ParseState<'a> {
     }
 
     #[inline(never)]
-    unsafe fn clicks<const MODE: u8>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+    unsafe fn clicks<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
         let fast = self.fast;
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
@@ -1020,8 +1028,7 @@ impl<'a> ParseState<'a> {
             Some(e) => &mut **e,
             None => std::ptr::null_mut(),
         };
-        let known = scan.clean;
-        for_each_line_b::<4>(scan, limit, |b| {
+        src.run::<4>(|base, b, known| {
             let id_len = b.len(0);
             let user_len = b.len(1);
             if id_len == 0 || user_len == 0 {
@@ -1158,23 +1165,136 @@ impl<'a> ParseState<'a> {
 
     #[inline(always)]
     unsafe fn consume(&mut self, kind: Kind, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+        let src = Scanned { base, scan, limit };
+        let one = self.emit.is_some();
+        let dense = self.dense.is_some();
+        (match kind {
+            Kind::Events if dense => self.events::<2, _>(src),
+            Kind::Events if one => self.events::<1, _>(src),
+            Kind::Events => self.events::<0, _>(src),
+            Kind::Clicks if dense => self.clicks::<2, _>(src),
+            Kind::Clicks if one => self.clicks::<1, _>(src),
+            Kind::Clicks => self.clicks::<0, _>(src),
+            Kind::Links => return self.links(base, scan, limit),
+        }) as u32
+    }
+
+    /// The event or click lines of `m` that start in `[pos, end)`, `pos` a
+    /// line start, by the one-pass reader. Returns where it stopped: `end`
+    /// or later, or the start of a line that only `long_line` can take.
+    #[inline(always)]
+    unsafe fn consume_fused(&mut self, kind: Kind, m: Mapped, pos: usize, end: usize, scan: &mut Scan) -> usize {
+        let src = Fused { m, pos, end, scan };
         let one = self.emit.is_some();
         let dense = self.dense.is_some();
         match kind {
-            Kind::Events if dense => self.events::<2>(base, scan, limit),
-            Kind::Events if one => self.events::<1>(base, scan, limit),
-            Kind::Events => self.events::<0>(base, scan, limit),
-            Kind::Clicks if dense => self.clicks::<2>(base, scan, limit),
-            Kind::Clicks if one => self.clicks::<1>(base, scan, limit),
-            Kind::Clicks => self.clicks::<0>(base, scan, limit),
-            Kind::Links => self.links(base, scan, limit),
+            Kind::Events if dense => self.events::<2, _>(src),
+            Kind::Events if one => self.events::<1, _>(src),
+            Kind::Events => self.events::<0, _>(src),
+            Kind::Clicks if dense => self.clicks::<2, _>(src),
+            Kind::Clicks if one => self.clicks::<1, _>(src),
+            Kind::Clicks => self.clicks::<0, _>(src),
+            Kind::Links => unreachable!(),
         }
     }
+}
+
+/// Where `events` and `clicks` get their lines: `f(base, bounds, known)`
+/// for each well-formed line of `N` fields, the bounds relative to `base`,
+/// `known` when both ID fields are bytes in 1..=127. Returns a position
+/// whose meaning depends on the source.
+trait Lines {
+    unsafe fn run<const N: usize>(self, f: impl FnMut(*const u8, &Bounds, bool)) -> usize;
+}
+
+/// The lines of a window that stage 1 has scanned, starting before
+/// `limit`. Returns the offset of the first line left.
+struct Scanned<'s> {
+    base: *const u8,
+    scan: &'s Scan,
+    limit: u32,
+}
+
+impl Lines for Scanned<'_> {
+    #[inline(always)]
+    unsafe fn run<const N: usize>(self, mut f: impl FnMut(*const u8, &Bounds, bool)) -> usize {
+        let (base, known) = (self.base, self.scan.clean);
+        for_each_line_b::<N>(self.scan, self.limit, |b| f(base, b, known)) as usize
+    }
+}
+
+/// The lines of a mapped file from `pos` (a line start) that start before
+/// `end`, one at a time by `fuse`. A line that `fuse` refuses goes through
+/// stage 1 and 2 on a small window of its own, so it is decided exactly as
+/// before. Returns where it stopped: at or past `end`, or at a line that
+/// no small window holds whole (too long, or the last line of the file
+/// without a line break).
+struct Fused<'s> {
+    m: Mapped,
+    pos: usize,
+    end: usize,
+    scan: &'s mut Scan,
+}
+
+/// The window a refused line is read with.
+const REFUSED_WINDOW: usize = 256;
+/// How far ahead of the reader the input is prefetched.
+const FUSED_AHEAD: usize = 1024;
+
+impl Lines for Fused<'_> {
+    #[inline(always)]
+    unsafe fn run<const N: usize>(self, mut f: impl FnMut(*const u8, &Bounds, bool)) -> usize {
+        let Fused { m, mut pos, end, scan } = self;
+        let mut b = Bounds::new();
+        while pos < end {
+            let p = m.ptr.add(pos);
+            sys::prefetch(p.wrapping_add(FUSED_AHEAD));
+            sys::prefetch(p.wrapping_add(FUSED_AHEAD + 64));
+            let mut known = false;
+            let nl = if N == 7 { fuse::event_line(p, &mut b, &mut known) } else { fuse::click_line(p, &mut b, &mut known) };
+            let mut used = nl as usize + 1;
+            if nl == fuse::REFUSED {
+                // One call site for `f`, so it is inlined.
+                (used, known) = refused_line::<N>(scan, m, pos, &mut b);
+                if used == 0 {
+                    return pos;
+                }
+                if !known {
+                    pos += used;
+                    continue;
+                }
+                known = scan.clean;
+            }
+            f(p, &b, known);
+            pos += used;
+        }
+        pos
+    }
+}
+
+/// A line the one-pass reader refused, through stage 1 and 2 on a window
+/// of its own. Returns its length with the line break (0 when the window
+/// does not hold it whole) and whether it is a well-formed line, whose
+/// bounds are then in `out`.
+#[cold]
+#[inline(never)]
+unsafe fn refused_line<const N: usize>(scan: &mut Scan, m: Mapped, pos: usize, out: &mut Bounds) -> (usize, bool) {
+    let p = m.ptr.add(pos);
+    scan.scan(p, REFUSED_WINDOW.min(m.len - pos));
+    let mut good = false;
+    let used = for_each_line_b::<N>(scan, 1, |b| {
+        out.s = b.s;
+        out.n = b.n;
+        good = true;
+    }) as usize;
+    (used, good)
 }
 
 struct Parser<'a> {
     st: ParseState<'a>,
     scan: Scan,
+    /// Event and click lines by the one-pass reader (`fuse`).
+    fused: bool,
 }
 
 unsafe fn find_newline(p: *const u8, len: usize) -> Option<usize> {
@@ -1253,6 +1373,19 @@ impl<'a> Parser<'a> {
             return;
         };
         let mut pos = from + first + 1;
+        if self.fused && kind != Kind::Links {
+            while pos < b {
+                let t = prof::start();
+                pos = self.st.consume_fused(kind, m, pos, b, &mut self.scan);
+                prof::add(1, t);
+                if pos < b {
+                    let end = find_newline(m.ptr.add(pos), len - pos).map_or(len, |i| pos + i);
+                    self.st.long_line(std::slice::from_raw_parts(m.ptr.add(pos), end - pos), kind);
+                    pos = end + 1;
+                }
+            }
+            return;
+        }
         while pos < b {
             let wlen = WINDOW.min(len - pos).min(b - pos + WINDOW_SLACK);
             let base = m.ptr.add(pos);
@@ -1340,16 +1473,22 @@ impl<'a> Resolver<'a> {
         let bases = &mut self.bases;
         for list in lists {
             list.for_each_chunk_ahead(|chunk, next| {
-                let end = chunk.as_ptr().add(chunk.len()) as usize;
                 let first = (bases.len() as u32) << OFF_BITS;
                 bases.push(chunk.as_mut_ptr());
                 let bases = bases.as_ptr();
-                for (k, entry) in chunk.iter_mut().enumerate() {
-                    // Ask for the entries a little ahead, into the next
-                    // chunk at the end of this one.
-                    let ahead = entry as *const Entry as usize + DEDUP_AHEAD;
-                    let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
-                    prefetch(ahead as *const u8);
+                // Ask for the entries a little ahead, into the next chunk at
+                // the end of this one: `DEDUP_AHEAD` bytes past entry `k` is
+                // `here + k` below `split` and `there + k` from it on, so
+                // the loop runs in two parts with no per-entry select.
+                let len = chunk.len();
+                let split = len.saturating_sub(DEDUP_AHEAD / std::mem::size_of::<Entry>());
+                let here = (chunk.as_ptr() as *const u8).wrapping_add(DEDUP_AHEAD) as *const Entry;
+                let there = if next.is_null() { here } else { (next as *const Entry).wrapping_sub(split) };
+                let data = chunk.as_mut_ptr();
+                for (from, to, ahead) in [(0, split, here), (split, len, there)] {
+                for k in from..to {
+                    let entry = &mut *data.add(k);
+                    prefetch(ahead.wrapping_add(k));
                     let h = mix1(entry.ekey);
                     // Low hash bits, apart from the home bits (20 and up).
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
@@ -1379,6 +1518,7 @@ impl<'a> Resolver<'a> {
                         i = (i + 1) & mask;
                     }
                 }
+                }
             });
         }
         let t = prof::add(4, t);
@@ -1394,13 +1534,19 @@ impl<'a> Resolver<'a> {
             list.for_each_chunk_ahead(|chunk, next| {
                 // The entries left the cache during the dedup walk: read
                 // ahead again, across chunk ends.
-                let end = chunk.as_ptr().add(chunk.len()) as usize;
-                for block in chunk.chunks(BLOCK) {
-                    for (h, entry) in hashes.iter_mut().zip(block) {
-                        let ahead = entry as *const Entry as usize + EMIT_AHEAD;
-                        let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
-                        prefetch(ahead as *const u8);
-                        *h = links.stage1(entry.ukey);
+                // As in the dedup walk: `EMIT_AHEAD` bytes past entry `k`.
+                let len = chunk.len();
+                let split = len.saturating_sub(EMIT_AHEAD / std::mem::size_of::<Entry>());
+                let here = (chunk.as_ptr() as *const u8).wrapping_add(EMIT_AHEAD) as *const Entry;
+                let there = if next.is_null() { here } else { (next as *const Entry).wrapping_sub(split) };
+                for (b, block) in chunk.chunks(BLOCK).enumerate() {
+                    let (k0, k1) = (b * BLOCK, b * BLOCK + block.len());
+                    let mid = split.clamp(k0, k1);
+                    for (from, to, ahead) in [(k0, mid, here), (mid, k1, there)] {
+                        for k in from..to {
+                            prefetch(ahead.wrapping_add(k));
+                            *hashes.get_unchecked_mut(k - k0) = links.stage1((*block.as_ptr().add(k - k0)).ukey);
+                        }
                     }
                     for (at, &h) in starts.iter_mut().zip(&hashes[..block.len()]) {
                         *at = links.stage2(h);
@@ -3095,6 +3241,70 @@ impl<'a> PersonPhase<'a> {
         shift
     }
 
+    /// Pass 1 of a partition: a local id per person (`keys[id + 1]`), how
+    /// many events each person has (`counts`), and one word per event,
+    /// `time << 32 | id` (`words`); purchases also go to `buys`. Out of
+    /// line, so the loop gets the registers to itself. Returns the people,
+    /// the words, and the shift and mask of the table.
+    #[inline(never)]
+    unsafe fn group(
+        evs: &[List<Ev>],
+        table: &mut Vec<u32>,
+        keys: *mut u64,
+        counts: *mut u32,
+        words: *mut u64,
+        buys: &mut Vec<(u64, u32)>,
+    ) -> (usize, usize, u32, usize) {
+        let cap = table.len();
+        *keys = 0;
+        let mut tab = table.as_mut_ptr();
+        let mut mask = cap - 1;
+        let mut shift = 64 - cap.trailing_zeros();
+        let mut people = 0usize;
+        let mut wp = words;
+        // Pass 1: a local id per person, how many events each person has,
+        // and one word per event.
+        for list in evs {
+            for chunk in list.chunks() {
+                for rec in chunk.iter() {
+                    if rec.v == DEAD {
+                        // Dropped by the one-pass dedup.
+                        continue;
+                    }
+                    let mut i = (person_hash(rec.pkey) >> shift) as usize;
+                    let id = loop {
+                        let id1 = *tab.add(i) as usize;
+                        if *keys.add(id1) == rec.pkey {
+                            break id1 as u32 - 1;
+                        }
+                        if id1 == 0 {
+                            if (people + 1) * 2 > mask + 1 {
+                                shift = Self::grow_table(table, keys, people);
+                                tab = table.as_mut_ptr();
+                                mask = table.len() - 1;
+                                i = (person_hash(rec.pkey) >> shift) as usize;
+                                continue;
+                            }
+                            *counts.add(people) = 0;
+                            people += 1;
+                            *keys.add(people) = rec.pkey;
+                            *tab.add(i) = people as u32;
+                            break people as u32 - 1;
+                        }
+                        i = (i + 1) & mask;
+                    };
+                    *counts.add(id as usize) += 1;
+                    *wp = (rec.v & !0xFFFF_FFFF) | u64::from(id);
+                    wp = wp.add(1);
+                    if rec.v as u32 != 0 {
+                        buys.push((rec.v, id));
+                    }
+                }
+            }
+        }
+        (people, wp.offset_from(words) as usize, shift, mask)
+    }
+
     unsafe fn partition(&mut self, evs: &[List<Ev>], cls: &[List<Click>]) {
         let t = prof::start();
         let n: usize = evs.iter().map(|l| l.count()).sum();
@@ -3112,59 +3322,13 @@ impl<'a> PersonPhase<'a> {
         self.counts.reserve(n);
         let keys = self.keys.as_mut_ptr();
         let counts = self.counts.as_mut_ptr();
-        *keys = 0;
-        let mut tab = self.tab.as_mut_ptr();
-        let mut mask = cap - 1;
-        let mut shift = 64 - cap.trailing_zeros();
-        let mut people = 0usize;
         self.words.clear();
         self.words.reserve(n);
         self.buys.clear();
         let words = self.words.as_mut_ptr();
-        let mut at = 0usize;
-
-        // Pass 1: a local id per person, how many events each person has,
-        // and one word per event.
-        for list in evs {
-            list.for_each_chunk(|chunk| {
-                for rec in chunk.iter() {
-                    if rec.v == DEAD {
-                        // Dropped by the one-pass dedup.
-                        continue;
-                    }
-                    let mut i = (person_hash(rec.pkey) >> shift) as usize;
-                    let id = loop {
-                        let id1 = *tab.add(i) as usize;
-                        if *keys.add(id1) == rec.pkey {
-                            break id1 as u32 - 1;
-                        }
-                        if id1 == 0 {
-                            if (people + 1) * 2 > mask + 1 {
-                                shift = Self::grow_table(&mut self.tab, keys, people);
-                                tab = self.tab.as_mut_ptr();
-                                mask = self.tab.len() - 1;
-                                i = (person_hash(rec.pkey) >> shift) as usize;
-                                continue;
-                            }
-                            *counts.add(people) = 0;
-                            people += 1;
-                            *keys.add(people) = rec.pkey;
-                            *tab.add(i) = people as u32;
-                            break people as u32 - 1;
-                        }
-                        i = (i + 1) & mask;
-                    };
-                    *counts.add(id as usize) += 1;
-                    *words.add(at) = (rec.v & !0xFFFF_FFFF) | u64::from(id);
-                    at += 1;
-                    if rec.v as u32 != 0 {
-                        self.buys.push((rec.v, id));
-                    }
-                }
-            });
-        }
+        let (people, n, shift, mask) = Self::group(evs, &mut self.tab, keys, counts, words, &mut self.buys);
+        let tab = self.tab.as_ptr();
         // Records the dedup dropped are not counted from here on.
-        let n = at;
         self.words.set_len(n);
         self.keys.set_len(people + 1);
         self.counts.set_len(people);
@@ -3180,18 +3344,23 @@ impl<'a> PersonPhase<'a> {
         self.ev.reserve(n + EV_PAD);
         self.ev.set_len(n + EV_PAD);
         self.ev[n..].fill(0);
-        for &word in &self.words {
-            let w = self.counts.get_unchecked_mut(word as u32 as usize);
-            *self.ev.get_unchecked_mut(*w as usize) = (word >> 32) as u32;
-            *w += 1;
+        {
+            // Through pointers, so nothing is reloaded per word.
+            let (cursor, ev) = (self.counts.as_mut_ptr(), self.ev.as_mut_ptr());
+            for &word in &self.words {
+                let w = cursor.add(word as u32 as usize);
+                *ev.add(*w as usize) = (word >> 32) as u32;
+                *w += 1;
+            }
         }
         // counts[i] is now the end offset of person i.
 
         // The purchases, person after person.
         self.bcounts.clear();
         self.bcounts.resize(people, 0);
+        let bcounts = self.bcounts.as_mut_ptr();
         for &(_, id) in &self.buys {
-            *self.bcounts.get_unchecked_mut(id as usize) += 1;
+            *bcounts.add(id as usize) += 1;
         }
         let mut sum = 0u32;
         for c in self.bcounts.iter_mut() {
@@ -3202,9 +3371,10 @@ impl<'a> PersonPhase<'a> {
         self.bought.clear();
         self.bought.reserve(self.buys.len());
         self.bought.set_len(self.buys.len());
+        let bought = self.bought.as_mut_ptr();
         for &(v, id) in &self.buys {
-            let w = self.bcounts.get_unchecked_mut(id as usize);
-            *self.bought.get_unchecked_mut(*w as usize) = v;
+            let w = bcounts.add(id as usize);
+            *bought.add(*w as usize) = v;
             *w += 1;
         }
 
@@ -3216,8 +3386,10 @@ impl<'a> PersonPhase<'a> {
         if nc > 0 {
             self.cids.clear();
             self.cids.reserve(nc);
+            let (cids, ccounts) = (self.cids.as_mut_ptr(), self.ccounts.as_mut_ptr());
+            let mut at = 0usize;
             for list in cls {
-                list.for_each_chunk(|chunk| {
+                for chunk in list.chunks() {
                     for rec in chunk.iter() {
                         let mut i = (person_hash(rec.key) >> shift) as usize;
                         let id = loop {
@@ -3230,13 +3402,15 @@ impl<'a> PersonPhase<'a> {
                             }
                             i = (i + 1) & mask;
                         };
-                        self.cids.push(id);
+                        *cids.add(at) = id;
+                        at += 1;
                         if id != u32::MAX {
-                            *self.ccounts.get_unchecked_mut(id as usize) += 1;
+                            *ccounts.add(id as usize) += 1;
                         }
                     }
-                });
+                }
             }
+            self.cids.set_len(at);
             let mut sum = 0u32;
             for c in self.ccounts.iter_mut() {
                 let k = *c;
@@ -3246,18 +3420,19 @@ impl<'a> PersonPhase<'a> {
             self.cl.reserve(sum as usize);
             self.cl.set_len(sum as usize);
             let mut at = 0usize;
+            let (cids, cursor, out) = (self.cids.as_ptr(), self.ccounts.as_mut_ptr(), self.cl.as_mut_ptr());
             for list in cls {
-                list.for_each_chunk(|chunk| {
+                for chunk in list.chunks() {
                     for rec in chunk.iter() {
-                        let id = *self.cids.get_unchecked(at);
+                        let id = *cids.add(at);
                         at += 1;
                         if id != u32::MAX {
-                            let w = self.ccounts.get_unchecked_mut(id as usize);
-                            *self.cl.get_unchecked_mut(*w as usize) = (rec.tc, rec.ckey);
+                            let w = cursor.add(id as usize);
+                            *out.add(*w as usize) = (rec.tc, rec.ckey);
                             *w += 1;
                         }
                     }
-                });
+                }
             }
         }
 
@@ -3489,7 +3664,23 @@ impl<'a> PersonPhase<'a> {
         if cl.len() > 1 {
             // By ts, then by click id descending: the last click at or
             // before a session start is the latest with the smallest id.
-            cl.sort_unstable_by(|a, b| (a.0 >> 32).cmp(&(b.0 >> 32)).then_with(|| cmp_ids(b.1, a.1)));
+            // One integer compare per step: by the first word (ts, then
+            // campaign), then each run of equal ts put in id order.
+            cl.sort_unstable_by_key(|c| c.0);
+            let mut i = 0;
+            while i + 1 < cl.len() {
+                let ts = cl.get_unchecked(i).0 >> 32;
+                if cl.get_unchecked(i + 1).0 >> 32 != ts {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 2;
+                while j < cl.len() && cl.get_unchecked(j).0 >> 32 == ts {
+                    j += 1;
+                }
+                cl.get_unchecked_mut(i..j).sort_unstable_by(|a, b| cmp_ids(b.1, a.1));
+                i = j;
+            }
         }
         let mut win = Window { lo: 0, hi: 0, session: 0, slot: 0 };
         for k in 0..sessions {
@@ -3663,6 +3854,7 @@ fn front_onepass(
             dense: None,
         },
         scan: Scan::new(WINDOW),
+        fused: cfg.fused,
     };
 
     // ---- links: read and joined before anything else, so that the
@@ -3882,6 +4074,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                             dense: None,
                         },
                         scan: Scan::new(WINDOW),
+                        fused: cfg.fused,
                     };
                     loop {
                         let at = next.fetch_add(1, Ordering::Relaxed);
@@ -4317,6 +4510,361 @@ mod sort_tests {
                     i = j;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+
+    fn rng(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mix(*state)
+    }
+
+    type Got = Vec<(usize, Vec<Vec<u8>>, bool)>;
+
+    /// `text` followed by the zero page a mapping has after its end.
+    fn padded(text: &[u8]) -> Vec<u8> {
+        let mut buf = text.to_vec();
+        buf.extend_from_slice(&[0u8; 4096]);
+        buf
+    }
+
+    unsafe fn collect<const N: usize>(base: *const u8, start: *const u8, b: &Bounds, known: bool, out: &mut Got) {
+        let fields = (0..N).map(|i| std::slice::from_raw_parts(base.add(b.start(i)), b.len(i)).to_vec()).collect();
+        out.push((base as usize - start as usize, fields, known));
+    }
+
+    fn long<const N: usize>(at: usize, line: &[u8], out: &mut Got) {
+        if let Some(f) = split_long::<N>(line) {
+            out.push((at, f.iter().map(|x| x.to_vec()).collect(), false));
+        }
+    }
+
+    /// The lines of `text` (from offset 0) as the two-stage reader in
+    /// `run_chunk` sees them, in windows of `window` bytes.
+    fn staged<const N: usize>(text: &[u8], window: usize) -> Got {
+        let buf = padded(text);
+        let len = text.len();
+        let mut scan = Scan::new(window.max(REFUSED_WINDOW));
+        let mut out = Got::new();
+        let mut pos = 0;
+        unsafe {
+            while pos < len {
+                let wlen = window.min(len - pos);
+                let base = buf.as_ptr().add(pos);
+                scan.scan(base, wlen);
+                let src = Scanned { base, scan: &scan, limit: (len - pos) as u32 };
+                let start = buf.as_ptr();
+                let used = src.run::<N>(|p, b, k| collect::<N>(p, start, b, k, &mut out));
+                if used > 0 {
+                    pos += used;
+                    continue;
+                }
+                let after = pos + wlen;
+                let end = text[after..].iter().position(|&c| c == b'\n').map_or(len, |i| after + i);
+                long::<N>(pos, &text[pos..end], &mut out);
+                pos = end + 1;
+            }
+        }
+        out
+    }
+
+    /// The same by the one-pass reader, as `run_chunk` drives it.
+    fn fused<const N: usize>(text: &[u8]) -> Got {
+        let buf = padded(text);
+        let len = text.len();
+        let m = Mapped { ptr: buf.as_ptr(), len };
+        let mut scan = Scan::new(WINDOW);
+        let mut out = Got::new();
+        let mut pos = 0;
+        unsafe {
+            while pos < len {
+                let start = buf.as_ptr();
+                let src = Fused { m, pos, end: len, scan: &mut scan };
+                pos = src.run::<N>(|p, b, k| collect::<N>(p, start, b, k, &mut out));
+                if pos < len {
+                    let end = text[pos..].iter().position(|&c| c == b'\n').map_or(len, |i| pos + i);
+                    long::<N>(pos, &text[pos..end], &mut out);
+                    pos = end + 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The plain splitter on every line.
+    fn reference<const N: usize>(text: &[u8]) -> Vec<(usize, Vec<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let mut tmp = Vec::new();
+        let mut at = 0;
+        while at < text.len() {
+            let end = text[at..].iter().position(|&c| c == b'\n').map_or(text.len(), |i| at + i);
+            if split_line(&text[at..end], N, &mut tmp) {
+                out.push((at, tmp.iter().map(|f| f.to_vec()).collect()));
+            }
+            at = end + 1;
+        }
+        out
+    }
+
+    fn check<const N: usize>(text: &[u8], what: &str) {
+        // Line offsets are not compared: a window source reports its base.
+        let want: Vec<_> = reference::<N>(text).into_iter().map(|(_, f)| f).collect();
+        let strip = |g: &Got| g.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>();
+        let got = fused::<N>(text);
+        assert_eq!(strip(&got), want, "fused, {N} fields, {what}: {:?}", String::from_utf8_lossy(text));
+        for (_, fields, known) in &got {
+            if *known {
+                for id in &fields[..2] {
+                    assert!(id.iter().all(|&c| (1..=127).contains(&c)), "known but not plain: {what}");
+                }
+            }
+        }
+        for window in [97, 1000, WINDOW] {
+            assert_eq!(strip(&staged::<N>(text, window)), want, "staged {window}, {N} fields, {what}");
+        }
+    }
+
+    /// One line, followed by `next`: the one-pass verdict and bounds
+    /// against stage 1 and 2 on a window holding just that line.
+    fn line<const N: usize>(line: &[u8], next: &[u8]) -> bool {
+        let mut text = line.to_vec();
+        text.push(b'\n');
+        text.extend_from_slice(next);
+        let buf = padded(&text);
+        let mut b = Bounds::new();
+        let mut known = false;
+        let nl = unsafe {
+            if N == 7 {
+                fuse::event_line(buf.as_ptr(), &mut b, &mut known)
+            } else {
+                fuse::click_line(buf.as_ptr(), &mut b, &mut known)
+            }
+        };
+        let mut scan = Scan::new(4096);
+        let mut staged = Got::new();
+        let used = unsafe {
+            scan.scan(buf.as_ptr(), text.len());
+            let src = Scanned { base: buf.as_ptr(), scan: &scan, limit: 1 };
+            src.run::<N>(|p, bb, k| collect::<N>(p, buf.as_ptr(), bb, k, &mut staged))
+        };
+        assert_eq!(used, line.len() + 1);
+        if nl == fuse::REFUSED {
+            return false;
+        }
+        assert_eq!(nl as usize, line.len(), "line end of {:?}", String::from_utf8_lossy(line));
+        assert_eq!(staged.len(), 1, "fused accepted a malformed line {:?}", String::from_utf8_lossy(line));
+        for i in 0..N {
+            let f = &buf[b.start(i)..b.start(i) + b.len(i)];
+            assert_eq!(f, &staged[0].1[i][..], "field {i} of {:?}", String::from_utf8_lossy(line));
+        }
+        true
+    }
+
+    const EVENT: [&str; 7] = ["e1234567a", "u12345678", "2026-10-03T23:58:10Z", "2026-10-03T23:59:10Z", "view", "p123", "100"];
+    const CLICK: [&str; 4] = ["k1234567a", "u12345678", "c_12", "2026-10-03T23:58:10Z"];
+
+    fn join(fields: &[Vec<u8>]) -> Vec<u8> {
+        fields.join(&b","[..])
+    }
+
+    fn quote_variants(x: &[u8]) -> Vec<Vec<u8>> {
+        let mut v = vec![x.to_vec(), Vec::new()];
+        let mut w = |pre: &[u8], mid: &[u8], post: &[u8]| v.push([pre, mid, post].concat());
+        w(b"\"", x, b"\"");
+        w(b"\"", b"", b"\"");
+        w(b"\"", b"", b"");
+        w(b"\"", x, b"");
+        w(b"", x, b"\"");
+        w(b"\"\"", x, b"");
+        w(b"", x, b"\"\"");
+        w(b"\"\"", x, b"\"\"");
+        w(b"\"", b"\"", b"\"");
+        w(b"\"\"\"", b"", b"");
+        w(b"\"\"\"\"", b"", b"");
+        if x.len() >= 2 {
+            w(&x[..1], b"\"", &x[1..]);
+            w(b"\"", &x[..1], &[b"\"", &x[1..], b"\""].concat());
+        }
+        v
+    }
+
+    fn quotes<const N: usize>(base: &[&str]) {
+        let fields: Vec<Vec<u8>> = base.iter().map(|f| f.as_bytes().to_vec()).collect();
+        let mut text = Vec::new();
+        for k in 0..N {
+            for (n, v) in quote_variants(&fields[k]).into_iter().enumerate() {
+                let mut f = fields.clone();
+                f[k] = v.clone();
+                let l = join(&f);
+                // The legal ones: plain, empty, quoted, quoted empty.
+                let legal = n < 4;
+                assert_eq!(line::<N>(&l, b"x,y\n"), legal, "{:?}", String::from_utf8_lossy(&l));
+                assert_eq!(line::<N>(&l, &join(&fields)), legal);
+                text.extend_from_slice(&l);
+                text.push(b'\n');
+                // Two fields at once.
+                let j = (k + 3) % N;
+                for u in quote_variants(&fields[j]) {
+                    let mut g = f.clone();
+                    g[j] = u;
+                    line::<N>(&join(&g), b"");
+                }
+            }
+        }
+        check::<N>(&text, "quote placements");
+    }
+
+    #[test]
+    fn every_quote_placement() {
+        quotes::<7>(&EVENT);
+        quotes::<4>(&CLICK);
+    }
+
+    /// Lines of every length from 20 to 150 bytes, padded or cut in each
+    /// field in turn, plain and quoted: commas and line breaks on every side
+    /// of the 32, 64, 96 and 128 byte edges.
+    fn lengths<const N: usize>(base: &[&str]) {
+        let fields: Vec<Vec<u8>> = base.iter().map(|f| f.as_bytes().to_vec()).collect();
+        let mut text = Vec::new();
+        let mut accepted = 0;
+        for k in 0..N {
+            for quoted in [false, true] {
+                for total in 20..=150usize {
+                    let mut f = fields.clone();
+                    if quoted {
+                        f[k] = [&b"\""[..], &f[k], b"\""].concat();
+                    }
+                    let now = join(&f).len();
+                    if total < now {
+                        let cut = (now - total).min(fields[k].len());
+                        f[k] = fields[k][..fields[k].len() - cut].to_vec();
+                        if quoted {
+                            f[k] = [&b"\""[..], &f[k], b"\""].concat();
+                        }
+                    } else {
+                        let at = if quoted { f[k].len() - 1 } else { f[k].len() };
+                        f[k].splice(at..at, std::iter::repeat_n(b'7', total - now));
+                    }
+                    let l = join(&f);
+                    let fast = line::<N>(&l, &join(&fields));
+                    assert_eq!(line::<N>(&l, b"\"\",,\n"), fast);
+                    accepted += usize::from(fast);
+                    text.extend_from_slice(&l);
+                    text.push(b'\n');
+                }
+            }
+        }
+        eprintln!("{N} fields: {accepted} of {} lengths by the fast path", N * 2 * 131);
+        assert!(accepted > N * 2 * 131 / 4);
+        check::<N>(&text, "lengths");
+    }
+
+    #[test]
+    fn line_lengths_around_block_edges() {
+        lengths::<7>(&EVENT);
+        lengths::<4>(&CLICK);
+    }
+
+    /// Random lines shaped like the real files, with every kind of dirt.
+    fn random<const N: usize>(seed: u64) {
+        let mut state = seed;
+        for round in 0..3000 {
+            let mut text = Vec::new();
+            let lines = 1 + rng(&mut state) % 30;
+            for _ in 0..lines {
+                let width = match rng(&mut state) % 30 {
+                    0 => N + 1,
+                    1 => N - 1,
+                    2 => 0,
+                    3 => 1,
+                    _ => N,
+                };
+                for i in 0..width {
+                    if i > 0 {
+                        text.push(b',');
+                    }
+                    let len = match rng(&mut state) % 12 {
+                        0 => 0,
+                        1 => 1,
+                        2 => 20 + rng(&mut state) % 60,
+                        _ => 3 + rng(&mut state) % 20,
+                    };
+                    let quoting = rng(&mut state) % 100;
+                    if quoting < 20 || quoting == 97 {
+                        text.push(b'"');
+                    }
+                    for _ in 0..len {
+                        let c = match rng(&mut state) % 200 {
+                            0 => b'\r',
+                            1 => 0x80,
+                            2 => 0,
+                            3 => 0xFF,
+                            4 => b'"',
+                            _ => b"abcxyz0189:-TZ"[(rng(&mut state) % 14) as usize],
+                        };
+                        text.push(c);
+                    }
+                    if quoting == 96 {
+                        text.extend_from_slice(b"\"x");
+                    }
+                    if quoting < 20 || quoting == 98 {
+                        text.push(b'"');
+                    }
+                }
+                text.push(b'\n');
+            }
+            if round % 3 == 0 {
+                // The last line of the file without its line break.
+                text.pop();
+            }
+            for at in 0..text.len().min(40) {
+                if text[at] == b'\n' {
+                    let end = text[at + 1..].iter().position(|&c| c == b'\n').map_or(text.len(), |i| at + 1 + i);
+                    if end < text.len() {
+                        line::<N>(&text[at + 1..end], &text[end + 1..]);
+                    }
+                }
+            }
+            check::<N>(&text, &format!("round {round}"));
+        }
+    }
+
+    #[test]
+    fn random_lines() {
+        random::<7>(5);
+        random::<4>(6);
+    }
+
+    #[test]
+    fn edge_files() {
+        for text in [
+            &b""[..],
+            b"\n",
+            b"\n\n\n",
+            b"a,b,c,d",
+            b"a,b,c,d\n",
+            b"a,b,c,d,e,f,g",
+            b"a,b,c,d,e,f,g\n",
+            b",,,,,,\n,,,\n",
+            b"\"\",\"\",\"\",\"\",\"\",\"\",\"\"\n\"\",\"\",\"\",\"\"",
+            b"\r\n\r",
+            b"a,b,c,d\r\n",
+            b"\x00,\x00,\x00,\x00\n",
+        ] {
+            check::<7>(text, "edge");
+            check::<4>(text, "edge");
+        }
+        // A line far longer than the refused-line window, and one longer
+        // than a stage 1 window.
+        for n in [300usize, 70_000] {
+            let mut text = format!("e1,u1,{},x,view,p1,5\n", "1".repeat(n)).into_bytes();
+            text.extend_from_slice(b"k1,u1,c_1,5\n");
+            check::<7>(&text, "long");
+            check::<4>(&text, "long");
         }
     }
 }

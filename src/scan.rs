@@ -203,7 +203,7 @@ fn flag_bytes(before: u64, after: u64, nm: u64, delim: u64, skip: u32) -> u64 {
 /// `m` without its lowest set bit, as one `blsr`. Written plainly, the
 /// compiler turns most of the eight into a `lea` and an `and`.
 #[inline(always)]
-fn clear_lowest(m: u64) -> u64 {
+pub(crate) fn clear_lowest(m: u64) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi1"))]
     unsafe {
         let r: u64;
@@ -220,7 +220,7 @@ fn clear_lowest(m: u64) -> u64 {
 /// zeroing `xor` in front of each of its own to break a false dependency
 /// on the output register; that costs a front-end slot per delimiter.
 #[inline(always)]
-fn lowest_bit(m: u64) -> u32 {
+pub(crate) fn lowest_bit(m: u64) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi1"))]
     unsafe {
         let r: u64;
@@ -623,11 +623,15 @@ pub unsafe fn fields<const N: usize>(d: *const u32, fl: *const u8) -> ([u32; 8],
 /// register costs two uops each, a load one.
 #[repr(C, align(32))]
 pub struct Bounds {
-    s: [u32; 8],
-    n: [u32; 8],
+    pub(crate) s: [u32; 8],
+    pub(crate) n: [u32; 8],
 }
 
 impl Bounds {
+    pub fn new() -> Self {
+        Bounds { s: [0; 8], n: [0; 8] }
+    }
+
     #[inline(always)]
     pub fn start(&self, i: usize) -> usize {
         // Volatile, or the compiler forwards the vector store and goes back

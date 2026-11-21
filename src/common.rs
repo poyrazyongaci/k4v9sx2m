@@ -63,7 +63,7 @@ pub struct Lookups {
     /// Campaign ids and channels in file order. Index is the campaign id.
     pub camp_ids: Vec<Vec<u8>>,
     pub camp_channels: Vec<Vec<u8>>,
-    pub campaigns: HashMap<Vec<u8>, u32>,
+    pub campaigns: HashMap<Vec<u8>, u32, IdHash>,
 }
 
 impl Lookups {
@@ -310,24 +310,89 @@ fn for_each_pair<'a>(bytes: &'a [u8], mut f: impl FnMut(&'a [u8], &'a [u8])) {
     };
     let mut start = header + 1;
     let (mut comma, mut commas) = (0usize, 0u32);
-    let mut i = start;
-    while i <= bytes.len() {
-        let b = if i < bytes.len() { bytes[i] } else { b'\n' };
-        if b == b',' {
-            comma = i;
-            commas += 1;
-        } else if b == b'\n' {
-            // The empty remainder after a final line break is no line.
-            if i == bytes.len() && start == i {
-                break;
+    // Only commas and line breaks matter: visit them a 64-byte block at a
+    // time, from bit masks, and skip the bytes between.
+    let mut at = start;
+    while at < bytes.len() {
+        let n = (bytes.len() - at).min(64);
+        let (mut commas_m, newlines_m) = delimiter_masks(&bytes[at..at + n]);
+        let mut m = commas_m | newlines_m;
+        while m != 0 {
+            let bit = m.trailing_zeros();
+            let i = at + bit as usize;
+            if commas_m & 1 << bit != 0 {
+                comma = i;
+                commas += 1;
+            } else {
+                if commas == 1 {
+                    f(&bytes[start..comma], &bytes[comma + 1..i]);
+                }
+                start = i + 1;
+                commas = 0;
             }
-            if commas == 1 {
-                f(&bytes[start..comma], &bytes[comma + 1..i]);
-            }
-            start = i + 1;
-            commas = 0;
+            commas_m &= !(1 << bit);
+            m &= m - 1;
         }
-        i += 1;
+        at += n;
+    }
+    // A last line without a line break; the empty remainder after a final
+    // line break is no line.
+    if start < bytes.len() && commas == 1 {
+        f(&bytes[start..comma], &bytes[comma + 1..]);
+    }
+}
+
+/// Bit `i` set where `block[i]` is a comma, and where it is a line break.
+/// `block` is at most 64 bytes.
+#[inline(always)]
+fn delimiter_masks(block: &[u8]) -> (u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if block.len() == 64 {
+        unsafe {
+            use core::arch::x86_64::*;
+            let lo = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
+            let hi = _mm256_loadu_si256(block.as_ptr().add(32) as *const __m256i);
+            let mask = |v: __m256i, b: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b as i8))) as u32 as u64;
+            return (mask(lo, b',') | mask(hi, b',') << 32, mask(lo, b'\n') | mask(hi, b'\n') << 32);
+        }
+    }
+    let (mut c, mut n) = (0u64, 0u64);
+    for (i, &b) in block.iter().enumerate() {
+        c |= u64::from(b == b',') << i;
+        n |= u64::from(b == b'\n') << i;
+    }
+    (c, n)
+}
+
+/// A cheap hash for short ids (the campaign map is built on the clock):
+/// eight bytes at a time, one multiply each. Equality is exact as always.
+#[derive(Clone, Copy, Default)]
+pub struct IdHash;
+
+pub struct IdHasher(u64);
+
+impl std::hash::BuildHasher for IdHash {
+    type Hasher = IdHasher;
+    fn build_hasher(&self) -> IdHasher {
+        IdHasher(0)
+    }
+}
+
+impl std::hash::Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        }
+        let mut last = 0u64;
+        for (i, &b) in chunks.remainder().iter().enumerate() {
+            last |= u64::from(b) << (8 * i);
+        }
+        self.0 = (h ^ last ^ (bytes.len() as u64) << 56).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+    }
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 31)
     }
 }
 
@@ -414,15 +479,13 @@ pub fn load_lookups(data: &Path) -> Lookups {
     // ids pay for a hash map entry. Both hold exact ids.
     let product_bytes = catalog_bytes(&data.join("products.csv"));
     let mut names = NameTable::new();
-    let mut last = 0usize;
     let mut dense_raw: Vec<u32> = Vec::new();
     let mut odd_raw: Vec<(&[u8], u32)> = Vec::new();
     for_each_pair(product_bytes, |id, cat| {
         if id.is_empty() {
             return;
         }
-        let idx = if names.names[last] == cat { last } else { names.index(cat) };
-        last = idx;
+        let idx = names.index(cat);
         match canonical_suffix(id, b"p") {
             Some(n) => {
                 let n = n as usize;
@@ -455,7 +518,7 @@ pub fn load_lookups(data: &Path) -> Lookups {
     let campaign_bytes = catalog_bytes(&data.join("campaigns.csv"));
     let mut camp_ids = Vec::new();
     let mut camp_channels = Vec::new();
-    let mut campaigns = HashMap::with_capacity(campaign_bytes.len() / 8);
+    let mut campaigns = HashMap::with_capacity_and_hasher(campaign_bytes.len() / 8, IdHash);
     for_each_pair(campaign_bytes, |id, channel| {
         if !id.is_empty() && !campaigns.contains_key(id) {
             campaigns.insert(id.to_vec(), camp_ids.len() as u32);
@@ -486,7 +549,7 @@ mod pair_tests {
         let mut state = 0x1234_5678_9abc_def0u64;
         for round in 0..20_000 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let len = (state >> 58) as usize + round % 3;
+            let len = (state >> 55) as usize + round % 3;
             let mut bytes = Vec::new();
             for k in 0..len {
                 let r = state.rotate_left(7 * k as u32 + 3) ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);

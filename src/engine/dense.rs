@@ -659,6 +659,7 @@ pub(super) fn run(
             dense,
         },
         scan: Scan::new(WINDOW),
+        fused: cfg.fused,
     };
 
     // ---- links: read first, as in the one-pass shape.
