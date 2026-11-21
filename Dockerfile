@@ -1,17 +1,16 @@
-# Shopping Sessions: plain Python reference pipeline.
-FROM python:3.12-slim-bookworm
+# Shopping Sessions entry: one static binary in an empty image.
+# The scorer is linux/amd64 (Cascade Lake or newer), so the build targets
+# x86-64-v3 (AVX2, BMI2). The build stage is pinned; the run stage is scratch.
+FROM rust:1.100.0-alpine3.22 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
+ && cp target/x86_64-unknown-linux-musl/release/sessions /sessions
 
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM scratch
+COPY --from=build /sessions /sessions
+USER 1000:1000
+ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+CMD ["/sessions"]
