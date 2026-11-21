@@ -227,20 +227,6 @@ impl<T> List<T> {
             at = (*at).next;
         }
     }
-    /// Like `for_each_chunk`, and also passes where the records of the
-    /// chunk after this one start (null after the last), for prefetching.
-    #[inline]
-    pub unsafe fn for_each_chunk_ahead(&self, mut f: impl FnMut(&mut [T], *const u8)) {
-        let mut at = self.head;
-        while !at.is_null() {
-            let len = (*at).len as usize;
-            let data = (at as *mut u8).add(HDR) as *mut T;
-            let next = (*at).next;
-            let ahead = if next.is_null() { std::ptr::null() } else { (next as *const u8).add(HDR) };
-            f(std::slice::from_raw_parts_mut(data, len), ahead);
-            at = next;
-        }
-    }
     /// Hand every chunk's memory to `f`. The list must not be used again.
     pub unsafe fn release(&self, mut f: impl FnMut(*mut u8)) {
         let mut at = self.head;
