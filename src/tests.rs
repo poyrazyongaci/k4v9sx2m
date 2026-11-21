@@ -364,3 +364,74 @@ fn random_datasets_match_reference() {
     assert!(totals[0] > 20_000 && totals[1] > 2_000 && totals[3] > 2_000 && totals[4] > totals[3]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Events are grouped by time bin (2^20 ms) and never sorted, so this packs
+/// the times of a few busy people around bin edges: one millisecond either
+/// side of an edge, equal times, and gaps of exactly 30:00.000 and
+/// 30:00.001 that cross one or two edges, with purchases all over.
+#[test]
+fn bin_edges_match_reference() {
+    let root = std::env::temp_dir().join(format!("sessions-bins-{}", std::process::id()));
+    let mut sessions = 0;
+    for seed in 0..9u64 {
+        let mut r = Rng(seed + 1000);
+        let dir = root.join(format!("b{seed}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = days_from_civil(2026, 10, 1) * DAY_MS + [0, 777_000, 3_600_000][(seed % 3) as usize];
+        let days = [14, 2, 40][(seed / 3 % 3) as usize];
+        let we = ws + days * DAY_MS;
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(we)),
+        )
+        .unwrap();
+        std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\np3,a\np4,shoes\n").unwrap();
+        std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+        let bin = 1i64 << 20;
+        let mut times: Vec<i64> = Vec::new();
+        let mut events = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+        let mut n = 0;
+        for _ in 0..500 {
+            let edge = ws + r.below((we - ws) as u64 / bin as u64 + 1) as i64 * bin;
+            let who = r.below(4);
+            let mut t = edge + r.below(5) as i64 - 2;
+            for _ in 0..1 + r.below(6) {
+                if (ws..we).contains(&t) {
+                    let kind = if r.chance(3) { "purchase" } else { "view" };
+                    let ingest = t - t.rem_euclid(1000) + 1000;
+                    events.push_str(&format!("b{n},u{who},{t},{}Z,{kind},p{},{}\n", utc(ingest), 1 + r.below(5), 100 + r.below(900)));
+                    times.push(t);
+                    n += 1;
+                }
+                t += match r.below(8) {
+                    0 => 0,
+                    1 => SESSION_GAP_MS,
+                    2 => SESSION_GAP_MS + 1,
+                    3 => bin - 1,
+                    4 => bin,
+                    5 => SESSION_GAP_MS - 1,
+                    6 => 1,
+                    _ => r.below(2 * bin as u64) as i64,
+                };
+            }
+        }
+        std::fs::create_dir_all(dir.join("events")).unwrap();
+        std::fs::write(dir.join("events/part-0.csv"), events).unwrap();
+        let mut clicks = String::from("click_id,user_id,campaign_id,ts\n");
+        for k in 0..300 {
+            let at = times[r.below(times.len() as u64) as usize];
+            let t = at + [0, 1, -1, -CLICK_REACH_MS, -CLICK_REACH_MS - 1, -3_600_000][r.below(6) as usize];
+            clicks.push_str(&format!("k{k},u{},c_{},{t}\n", r.below(4), 1 + r.below(3)));
+        }
+        std::fs::create_dir_all(dir.join("clicks")).unwrap();
+        std::fs::write(dir.join("clicks/part-0.csv"), clicks).unwrap();
+        std::fs::create_dir_all(dir.join("links")).unwrap();
+        let links = if seed % 2 == 0 { "user_id_a,user_id_b\nu0,u1\n" } else { "user_id_a,user_id_b\n" };
+        std::fs::write(dir.join("links/part-0.csv"), links).unwrap();
+        sessions += compare(&dir, &cfg(2, 4096, 1))[2];
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(sessions > 2_000, "only {sessions} sessions");
+    let _ = std::fs::remove_dir_all(&root);
+}

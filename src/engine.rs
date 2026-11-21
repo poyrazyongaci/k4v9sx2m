@@ -723,8 +723,19 @@ struct PersonPhase<'a> {
     tab_ids: Vec<u32>,
     pkeys: Vec<u64>,
     counts: Vec<u32>,
-    ids: Vec<u32>,
-    ev: Vec<u64>,
+    /// Events per time bin, then the write cursor of each bin.
+    bins: Vec<u32>,
+    /// One word per event, `ts_rel << 32 | local person id`: in input order
+    /// and then in bin order.
+    words: Vec<u64>,
+    binned: Vec<u64>,
+    /// `ts_rel` of every event, person after person, each in bin order.
+    ev: Vec<u32>,
+    /// The purchases: `(value, local person id)` as they come, then the
+    /// values person after person, with the end offset of each person.
+    buys: Vec<(u64, u32)>,
+    bcounts: Vec<u32>,
+    bought: Vec<u64>,
     ccounts: Vec<u32>,
     cids: Vec<u32>,
     cl: Vec<(u64, u64)>,
@@ -740,6 +751,20 @@ struct PersonPhase<'a> {
     /// Summed sessions and revenue of the rows emitted, for the self-check.
     check: (u64, u64),
 }
+
+/// Events are never sorted by time. They are put in order of their time
+/// bin only: `ts_rel >> BIN_SHIFT`, bins of 2^20 ms. Two events of one bin
+/// are under 2^20 ms apart, which is less than the session gap, so a bin
+/// never holds a session break. A break can only fall between two
+/// consecutive non-empty bins of a person, and it does exactly when the
+/// smallest time of the later bin is more than the gap after the largest
+/// time of the earlier one: those two are neighbours in time order.
+///
+/// So the events of a person are only times here. The purchases (3% of the
+/// events) travel on the side, sorted by time per person, and a session
+/// takes those up to its last event when it closes.
+const BIN_SHIFT: u32 = 20;
+const _: () = assert!((1i64 << BIN_SHIFT) - 1 <= SESSION_GAP_MS);
 
 #[inline(always)]
 fn sort_u64(v: &mut [u64]) {
@@ -766,8 +791,13 @@ impl<'a> PersonPhase<'a> {
             tab_ids: Vec::new(),
             pkeys: Vec::new(),
             counts: Vec::new(),
-            ids: Vec::new(),
+            bins: Vec::new(),
+            words: Vec::new(),
+            binned: Vec::new(),
             ev: Vec::new(),
+            buys: Vec::new(),
+            bcounts: Vec::new(),
+            bought: Vec::new(),
             ccounts: Vec::new(),
             cids: Vec::new(),
             cl: Vec::new(),
@@ -814,10 +844,18 @@ impl<'a> PersonPhase<'a> {
         self.tab_ids.resize(cap, 0);
         self.pkeys.clear();
         self.counts.clear();
-        self.ids.clear();
-        self.ids.reserve(n);
+        // `ts_rel < wlen`, so the last bin is that of `wlen - 1`.
+        let nbins = ((self.fast.wlen - 1) >> BIN_SHIFT) as usize + 1;
+        self.bins.clear();
+        self.bins.resize(nbins, 0);
+        self.words.clear();
+        self.words.reserve(n);
+        self.buys.clear();
+        let words = self.words.as_mut_ptr();
+        let mut at = 0usize;
 
-        // Pass 1: a local id per person, and how many events each has.
+        // Pass 1: a local id per person, how many events each person has
+        // and each time bin has, and one word per event.
         for list in evs {
             list.for_each_chunk(|chunk| {
                 for rec in chunk.iter() {
@@ -845,11 +883,34 @@ impl<'a> PersonPhase<'a> {
                         i = (i + 1) & mask;
                     };
                     *self.counts.get_unchecked_mut(id as usize) += 1;
-                    self.ids.push(id);
+                    *self.bins.get_unchecked_mut((rec.v >> (32 + BIN_SHIFT)) as usize) += 1;
+                    *words.add(at) = (rec.v & !0xFFFF_FFFF) | u64::from(id);
+                    at += 1;
+                    if rec.v as u32 != 0 {
+                        self.buys.push((rec.v, id));
+                    }
                 }
             });
         }
+        self.words.set_len(n);
         let people = self.pkeys.len();
+        // Pass 2: the whole partition into bin order.
+        let mut sum = 0u32;
+        for c in self.bins.iter_mut() {
+            let k = *c;
+            *c = sum;
+            sum += k;
+        }
+        self.binned.clear();
+        self.binned.reserve(n);
+        self.binned.set_len(n);
+        for &word in &self.words {
+            let w = self.bins.get_unchecked_mut((word >> (32 + BIN_SHIFT)) as usize);
+            *self.binned.get_unchecked_mut(*w as usize) = word;
+            *w += 1;
+        }
+        // Pass 3: a stable scatter by person, so each person's events are
+        // in bin order.
         // counts -> start offsets (counts[i] becomes the write cursor).
         let mut sum = 0u32;
         for c in self.counts.iter_mut() {
@@ -860,19 +921,33 @@ impl<'a> PersonPhase<'a> {
         self.ev.clear();
         self.ev.reserve(n);
         self.ev.set_len(n);
-        let mut at = 0usize;
-        for list in evs {
-            list.for_each_chunk(|chunk| {
-                for rec in chunk.iter() {
-                    let id = *self.ids.get_unchecked(at) as usize;
-                    at += 1;
-                    let w = self.counts.get_unchecked_mut(id);
-                    *self.ev.get_unchecked_mut(*w as usize) = rec.v;
-                    *w += 1;
-                }
-            });
+        for &word in &self.binned {
+            let w = self.counts.get_unchecked_mut(word as u32 as usize);
+            *self.ev.get_unchecked_mut(*w as usize) = (word >> 32) as u32;
+            *w += 1;
         }
         // counts[i] is now the end offset of person i.
+
+        // The purchases, person after person.
+        self.bcounts.clear();
+        self.bcounts.resize(people, 0);
+        for &(_, id) in &self.buys {
+            *self.bcounts.get_unchecked_mut(id as usize) += 1;
+        }
+        let mut sum = 0u32;
+        for c in self.bcounts.iter_mut() {
+            let k = *c;
+            *c = sum;
+            sum += k;
+        }
+        self.bought.clear();
+        self.bought.reserve(self.buys.len());
+        self.bought.set_len(self.buys.len());
+        for &(v, id) in &self.buys {
+            let w = self.bcounts.get_unchecked_mut(id as usize);
+            *self.bought.get_unchecked_mut(*w as usize) = v;
+            *w += 1;
+        }
 
         // Clicks of people that have events here; the rest cannot matter.
         let nc: usize = cls.iter().map(|l| l.count()).sum();
@@ -931,12 +1006,15 @@ impl<'a> PersonPhase<'a> {
         let t = prof::add(7, t);
         let mut ev_start = 0usize;
         let mut cl_start = 0usize;
+        let mut buy_start = 0usize;
         for p in 0..people {
             let ev_end = self.counts[p] as usize;
             let cl_end = if nc > 0 { self.ccounts[p] as usize } else { 0 };
-            self.person(p, ev_start, ev_end, cl_start, cl_end);
+            let buy_end = self.bcounts[p] as usize;
+            self.person(p, ev_start, ev_end, cl_start, cl_end, buy_start, buy_end);
             ev_start = ev_end;
             cl_start = cl_end;
+            buy_start = buy_end;
         }
         let t = prof::add(8, t);
         if self.out.flush_full() {
@@ -965,103 +1043,94 @@ impl<'a> PersonPhase<'a> {
     }
 
     #[inline(always)]
-    unsafe fn person(&mut self, p: usize, ev_start: usize, ev_end: usize, cl_start: usize, cl_end: usize) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn person(
+        &mut self,
+        p: usize,
+        ev_start: usize,
+        ev_end: usize,
+        cl_start: usize,
+        cl_end: usize,
+        buy_start: usize,
+        buy_end: usize,
+    ) {
         let pkey = self.pkeys[p];
-        let ev = std::slice::from_raw_parts_mut(self.ev.as_mut_ptr().add(ev_start), ev_end - ev_start);
+        let ev = std::slice::from_raw_parts(self.ev.as_ptr().add(ev_start), ev_end - ev_start);
         let cl = std::slice::from_raw_parts_mut(self.cl.as_mut_ptr().add(cl_start), cl_end - cl_start);
-        sort_u64(ev);
         if cl.len() > 1 {
             // By ts, then by click id descending: the last click at or
             // before a session start is the latest with the smallest id.
             cl.sort_unstable_by(|a, b| (a.0 >> 32).cmp(&(b.0 >> 32)).then_with(|| cmp_ids(b.1, a.1)));
         }
-        let ndays = self.fast.ndays;
-        let organic = self.fast.ncamp;
+        if buy_end - buy_start > 1 {
+            // The time is the top half of a value.
+            sort_u64(std::slice::from_raw_parts_mut(self.bought.as_mut_ptr().add(buy_start), buy_end - buy_start));
+        }
+        let mut buy = buy_start;
         let ws_in_day = self.fast.ws_in_day;
-        let reach = CLICK_REACH_MS as u64;
-        let gap = SESSION_GAP_MS as u64;
+        let gap = SESSION_GAP_MS as u32;
         let n = ev.len();
-        let (mut lo, mut hi) = (0usize, 0usize);
+        let mut win = (0usize, 0usize);
         let mut cur_day = u32::MAX;
         let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
+        // The open session: its start and the largest time seen in it.
+        let (mut start, mut last) = (0u32, 0u32);
         let mut i = 0usize;
-        while i < n {
-            let start = *ev.get_unchecked(i) >> 32;
-            let day_rel = ((start + ws_in_day) / DAY_MS as u64) as u32;
-            if day_rel != cur_day {
-                if cur_day != u32::MAX {
-                    self.emit(pkey, cur_day, d_sessions, d_events, d_revenue);
-                }
-                cur_day = day_rel;
-                d_sessions = 0;
-                d_events = 0;
-                d_revenue = 0;
-            }
-            let mut prev = start;
-            let mut revenue = 0u64;
+        loop {
+            // One run of events in the same bin, and its extremes.
+            let (mut first, mut latest) = (u32::MAX, 0u32);
             let mut j = i;
-            while j < n {
-                let v = *ev.get_unchecked(j);
-                let t = v >> 32;
-                if t - prev > gap {
+            if i < n {
+                let bin = *ev.get_unchecked(i) >> BIN_SHIFT;
+                while j < n {
+                    let t = *ev.get_unchecked(j);
+                    if t >> BIN_SHIFT != bin {
+                        break;
+                    }
+                    first = first.min(t);
+                    latest = latest.max(t);
+                    j += 1;
+                }
+            }
+            // `first` is past every time when the events have run out.
+            if i == 0 || first - last > gap {
+                if i != 0 {
+                    // The session is complete: its purchases are those not
+                    // taken yet that are no later than its last event.
+                    let mut revenue = 0u64;
+                    while buy < buy_end && (*self.bought.get_unchecked(buy) >> 32) as u32 <= last {
+                        let pc = *self.bought.get_unchecked(buy) as u32;
+                        let price = u64::from(pc >> 8);
+                        let cat = (pc & 0xFF) as u8;
+                        revenue += price;
+                        let sum = self.catsum.get_unchecked_mut(cat as usize);
+                        if *sum == 0 {
+                            self.touched.push(cat);
+                        }
+                        *sum += price;
+                        buy += 1;
+                    }
+                    d_revenue += revenue;
+                    self.credit(cl, &mut win, u64::from(start), cur_day as usize, revenue);
+                }
+                if i == n {
                     break;
                 }
-                prev = t;
-                let pc = v as u32;
-                if pc != 0 {
-                    let price = u64::from(pc >> 8);
-                    let cat = (pc & 0xFF) as u8;
-                    revenue += price;
-                    let sum = self.catsum.get_unchecked_mut(cat as usize);
-                    if *sum == 0 {
-                        self.touched.push(cat);
+                start = first;
+                let day_rel = ((u64::from(start) + ws_in_day) / DAY_MS as u64) as u32;
+                if day_rel != cur_day {
+                    if cur_day != u32::MAX {
+                        self.emit(pkey, cur_day, d_sessions, d_events, d_revenue);
                     }
-                    *sum += price;
+                    cur_day = day_rel;
+                    d_sessions = 0;
+                    d_events = 0;
+                    d_revenue = 0;
                 }
-                j += 1;
+                d_sessions += 1;
             }
-            d_sessions += 1;
+            last = latest;
             d_events += (j - i) as u32;
-            d_revenue += revenue;
-
-            let day = day_rel as usize;
-            let mut credit = organic;
-            if !cl.is_empty() {
-                // Click times are relative to window_start - 7 days, so a
-                // session start S is S + reach on that clock.
-                let upto = start + reach;
-                while hi < cl.len() && (cl.get_unchecked(hi).0 >> 32) <= upto {
-                    let c = cl.get_unchecked(hi).0 as u32 as usize;
-                    if *self.cnt.get_unchecked(c) == 0 {
-                        *self.pos.get_unchecked_mut(c) = self.active.len() as u32;
-                        self.active.push(c as u32);
-                    }
-                    *self.cnt.get_unchecked_mut(c) += 1;
-                    hi += 1;
-                }
-                while lo < hi && (cl.get_unchecked(lo).0 >> 32) < start {
-                    let c = cl.get_unchecked(lo).0 as u32 as usize;
-                    *self.cnt.get_unchecked_mut(c) -= 1;
-                    if *self.cnt.get_unchecked(c) == 0 {
-                        let at = *self.pos.get_unchecked(c) as usize;
-                        let moved = *self.active.last().unwrap_unchecked();
-                        *self.active.get_unchecked_mut(at) = moved;
-                        *self.pos.get_unchecked_mut(moved as usize) = at as u32;
-                        self.active.pop();
-                    }
-                    lo += 1;
-                }
-                if hi > lo {
-                    credit = cl.get_unchecked(hi - 1).0 as u32 as usize;
-                }
-                for &c in &self.active {
-                    self.agg.get_unchecked_mut(c as usize * ndays + day)[3] += 1;
-                }
-            }
-            let cell = self.agg.get_unchecked_mut(credit * ndays + day);
-            cell[0] += 1;
-            cell[1] += u64::from(revenue > 0);
-            cell[2] += revenue;
             i = j;
         }
         if cur_day != u32::MAX {
@@ -1071,6 +1140,54 @@ impl<'a> PersonPhase<'a> {
             *self.cnt.get_unchecked_mut(c as usize) = 0;
         }
         self.active.clear();
+    }
+
+    /// Credit one finished session to a click and count its assists. `cl`
+    /// is the person's clicks in order, `win` the range of them in reach of
+    /// the previous session; sessions come in order of their start.
+    #[inline(always)]
+    unsafe fn credit(&mut self, cl: &[(u64, u64)], win: &mut (usize, usize), start: u64, day: usize, revenue: u64) {
+        let ndays = self.fast.ndays;
+        let mut credit = self.fast.ncamp;
+        if !cl.is_empty() {
+            let reach = CLICK_REACH_MS as u64;
+            let (mut lo, mut hi) = *win;
+            // Click times are relative to window_start - 7 days, so a
+            // session start S is S + reach on that clock.
+            let upto = start + reach;
+            while hi < cl.len() && (cl.get_unchecked(hi).0 >> 32) <= upto {
+                let c = cl.get_unchecked(hi).0 as u32 as usize;
+                if *self.cnt.get_unchecked(c) == 0 {
+                    *self.pos.get_unchecked_mut(c) = self.active.len() as u32;
+                    self.active.push(c as u32);
+                }
+                *self.cnt.get_unchecked_mut(c) += 1;
+                hi += 1;
+            }
+            while lo < hi && (cl.get_unchecked(lo).0 >> 32) < start {
+                let c = cl.get_unchecked(lo).0 as u32 as usize;
+                *self.cnt.get_unchecked_mut(c) -= 1;
+                if *self.cnt.get_unchecked(c) == 0 {
+                    let at = *self.pos.get_unchecked(c) as usize;
+                    let moved = *self.active.last().unwrap_unchecked();
+                    *self.active.get_unchecked_mut(at) = moved;
+                    *self.pos.get_unchecked_mut(moved as usize) = at as u32;
+                    self.active.pop();
+                }
+                lo += 1;
+            }
+            if hi > lo {
+                credit = cl.get_unchecked(hi - 1).0 as u32 as usize;
+            }
+            for &c in &self.active {
+                self.agg.get_unchecked_mut(c as usize * ndays + day)[3] += 1;
+            }
+            *win = (lo, hi);
+        }
+        let cell = self.agg.get_unchecked_mut(credit * ndays + day);
+        cell[0] += 1;
+        cell[1] += u64::from(revenue > 0);
+        cell[2] += revenue;
     }
 }
 
@@ -1125,12 +1242,13 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let threads = cfg.threads;
 
     let estimate = event_bytes / 64;
-    let bits1 = bits_for(estimate, 24_000, cfg.p1_bits);
-    // Person partitions: the scatter that fills them costs more per record
-    // the more partitions there are (measured: 1024, 2048 and 4096 at 20M
-    // events cost 150, 166 and 196 ms of resolve), while the person phase
-    // is flat up to about 40k events a partition. So half as many as the
-    // event side: 20k to 40k events each.
+    // A scatter costs more per record the more partitions it has, and the
+    // consumer of a partition is flat up to about 40k records. Measured at
+    // 20M events, person side: 1024, 2048 and 4096 partitions cost 150, 166
+    // and 196 ms of resolve. At 60M events, event side: 2048 against 4096
+    // saves 57 ms of parse and costs 28 ms of resolve. So both sides aim
+    // at 20k to 40k records a partition.
+    let bits1 = bits_for(estimate, 48_000, cfg.p1_bits);
     let bits2 = bits_for(estimate, 48_000, cfg.p2_bits);
     let (parts1, parts2) = (1usize << bits1, 1usize << bits2);
 
