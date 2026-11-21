@@ -34,8 +34,6 @@ use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
 use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, parse_ts_ingest, DateCache, BAD};
 
 mod dense;
-#[path = "hot.rs"]
-mod hot;
 
 pub struct Config {
     pub threads: usize,
@@ -199,10 +197,8 @@ struct Fast<'a> {
     /// Category of product `p<n>`, by `n`; `unknown` where the file has none.
     prod_cat: Vec<u8>,
     unknown: u8,
-    /// Every campaign ID of 1 to 7 bytes, by `short_key`: open addressing,
-    /// (key, index) slots, key 0 for an empty slot (no `short_key` is 0).
-    camp_tab: Vec<[u64; 2]>,
-    camp_shift: u32,
+    /// Campaign index of `c_<n>`, by `n`; `u32::MAX` where the file has none.
+    camp_idx: Vec<u32>,
     ncamp: usize,
     ndays: usize,
     ws_day: i64,
@@ -232,21 +228,14 @@ impl<'a> Fast<'a> {
         }
         let unknown = lk.unknown_cat as u8;
         let prod_cat: Vec<u8> = lk.product_dense.iter().map(|&c| if c == u32::MAX { unknown } else { c as u8 }).collect();
-        // Room for four times the short IDs: probes stay short.
-        let short = lk.campaigns.keys().filter(|id| (1..=7).contains(&id.len())).count();
-        let slots = (short * 4).next_power_of_two().max(16);
-        let camp_shift = 64 - slots.trailing_zeros();
-        let mut camp_tab = vec![[0u64; 2]; slots];
+        let mut camp_idx = Vec::new();
         for (id, &idx) in &lk.campaigns {
-            if (1..=7).contains(&id.len()) {
-                let mut word = [0u8; 8];
-                word[..id.len()].copy_from_slice(id);
-                let key = short_key(u64::from_le_bytes(word), id.len());
-                let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> camp_shift) as usize;
-                while camp_tab[i][0] != 0 {
-                    i = (i + 1) & (slots - 1);
+            if let Some(n) = canonical_suffix(id, b"c_") {
+                let n = n as usize;
+                if camp_idx.len() <= n {
+                    camp_idx.resize(n + 1, u32::MAX);
                 }
-                camp_tab[i] = [key, u64::from(idx)];
+                camp_idx[n] = idx;
             }
         }
         Some(Fast {
@@ -257,8 +246,7 @@ impl<'a> Fast<'a> {
             cwlen: (wlen + CLICK_REACH_MS) as u64,
             prod_cat,
             unknown: lk.unknown_cat as u8,
-            camp_tab,
-            camp_shift,
+            camp_idx,
             ncamp: lk.camp_ids.len(),
             ndays,
             ws_day,
@@ -287,33 +275,15 @@ impl<'a> Fast<'a> {
 
     #[inline(always)]
     unsafe fn campaign(&self, p: *const u8, len: usize) -> u32 {
-        // An ID of 1 to 7 bytes is a campaign exactly when its `short_key`
-        // is in `camp_tab`, which holds every such campaign. Reads 8 bytes
-        // from `p`: field reads may run 16 bytes past the field.
-        if len.wrapping_sub(1) < 7 {
-            let key = short_key(load64(p), len);
-            let mask = self.camp_tab.len() - 1;
-            let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.camp_shift) as usize;
-            loop {
-                let s = *self.camp_tab.get_unchecked(i);
-                if s[0] == key {
-                    return s[1] as u32;
-                }
-                if s[0] == 0 {
-                    return u32::MAX;
-                }
-                i = (i + 1) & mask;
+        if len >= 3 && *p == b'c' && *p.add(1) == b'_' {
+            if let Some(n) = canonical_number(p.add(2), len - 2) {
+                return match self.camp_idx.get(n as usize) {
+                    Some(&c) => c,
+                    None => u32::MAX,
+                };
             }
         }
         self.campaign_slow(std::slice::from_raw_parts(p, len))
-    }
-
-    /// The campaign of `id` as the fast path finds it, for tests.
-    #[cfg(test)]
-    fn campaign_of(&self, id: &[u8]) -> u32 {
-        let mut buf = id.to_vec();
-        buf.extend_from_slice(&[0xAB; 16]);
-        unsafe { self.campaign(buf.as_ptr(), id.len()) }
     }
 
     #[cold]
@@ -321,15 +291,6 @@ impl<'a> Fast<'a> {
     fn campaign_slow(&self, id: &[u8]) -> u32 {
         self.lk.campaigns.get(id).copied().unwrap_or(u32::MAX)
     }
-}
-
-/// The first `len` (1 to 7) bytes of `word` (little-endian), with the
-/// length in the top byte: one key for each byte string of 1 to 7 bytes,
-/// never 0.
-#[inline(always)]
-fn short_key(word: u64, len: usize) -> u64 {
-    debug_assert!((1..=7).contains(&len));
-    (word & ((1u64 << (8 * len)) - 1)) | (len as u64) << 56
 }
 
 // ---------------------------------------------------------------- links
@@ -1202,11 +1163,6 @@ impl Emit {
     }
 }
 
-// With `--cfg ss_hot`: the section of `events`, 4096-byte aligned (see
-// `sys::layout`).
-#[cfg(all(ss_hot, target_arch = "x86_64"))]
-core::arch::global_asm!(".pushsection .text.hot_events,\"ax\",@progbits", ".p2align 12", ".popsection");
-
 const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -1216,9 +1172,7 @@ impl<'a> ParseState<'a> {
     /// copy goes to `emit` for its person lookup, not to `entries`; 2 is the
     /// dense shape, where it goes to `dense`.
     #[inline(never)]
-    #[cfg_attr(all(ss_hot, target_arch = "x86_64"), link_section = ".text.hot_events")]
     unsafe fn events<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
-        crate::layout_pad!(sys::layout::EVENTS_PAD);
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
@@ -1477,11 +1431,9 @@ impl<'a> ParseState<'a> {
         match kind {
             Kind::Events if dense => self.events::<2, _>(src),
             Kind::Events if one => self.events::<1, _>(src),
-            Kind::Events if hot::on() => self.events_hot(m, pos, end, src.scan),
             Kind::Events => self.events::<0, _>(src),
             Kind::Clicks if dense => self.clicks::<2, _>(src),
             Kind::Clicks if one => self.clicks::<1, _>(src),
-            Kind::Clicks if hot::on() => self.clicks_hot(m, pos, end, src.scan),
             Kind::Clicks => self.clicks::<0, _>(src),
             Kind::Links => unreachable!(),
         }
@@ -1752,8 +1704,6 @@ impl<'a> Resolver<'a> {
         let chunks: usize = lists.iter().map(|l| l.chunks as usize).sum();
         let pos_bits = usize::BITS - chunks.leading_zeros() + OFF_BITS;
         let pos_mask = if pos_bits >= 32 { u32::MAX } else { (1u32 << pos_bits) - 1 };
-        // The tag shift needs this; `chunks` is far below 2^54.
-        assert!(pos_bits < 64);
         let cap = (n * 2).next_power_of_two().max(64);
         self.table.clear();
         self.table.resize(cap, 0);
@@ -1777,21 +1727,13 @@ impl<'a> Resolver<'a> {
                 let there = if next.is_null() { here } else { (next as *const Entry).wrapping_sub(split) };
                 let data = chunk.as_mut_ptr();
                 for (from, to, ahead) in [(0, split, here), (split, len, there)] {
-                // Pointers and a running name, not an index: `first | k` is
-                // `first + k`, as `k` fits in `OFF_BITS`.
-                let (mut e, stop) = (data.add(from), data.add(to));
-                let mut a = ahead.wrapping_add(from);
-                let mut me = first | from as u32;
-                while e < stop {
-                    let entry = &mut *e;
-                    prefetch(a);
-                    e = e.add(1);
-                    a = a.wrapping_add(1);
-                    me += 1;
-                    let me = me - 1;
+                for k in from..to {
+                    let entry = &mut *data.add(k);
+                    prefetch(ahead.wrapping_add(k));
                     let h = mix1(entry.ekey);
                     // Low hash bits, apart from the home bits (20 and up).
-                    let tag = h.wrapping_shl(pos_bits) as u32; // no tag from 32 on
+                    let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
+                    let me = first | k as u32;
                     let mut i = (h >> 20) as usize & mask;
                     loop {
                         let slot = *table.add(i);
@@ -1851,17 +1793,11 @@ impl<'a> Resolver<'a> {
                     for (at, &h) in starts.iter_mut().zip(&hashes[..block.len()]) {
                         *at = links.stage2(h);
                     }
-                    // By pointers: an entry is 32 bytes, too wide for an
-                    // index scale.
-                    let (mut e, stop, mut at) = (block.as_ptr(), block.as_ptr().add(block.len()), starts.as_ptr());
-                    while e < stop {
-                        let entry = &*e;
+                    for (&at, entry) in starts.iter().zip(block) {
                         if entry.w3 != DEAD {
-                            let pkey = links.stage3(*at, entry.ukey);
+                            let pkey = links.stage3(at, entry.ukey);
                             ev.push_hot(&hot, person_part(pkey, shift2), Ev { pkey, v: entry.w3 });
                         }
-                        e = e.add(1);
-                        at = at.add(1);
                     }
                 }
             });
@@ -1985,8 +1921,6 @@ impl<'a> Deduper<'a> {
         let chunks: usize = lists.iter().map(|l| l.chunks as usize).sum();
         let pos_bits = usize::BITS - chunks.leading_zeros() + NOTE_OFF_BITS;
         let pos_mask = if pos_bits >= 32 { u32::MAX } else { (1u32 << pos_bits) - 1 };
-        // The tag shift needs this; `chunks` is far below 2^54.
-        assert!(pos_bits < 64);
         let cap = (n * 2).next_power_of_two().max(64);
         self.table.clear();
         self.table.resize(cap, 0);
@@ -2005,7 +1939,7 @@ impl<'a> Deduper<'a> {
                     let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
                     prefetch(ahead as *const u8);
                     let h = mix1(note.ekey);
-                    let tag = h.wrapping_shl(pos_bits) as u32; // no tag from 32 on
+                    let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let me = first | k as u32;
                     let mut i = (h >> 20) as usize & mask;
                     loop {
@@ -2062,7 +1996,7 @@ impl<'a> Deduper<'a> {
                 None => {
                     // The winner among the notes, if the key has any.
                     let h = mix1(w.ekey);
-                    let tag = h.wrapping_shl(pos_bits) as u32; // no tag from 32 on
+                    let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let mut i = (h >> 20) as usize & mask;
                     let mut found = None;
                     loop {
@@ -3637,10 +3571,7 @@ impl<'a> PersonPhase<'a> {
                         i = (i + 1) & mask;
                     };
                     *counts.add(id as usize) += 1;
-                    // `(v & !0xFFFF_FFFF) | id` as two halves: no mask
-                    // constant (little-endian: the id is the low half).
-                    *(wp as *mut u32) = id;
-                    *(wp as *mut u32).add(1) = (rec.v >> 32) as u32;
+                    *wp = (rec.v & !0xFFFF_FFFF) | u64::from(id);
                     wp = wp.add(1);
                     if rec.v as u32 != 0 {
                         buys.push((rec.v, id));
@@ -5382,61 +5313,6 @@ mod fused_tests {
             text.extend_from_slice(b"k1,u1,c_1,5\n");
             check::<7>(&text, "long");
             check::<4>(&text, "long");
-        }
-    }
-}
-
-#[cfg(test)]
-mod campaign_tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    /// The short-ID table answers what the map answers, for IDs of every
-    /// length from 0 to 10 (the table holds 1 to 7), with NUL and high
-    /// bytes, IDs that are prefixes of each other or differ only in
-    /// trailing NULs, and garbage bytes after the field.
-    #[test]
-    fn short_ids_match_the_map() {
-        let mut ids: Vec<Vec<u8>> = (1..=2000).map(|n| format!("c_{n}").into_bytes()).collect();
-        for odd in [
-            &b"c"[..], b"c_", b"c_01", b"x", b"\0", b"\0\0", b"c_1\0", b"\xff\xff\xff\xff\xff\xff\xff",
-            b"abcdefg", b"abcdefgh", b"abcdefghi", b"c_12345", b"c_123456", b"c_1234567", b"",
-        ] {
-            ids.push(odd.to_vec());
-        }
-        let mut campaigns: HashMap<Vec<u8>, u32, IdHash> = HashMap::default();
-        for (i, id) in ids.iter().enumerate() {
-            campaigns.insert(id.clone(), i as u32);
-        }
-        let lk = Lookups {
-            window_start: 0,
-            window_end: DAY_MS,
-            cats: vec![b"unknown".to_vec()],
-            unknown_cat: 0,
-            product_dense: Vec::new(),
-            product_odd: HashMap::new(),
-            camp_ids: ids.clone(),
-            camp_channels: vec![b"x".to_vec(); ids.len()],
-            campaigns,
-        };
-        let fast = Fast::new(&lk, 0).unwrap();
-        let mut probes = ids.clone();
-        for extra in [
-            &b"c_2001"[..], b"c_0", b"c_1\0\0", b"\0\0\0", b"\0\0\0\0\0\0\0", b"abcdef", b"abcdefg\0", b"c_123",
-            b"c_1234", b"\xff\xff\xff\xff\xff\xff", b"\xff\xff\xff\xff\xff\xff\xff\xff", b"c_10000", b"C_1", b"c-1",
-        ] {
-            probes.push(extra.to_vec());
-        }
-        let mut state = 7u64;
-        for _ in 0..20_000 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            let len = (state >> 60) as usize % 11;
-            let alphabet = [b'c', b'_', b'1', b'0', 0, 0xff];
-            probes.push((0..len).map(|k| alphabet[(state >> (k * 3)) as usize % 6]).collect());
-        }
-        for id in &probes {
-            let want = lk.campaigns.get(id.as_slice()).copied().unwrap_or(u32::MAX);
-            assert_eq!(fast.campaign_of(id), want, "{id:?}");
         }
     }
 }

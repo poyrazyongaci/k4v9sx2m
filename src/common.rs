@@ -81,23 +81,13 @@ impl Lookups {
 /// the one spelling of that id, so it can index a dense table.
 pub fn canonical_suffix(id: &[u8], prefix: &[u8]) -> Option<u32> {
     let rest = id.strip_prefix(prefix)?;
-    if rest.is_empty() || rest.len() > 7 || rest[0] == b'0' {
+    if rest.is_empty() || rest.len() > 7 || rest[0] == b'0' || !rest.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    // One pass: check and add up each digit.
-    let mut n = 0u32;
-    for &c in rest {
-        let d = c.wrapping_sub(b'0');
-        if d > 9 {
-            return None;
-        }
-        n = n * 10 + u32::from(d);
-    }
-    Some(n)
+    Some(rest.iter().fold(0u32, |acc, &c| acc * 10 + u32::from(c - b'0')))
 }
 
 pub fn die(msg: &str) -> ! {
-    crate::layout_pad!(crate::sys::layout::DIE_PAD);
     eprintln!("sessions: {msg}");
     std::process::exit(1);
 }
@@ -443,13 +433,12 @@ impl<'a> NameTable<'a> {
         h.wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
-    #[inline(always)]
     fn slot(&self, name: &[u8]) -> usize {
         let mask = self.slots.len() - 1;
         let mut i = (Self::hash(name) >> 32) as usize & mask;
         loop {
             let at = self.slots[i];
-            if at == 0 || same_bytes(self.names[at as usize - 1], name) {
+            if at == 0 || self.names[at as usize - 1] == name {
                 return i;
             }
             i = (i + 1) & mask;
@@ -457,7 +446,6 @@ impl<'a> NameTable<'a> {
     }
 
     /// The index of `name`, added if new.
-    #[inline(always)]
     fn index(&mut self, name: &'a [u8]) -> usize {
         let i = self.slot(name);
         if self.slots[i] != 0 {
@@ -475,37 +463,6 @@ impl<'a> NameTable<'a> {
             self.slots[i] = id as u32 + 1;
         }
         id
-    }
-}
-
-/// `a == b` with word compares and no call: musl's `memcmp` goes a byte at
-/// a time. Every load lies inside the two slices.
-#[inline(always)]
-fn same_bytes(a: &[u8], b: &[u8]) -> bool {
-    let n = a.len();
-    if n != b.len() {
-        return false;
-    }
-    let (p, q) = (a.as_ptr(), b.as_ptr());
-    unsafe {
-        let w8 = |p: *const u8, i: usize| (p.add(i) as *const u64).read_unaligned();
-        let w4 = |p: *const u8, i: usize| (p.add(i) as *const u32).read_unaligned();
-        if n >= 8 {
-            // Words from the front, then the last eight bytes (which may
-            // overlap the last word).
-            let mut i = 0;
-            while i + 8 < n {
-                if w8(p, i) != w8(q, i) {
-                    return false;
-                }
-                i += 8;
-            }
-            w8(p, n - 8) == w8(q, n - 8)
-        } else if n >= 4 {
-            w4(p, 0) == w4(q, 0) && w4(p, n - 4) == w4(q, n - 4)
-        } else {
-            (0..n).all(|i| *p.add(i) == *q.add(i))
-        }
     }
 }
 
@@ -585,32 +542,6 @@ pub fn load_lookups(data: &Path) -> Lookups {
 #[cfg(test)]
 mod pair_tests {
     use super::*;
-
-    /// Every length from 0 to 40 against itself, against each one-byte
-    /// change, and against the same bytes one shorter and one longer;
-    /// slices cut from inside a buffer so a read past either end would
-    /// see different bytes.
-    #[test]
-    fn same_bytes_matches_eq() {
-        let buf: Vec<u8> = (0..120u32).map(|i| (i * 37 + 11) as u8).collect();
-        for n in 0..=40 {
-            let a = &buf[20..20 + n];
-            let mut b = buf.clone();
-            assert!(same_bytes(a, &b[20..20 + n]), "{n}");
-            for k in 0..n {
-                b[20 + k] ^= 0x40;
-                assert!(!same_bytes(a, &b[20..20 + n]), "{n} {k}");
-                b[20 + k] ^= 0x40;
-            }
-            if n > 0 {
-                assert!(!same_bytes(a, &buf[20..19 + n]), "{n} shorter");
-            }
-            assert!(!same_bytes(a, &buf[20..21 + n]), "{n} longer");
-            // Same bytes at another address.
-            let copy = a.to_vec();
-            assert_eq!(same_bytes(a, &copy), true, "{n} copy");
-        }
-    }
 
     #[test]
     fn for_each_pair_matches_split_line() {

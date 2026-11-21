@@ -3,9 +3,7 @@
 //! parser in common.rs, so the two cannot disagree on odd input: the fast
 //! path only ever accepts, it never rejects on its own.
 //!
-//! All pointer-taking functions may read up to 16 bytes past the field,
-//! and `parse_ts_ingest` reads the 20 bytes from the start of `ingest_ts`
-//! whatever its length (20 past an empty one).
+//! All pointer-taking functions may read up to 16 bytes past the field.
 
 use crate::common::*;
 
@@ -64,56 +62,22 @@ fn parse_values(v: u64) -> u64 {
     (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
 }
 
-/// One cached month (or, in slots 2 and 3, "no calendar"): 32 bytes, so a
-/// slot's byte offset addresses its key, limits and base at once.
-#[repr(C, align(32))]
-#[derive(Clone, Copy)]
-struct Slot {
-    /// Upper bounds for `[DD - 1, HH, MM, SS]` as 16-bit lanes.
-    lim: [u16; 8],
-    /// The `YYYY-MM-` this slot holds.
-    key: u64,
-    /// Milliseconds at the start of the day before the month's first day.
-    base_ms: i64,
-}
-
-const SLOT_BYTES: usize = std::mem::size_of::<Slot>();
-const _: () = assert!(SLOT_BYTES == 32);
-/// The layout of the cache that the asm loops in `engine/hot.rs` read:
-/// size of the cache, offset of the slots, slot size, and the offsets of
-/// `lim`, `key` and `base_ms` in a slot.
-pub(crate) const CACHE_LAYOUT: [usize; 6] = [
-    std::mem::size_of::<DateCache>(),
-    std::mem::offset_of!(DateCache, slots),
-    SLOT_BYTES,
-    std::mem::offset_of!(Slot, lim),
-    std::mem::offset_of!(Slot, key),
-    std::mem::offset_of!(Slot, base_ms),
-];
-
-/// Byte offset of the "no calendar" slots from the month slots.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
-const NOCAL: usize = 2 * SLOT_BYTES;
-
-/// Remembers two `YYYY-MM-` prefixes: the day number before the first of
-/// the month and the month's length. A month's slot is the parity of its
-/// last digit, and two months in a row always differ in it (12 and 01
-/// too), so dates that span two months never evict each other. A thread's
-/// dates lie within a few weeks, so nearly every timestamp hits.
+/// Remembers the last two `YYYY-MM-` prefixes seen: the day number before
+/// the first of the month and the month's length. A window touches one or
+/// two months, so nearly every timestamp hits.
 ///
-/// Slots 2 and 3 are not months. They stand for "no calendar": no bounds
-/// and no base, which is what a digits-only timestamp needs when it runs
-/// through the same code as the calendar forms (see `parse_ts`).
-#[repr(C, align(32))]
+/// Slots 2 and 3 of `lim` and `base_ms` are not months. They stand for "no
+/// calendar": no bounds and no base, which is what a digits-only timestamp
+/// needs when it runs through the same code as the calendar forms (see
+/// `parse_ts`).
+#[repr(C, align(16))]
 pub struct DateCache {
-    slots: [Slot; 4],
-}
-
-/// The byte offset of the slot for the month `a` (a field's first eight
-/// bytes): bit 0 of byte 6, the month's last digit, moved to bit 5.
-#[inline(always)]
-fn slot_off(a: u64) -> usize {
-    ((a >> 43) & SLOT_BYTES as u64) as usize
+    /// Upper bounds for `[DD - 1, HH, MM, SS]` as 16-bit lanes.
+    lim: [[u16; 8]; 4],
+    key: [u64; 2],
+    /// Milliseconds at the start of the day before the month's first day.
+    base_ms: [i64; 4],
+    next: usize,
 }
 
 impl DateCache {
@@ -122,27 +86,15 @@ impl DateCache {
     /// so there is no key that could stand for "empty": a zeroed slot would
     /// accept eight NUL bytes as a month whose only day is the 1st.
     pub fn new() -> Self {
-        let month = Slot { lim: [0; 8], key: 0, base_ms: 0 };
-        let nocal = Slot { lim: [u16::MAX; 8], key: 0, base_ms: 0 };
-        let mut cache = DateCache { slots: [month, month, nocal, nocal] };
+        let mut cache =
+            DateCache { lim: [[0; 8], [0; 8], [u16::MAX; 8], [u16::MAX; 8]], key: [0; 2], base_ms: [0; 4], next: 0 };
         for month in [b"1970-01-", b"1970-02-"] {
             let filled = cache.fill(u64::from_le_bytes(*month));
             assert!(filled);
         }
-        assert!(cache.slots[0].key != cache.slots[1].key);
         cache
     }
 
-    /// The slot at byte offset `off`: 0 or 32 for a month, plus `NOCAL`
-    /// for the slots without a calendar.
-    #[inline(always)]
-    unsafe fn at(&self, off: usize) -> *const Slot {
-        debug_assert!(off % SLOT_BYTES == 0 && off < 4 * SLOT_BYTES);
-        (self.slots.as_ptr() as *const u8).add(off) as *const Slot
-    }
-
-    /// Puts the month `a` in its slot; false, with no change, when `a` is
-    /// not a month.
     #[cold]
     #[inline(never)]
     fn fill(&mut self, a: u64) -> bool {
@@ -158,23 +110,27 @@ impl DateCache {
         if !(1..=12).contains(&month) {
             return false;
         }
-        self.slots[slot_off(a) / SLOT_BYTES] = Slot {
-            lim: [days_in_month(year, month) as u16 - 1, 23, 59, 59, 0, 0, 0, 0],
-            key: a,
-            base_ms: (days_from_civil(year, month, 1) - 1) * DAY_MS,
-        };
+        let slot = self.next;
+        self.next ^= 1;
+        self.key[slot] = a;
+        self.base_ms[slot] = (days_from_civil(year, month, 1) - 1) * DAY_MS;
+        self.lim[slot] = [days_in_month(year, month) as u16 - 1, 23, 59, 59, 0, 0, 0, 0];
         true
     }
+}
 
+impl DateCache {
     /// The slot of the month `a` (the field's first eight bytes), filled
-    /// first if need be; `None` when `a` is not a month.
+    /// first if need be; `None` when `a` is not a month. A window can lie
+    /// across two months in any proportion, so the slot is computed, not
+    /// branched on; the one branch is the miss.
     #[inline(always)]
     fn slot(&mut self, a: u64) -> Option<usize> {
-        let slot = slot_off(a) / SLOT_BYTES;
-        if a == self.slots[slot].key || self.fill(a) {
+        let slot = usize::from(a != self.key[0]);
+        if a == self.key[slot] {
             return Some(slot);
         }
-        None
+        self.fill(a).then(|| usize::from(a != self.key[0]))
     }
 }
 
@@ -185,8 +141,8 @@ impl DateCache {
 pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> Option<i64> {
     let a = load64(p);
     let slot = cache.slot(a)?;
-    let base_ms = cache.slots[slot].base_ms;
-    let dim = u32::from(cache.slots[slot].lim[0]) + 1;
+    let base_ms = cache.base_ms[slot];
+    let dim = u32::from(cache.lim[slot][0]) + 1;
     // "DDTHH:MM": turn the two separators into '0', then all must be digits.
     const PAT: u64 = ((b'T' ^ b'0') as u64) << 16 | ((b':' ^ b'0') as u64) << 40;
     const SEP: u64 = 0xFF << 16 | 0xFF << 40;
@@ -225,9 +181,8 @@ pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> Opti
     use core::arch::x86_64::*;
     let a = load64(p);
     let slot = cache.slot(a)?;
-    let s = cache.slots.get_unchecked(slot);
-    let base_ms = s.base_ms;
-    let lim = _mm_load_si128(s.lim.as_ptr() as *const __m128i);
+    let base_ms = *cache.base_ms.get_unchecked(slot);
+    let lim = _mm_load_si128(cache.lim.as_ptr().add(slot) as *const __m128i);
     // Bytes 4..20 of the field: - M M - D D T H H : M M : S S ?
     let v = _mm_loadu_si128(p.add(4) as *const __m128i);
     let expect = _mm_setr_epi8(
@@ -300,8 +255,7 @@ struct Form {
     off: usize,
     /// All ones when the first eight bytes must be a cached `YYYY-MM-`.
     keymask: u64,
-    /// Added to the slot offset: `NOCAL` moves it to the slots without a
-    /// calendar.
+    /// Added to the cache slot: 2 moves it to the slots without a calendar.
     slot: usize,
 }
 
@@ -325,11 +279,8 @@ const fn civil_form(last: u8) -> Form {
 
 /// Index 0: thirteen digits (F3 as the generator writes it). 1: F1. 2: F2,
 /// whose byte 19 is the sign of the offset and is checked with the offset.
-/// 3: no form. It always fails: its digits are all left out, so the day
-/// lane is 0 - 1, above the day limit of any month, and its slot is a
-/// month's.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
-const FORM_LIST: [Form; 4] = [
+const FORM_LIST: [Form; 3] = [
     Form {
         expect: [b'0'; 16],
         limit: [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 255, 255, 255],
@@ -340,35 +291,25 @@ const FORM_LIST: [Form; 4] = [
         scale: 100_000_000,
         off: 0,
         keymask: 0,
-        slot: NOCAL,
+        slot: 2,
     },
     civil_form(0),
     civil_form(255),
-    Form {
-        expect: [0; 16],
-        limit: [0; 16],
-        shuf: [-1; 16],
-        fold4: [0; 8],
-        fold2: [0; 8],
-        scale: 0,
-        off: 0,
-        keymask: u64::MAX,
-        slot: 0,
-    },
 ];
 
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
-static FORMS: [Form; 4] = FORM_LIST;
+static FORMS: [Form; 3] = FORM_LIST;
 
-/// Field length (mod 32) to the byte offset of its entry in `FORMS`, the
-/// "no form" entry for lengths that have none.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
-static LEN_FORM: [u16; 32] = {
-    let size = std::mem::size_of::<Form>();
-    let mut t = [(3 * size) as u16; 32];
+const NO_FORM: u8 = 255;
+
+/// Field length to index in `FORMS`.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+static LEN_FORM: [u8; 32] = {
+    let mut t = [NO_FORM; 32];
     t[13] = 0;
-    t[20] = size as u16;
-    t[25] = (2 * size) as u16;
+    t[20] = 1;
+    t[25] = 2;
     t
 };
 
@@ -380,18 +321,22 @@ static LEN_FORM: [u16; 32] = {
 /// only selects constants: all three run the same instructions, and the
 /// branches left are the ones that are almost never taken (whatever this
 /// path does not recognise goes to `parse_ts_general`) and the F2 offset.
-/// The form, the month and the bytes are checked with one branch.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
 #[inline(always)]
 pub unsafe fn parse_ts(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
     use core::arch::x86_64::*;
-    let f = FORMS.as_ptr().byte_add(usize::from(*LEN_FORM.get_unchecked(len & 31)));
-    // The month, for the forms that have one: it must be in the cache. A
-    // length of 32 or more has no form.
+    let form = if len < 32 { *LEN_FORM.get_unchecked(len) } else { NO_FORM };
+    if form == NO_FORM {
+        return parse_ts_cold(p, len, cache);
+    }
+    let f = FORMS.as_ptr().add(form as usize);
+    // The month, for the forms that have one: it must be in the cache.
     let a = load64(p);
-    let at = slot_off(a);
-    let miss = ((a ^ (*cache.at(at)).key) & (*f).keymask) | (len >> 5) as u64;
-    let s = cache.at(at + (*f).slot);
+    let slot = usize::from(a != cache.key[0]);
+    if (a ^ *cache.key.get_unchecked(slot)) & (*f).keymask != 0 {
+        return parse_ts_cold(p, len, cache);
+    }
+    let slot = slot + (*f).slot;
     let v = _mm_loadu_si128(p.add((*f).off) as *const __m128i);
     let x = _mm_xor_si128(v, _mm_load_si128((*f).expect.as_ptr() as *const __m128i));
     let limit = _mm_load_si128((*f).limit.as_ptr() as *const __m128i);
@@ -401,18 +346,17 @@ pub unsafe fn parse_ts(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
     // [DD - 1, HH, MM, SS] must not exceed the month's limits (unsigned, so
     // day 0 wraps and fails). The slots without a calendar allow anything.
     let shifted = _mm_sub_epi16(pairs, _mm_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0));
-    let lim = _mm_load_si128((*s).lim.as_ptr() as *const __m128i);
+    let lim = _mm_load_si128(cache.lim.as_ptr().add(slot) as *const __m128i);
     let ok_range = _mm_cmpeq_epi16(_mm_min_epu16(shifted, lim), shifted);
-    let ok = _mm_movemask_epi8(_mm_and_si128(ok_bytes, ok_range)) as u64;
-    if (ok ^ 0xFFFF) | miss != 0 {
+    if _mm_movemask_epi8(_mm_and_si128(ok_bytes, ok_range)) != 0xFFFF {
         return parse_ts_cold(p, len, cache);
     }
     let fours = _mm_madd_epi16(pairs, _mm_load_si128((*f).fold4.as_ptr() as *const __m128i));
     let packed = _mm_packus_epi32(fours, fours);
     let halves = _mm_madd_epi16(packed, _mm_load_si128((*f).fold2.as_ptr() as *const __m128i));
     let both = _mm_cvtsi128_si64(halves) as u64;
-    let v = ((both & 0xFFFF_FFFF) * (*f).scale + (both >> 32)) as i64 + (*s).base_ms;
-    if len == 25 {
+    let v = ((both & 0xFFFF_FFFF) * (*f).scale + (both >> 32)) as i64 + *cache.base_ms.get_unchecked(slot);
+    if form == 2 {
         return match offset_minutes(p) {
             Some(minutes) => v - minutes * 60_000,
             None => parse_ts_cold(p, len, cache),
@@ -461,32 +405,29 @@ const fn with_ingest(form: usize) -> Form2 {
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-static FORMS2: [Form2; 4] = [with_ingest(0), with_ingest(1), with_ingest(2), with_ingest(3)];
+static FORMS2: [Form2; 3] = [with_ingest(0), with_ingest(1), with_ingest(2)];
 
-/// Field length (mod 32) to the byte offset of its entry in `FORMS2`
-/// (`LEN_FORM` scaled to the entry size, so no multiply).
+/// Field length to the byte offset of its entry in `FORMS2` (`LEN_FORM`
+/// times the entry size, so no multiply), `NO_FORM2` for none.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 static LEN_FORM2: [u16; 32] = {
-    let mut t = [0; 32];
+    let mut t = [NO_FORM2; 32];
     let mut len = 0;
     while len < 32 {
-        let form = LEN_FORM[len] as usize / std::mem::size_of::<Form>();
-        t[len] = (form * std::mem::size_of::<Form2>()) as u16;
+        if LEN_FORM[len] != NO_FORM {
+            t[len] = (LEN_FORM[len] as usize * std::mem::size_of::<Form2>()) as u16;
+        }
         len += 1;
     }
     t
 };
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const NO_FORM2: u16 = u16::MAX;
+
 /// `ts` and `ingest_ts` of one event: what `parse_ts` and `parse_ingest`
 /// return for them. Each timestamp takes one 128-bit lane of the same
-/// instructions, so the pair costs little more than one of them. The
-/// lengths, both months and all bytes are checked with one branch.
-///
-/// Reads: up to 20 bytes from `tp` and from `ip` whatever the lengths are
-/// (they are checked after the loads), and the F2 offset inside `ts`. The only caller passes fields of a
-/// line in a file mapping, so both pointers are at most the file's end,
-/// and `sys::map_file` puts at least one page of zeros after it.
-/// `pair_reader_ingest_lengths` covers `ilen` 0 to 40.
+/// instructions, so the pair costs little more than one of them.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 pub unsafe fn parse_ts_ingest(
@@ -497,13 +438,19 @@ pub unsafe fn parse_ts_ingest(
     cache: &mut DateCache,
 ) -> (i64, i64) {
     use core::arch::x86_64::*;
-    let f = FORMS2.as_ptr().byte_add(usize::from(*LEN_FORM2.get_unchecked(tlen & 31)));
-    // Both months (`ts` only if its form has one) must be in the cache. A
-    // `ts` of 32 bytes or more has no form; `ingest_ts` must be F1.
+    let off = if tlen < 32 { *LEN_FORM2.get_unchecked(tlen) } else { NO_FORM2 };
+    if (off == NO_FORM2) | (ilen != 20) {
+        return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
+    }
+    let f = FORMS2.as_ptr().byte_add(usize::from(off));
+    let form = *LEN_FORM.get_unchecked(tlen);
+    // Both months (`ts` only if its form has one) must be in the cache.
     let (a, b) = (load64(tp), load64(ip));
-    let (oa, ob) = (slot_off(a), slot_off(b));
-    let miss = ((a ^ (*cache.at(oa)).key) & (*f).keymask) | (b ^ (*cache.at(ob)).key) | ((tlen >> 5) | (ilen ^ 20)) as u64;
-    let (sa, sb) = (cache.at(oa + (*f).slot), cache.at(ob));
+    let (sa, sb) = (usize::from(a != cache.key[0]), usize::from(b != cache.key[0]));
+    if ((a ^ *cache.key.get_unchecked(sa)) & (*f).keymask) | (b ^ *cache.key.get_unchecked(sb)) != 0 {
+        return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
+    }
+    let sa = sa + (*f).slot;
     let two = |low: *const u8, high: *const u8| -> __m256i {
         _mm256_inserti128_si256(
             _mm256_castsi128_si256(_mm_loadu_si128(low as *const __m128i)),
@@ -518,10 +465,9 @@ pub unsafe fn parse_ts_ingest(
     let digits = _mm256_shuffle_epi8(x, _mm256_load_si256((*f).shuf.as_ptr() as *const __m256i));
     let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
     let shifted = _mm256_sub_epi16(pairs, _mm256_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0));
-    let lim = two((*sa).lim.as_ptr() as *const u8, (*sb).lim.as_ptr() as *const u8);
+    let lim = two(cache.lim.as_ptr().add(sa) as *const u8, cache.lim.as_ptr().add(sb) as *const u8);
     let ok_range = _mm256_cmpeq_epi16(_mm256_min_epu16(shifted, lim), shifted);
-    let ok = _mm256_movemask_epi8(_mm256_and_si256(ok_bytes, ok_range)) as u32;
-    if u64::from(!ok) | miss != 0 {
+    if _mm256_movemask_epi8(_mm256_and_si256(ok_bytes, ok_range)) != -1 {
         return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
     }
     let fours = _mm256_madd_epi16(pairs, _mm256_load_si256((*f).fold4.as_ptr() as *const __m256i));
@@ -530,9 +476,9 @@ pub unsafe fn parse_ts_ingest(
     let both = _mm_cvtsi128_si64(_mm256_castsi256_si128(halves)) as u64;
     // The high half of an F1 value is zero.
     let seconds = _mm_cvtsi128_si64(_mm256_extracti128_si256(halves, 1)) as u64;
-    let ingest = (seconds * 1000) as i64 + (*sb).base_ms;
-    let ts = ((both & 0xFFFF_FFFF) * (*f).scale + (both >> 32)) as i64 + (*sa).base_ms;
-    if tlen == 25 {
+    let ingest = (seconds * 1000) as i64 + *cache.base_ms.get_unchecked(sb);
+    let ts = ((both & 0xFFFF_FFFF) * (*f).scale + (both >> 32)) as i64 + *cache.base_ms.get_unchecked(sa);
+    if form == 2 {
         match offset_minutes(tp) {
             Some(minutes) => return (ts - minutes * 60_000, ingest),
             None => return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache),
@@ -895,213 +841,6 @@ mod tests {
                     check(&text, &mut DateCache::new());
                 }
             }
-        }
-    }
-
-    /// Every day from 1969 to 2101 in F1 (value checked) and F2, then every
-    /// day number 0 to 32 of every month 0 to 13 of those years, leap days
-    /// and Feb 30 among them: the fast readers and the reference agree.
-    #[test]
-    fn every_date_1969_to_2101() {
-        let mut cache = DateCache::new();
-        let mut state = 3;
-        for day in days_from_civil(1969, 1, 1)..days_from_civil(2102, 1, 1) {
-            let (y, m, d) = civil_from_days(day);
-            let s = rng(&mut state) % 86_400;
-            let (hh, mi, ss) = (s / 3600, s / 60 % 60, s % 60);
-            let f1 = format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}Z");
-            assert_eq!(fast(f1.as_bytes(), &mut cache), day * DAY_MS + s as i64 * 1000, "{f1}");
-            let sign = if rng(&mut state) % 2 == 0 { '+' } else { '-' };
-            let f2 = format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}{sign}{:02}:{:02}", rng(&mut state) % 24, rng(&mut state) % 60);
-            check(f2.as_bytes(), &mut cache);
-        }
-        for y in 1969..=2101 {
-            for m in 0..=13 {
-                for d in 0..=32 {
-                    check(format!("{y:04}-{m:02}-{d:02}T00:00:00Z").as_bytes(), &mut cache);
-                    check(format!("{y:04}-{m:02}-{d:02}T23:59:59-23:59").as_bytes(), &mut cache);
-                }
-            }
-        }
-    }
-
-    /// Times of day at and past every limit, fractions of 1 to 12 digits,
-    /// offsets of both signs and every width, and every length from 0 to 64
-    /// (lengths of 32 or more whose low five bits name a form among them).
-    #[test]
-    fn times_offsets_and_lengths() {
-        let mut cache = DateCache::new();
-        for hh in 0..=25 {
-            for mm in [0, 1, 9, 10, 58, 59, 60, 61, 99] {
-                for ss in [0, 1, 9, 10, 58, 59, 60, 61, 99] {
-                    for tail in ["Z", "+00:00", "-00:00", "-23:59", "+23:59", "+24:00", "-00:60", "+12:00", "+1:00", "+001:00", "-10:5", "+10:500"] {
-                        check(format!("2028-02-29T{hh:02}:{mm:02}:{ss:02}{tail}").as_bytes(), &mut cache);
-                        check(format!("2027-12-31T{hh:02}:{mm:02}:{ss:02}{tail}").as_bytes(), &mut cache);
-                    }
-                }
-            }
-        }
-        let digits = "123456789012";
-        for n in 1..=12 {
-            let frac = &digits[..n];
-            check(format!("2026-10-03T23:59:59.{frac}Z").as_bytes(), &mut cache);
-            check(format!("2026-10-03T23:59:59.{frac}+05:30").as_bytes(), &mut cache);
-            check(format!("1791071890000.{frac}").as_bytes(), &mut cache);
-            check(format!("{frac}").as_bytes(), &mut cache);
-        }
-        for base in ["2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "1791071890000", "0000000000000"] {
-            for len in 0..=64 {
-                // The form's bytes, cut short or repeated to the length.
-                let text: Vec<u8> = base.bytes().cycle().take(len).collect();
-                check(&text, &mut cache);
-                // The form's bytes behind padding to the length.
-                if len >= base.len() {
-                    let mut text = vec![b'0'; len - base.len()];
-                    text.extend_from_slice(base.as_bytes());
-                    check(&text, &mut cache);
-                    let mut text = base.as_bytes().to_vec();
-                    text.resize(len, b'0');
-                    check(&text, &mut cache);
-                }
-            }
-        }
-        // 32 leading zeros: a valid F3 value whose length is 13 mod 32.
-        let long = format!("{}1791071890000", "0".repeat(32));
-        assert_eq!(fast(long.as_bytes(), &mut cache), 1_791_071_890_000);
-    }
-
-    /// The pair reader with `ingest_ts` lengths 0 to 40, where the bytes
-    /// past the field always read as a valid F1: only a 20-byte field is
-    /// one.
-    #[test]
-    fn pair_reader_ingest_lengths() {
-        let mut cache = DateCache::new();
-        let ingest = b"2026-10-03T23:58:10Z2026-10-03T23:58:10Z2026-10-03T23:58:10Z";
-        let mut ts = b"2026-10-03T23:58:00Z".to_vec();
-        ts.extend_from_slice(&[b'0'; 32]);
-        for ilen in 0..=40 {
-            for start in [0, 1, 20] {
-                let field = &ingest[start..start + ilen];
-                let want = parse_ts_naive(field).unwrap_or(i64::MAX);
-                let pair = unsafe { parse_ts_ingest(ts.as_ptr(), 20, ingest.as_ptr().add(start), ilen, &mut cache) };
-                assert_eq!(pair, (1_791_071_880_000, want), "{ilen} {start}");
-            }
-        }
-    }
-
-    /// The month cache: months of one parity in turn evict each other and
-    /// still read right, two dates of one month share a slot, a prefix that
-    /// is not a month never enters a slot, and the slots without a calendar
-    /// never change.
-    #[test]
-    fn cache_slots() {
-        let key = |s: &[u8; 8]| u64::from_le_bytes(*s);
-        for m in 1..=12 {
-            let next = m % 12 + 1;
-            let a = key(format!("2026-{m:02}-").as_bytes().try_into().unwrap());
-            let b = key(format!("2026-{next:02}-").as_bytes().try_into().unwrap());
-            assert_ne!(slot_off(a), slot_off(b), "{m}");
-        }
-        let mut cache = DateCache::new();
-        let texts = [
-            "2026-01-31T10:00:00Z",
-            "2026-03-01T10:00:00Z",
-            "2026-01-01T00:00:00Z",
-            "2026-02-28T23:59:59Z",
-            "2026-03-31T00:00:00+01:00",
-            "2025-11-30T00:00:00Z",
-            "2026-01-15T00:00:00Z",
-            "2025-12-31T23:59:59Z",
-            "2026-10-03T00:00:00Z",
-            "2026-10-31T00:00:00Z",
-            "2026-10-32T00:00:00Z",
-            "2026-11-31T00:00:00Z",
-            "2027-02-29T00:00:00Z",
-            "2028-02-29T00:00:00Z",
-            "2028-02-30T00:00:00Z",
-            "1791071890000",
-        ];
-        for _ in 0..3 {
-            for t in texts {
-                check(t.as_bytes(), &mut cache);
-            }
-        }
-        // Hit after miss: the slot holds what the miss put there. (Only the
-        // single reader here: `fast` also reads other months.)
-        let mut cache = DateCache::new();
-        assert_eq!(fast_single(b"2026-11-05T00:00:00Z", &mut cache), days_from_civil(2026, 11, 5) * DAY_MS);
-        assert_eq!(cache.slots[1].key, key(b"2026-11-"));
-        assert_eq!(fast_single(b"2026-11-06T00:00:01Z", &mut cache), days_from_civil(2026, 11, 6) * DAY_MS + 1000);
-        // Not months: the slot of their parity keeps its month.
-        for bad in ["2026-13-05T00:00:00Z", "2026-1305T00:00:00Z", "2026-00-05T00:00:00Z", "2026-1a-05T00:00:00Z", "2026-21-05T00:00:00Z"] {
-            assert_eq!(fast_single(bad.as_bytes(), &mut cache), BAD, "{bad}");
-            let mut buf = bad.as_bytes().to_vec();
-            buf.extend_from_slice(&[0; 32]);
-            assert_eq!(unsafe { parse_ingest(buf.as_ptr(), 20, &mut cache) }, i64::MAX, "{bad}");
-        }
-        assert_eq!(cache.slots[1].key, key(b"2026-11-"));
-        assert_eq!(cache.slots[0].key, key(b"1970-02-"));
-        for slot in &cache.slots[2..] {
-            assert_eq!((slot.lim, slot.key, slot.base_ms), ([u16::MAX; 8], 0, 0));
-        }
-    }
-
-    /// The reads stay within their stated bounds: each field is put so that
-    /// the page after the bound is unmapped.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn reads_stay_in_bounds() {
-        unsafe {
-            let page = 4096;
-            let base = libc::mmap(
-                std::ptr::null_mut(),
-                2 * page,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            ) as *mut u8;
-            assert!(!base.is_null() && base as isize != -1);
-            assert_eq!(libc::mprotect(base.add(page) as *mut libc::c_void, page, libc::PROT_NONE), 0);
-            let end = base.add(page);
-            std::ptr::write_bytes(base, b'7', page);
-            let mut cache = DateCache::new();
-            let texts: [&[u8]; 9] = [
-                b"2026-10-03T23:58:10Z",
-                b"2026-10-03T19:58:10-04:00",
-                b"1791071890000",
-                b"",
-                b"1",
-                b"2026-10-03T23:58:10",
-                b"2026-10-03T23:58:10Z0000000000000000000000000000000000",
-                b"0000000000000000000000000000000000000000000001791071890000",
-                b"20261003",
-            ];
-            let place = |text: &[u8], room: usize| -> *const u8 {
-                let p = end.sub(text.len() + room);
-                std::ptr::copy_nonoverlapping(text.as_ptr(), p, text.len());
-                p
-            };
-            for t in texts {
-                let want = parse_ts_naive(t).unwrap_or(BAD);
-                assert_eq!(parse_ts(place(t, 16), t.len(), &mut cache), want);
-                assert_eq!(parse_ts_general(place(t, 16), t.len(), &mut cache), want);
-                assert_eq!(parse_ingest(place(t, 16), t.len(), &mut cache), if want == BAD { i64::MAX } else { want });
-                for i in texts {
-                    let iwant = parse_ts_naive(i).unwrap_or(i64::MAX);
-                    // ts with 16 bytes after it, the ingest field last.
-                    let mut ts = t.to_vec();
-                    ts.extend_from_slice(&[b'7'; 16]);
-                    let ip = place(i, 16usize.max(20usize.saturating_sub(i.len())));
-                    assert_eq!(parse_ts_ingest(ts.as_ptr(), t.len(), ip, i.len(), &mut cache), (want, iwant));
-                    // ingest_ts first, ts last.
-                    let mut ing = i.to_vec();
-                    ing.extend_from_slice(&[b'7'; 20]);
-                    let tp = place(t, 16);
-                    assert_eq!(parse_ts_ingest(tp, t.len(), ing.as_ptr(), i.len(), &mut cache), (want, iwant));
-                }
-            }
-            libc::munmap(base as *mut libc::c_void, 2 * page);
         }
     }
 
