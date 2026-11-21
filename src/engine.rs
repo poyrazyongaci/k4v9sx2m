@@ -26,7 +26,7 @@ use crate::output::write_camp_rows;
 use crate::usercols::UserOut;
 use crate::scan::{for_each_line, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
-use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, DateCache, BAD};
+use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, parse_ts_ingest, DateCache, BAD};
 
 pub struct Config {
     pub threads: usize,
@@ -128,6 +128,8 @@ impl<'a> Fast<'a> {
         if event_bytes >= (1 << 34) {
             return None;
         }
+        // The late check adds 24 hours to a `ts` inside the window.
+        lk.window_end.checked_add(LATE_MS)?;
         let ws_day = lk.window_start.div_euclid(DAY_MS);
         let ndays = ((lk.window_end - 1).div_euclid(DAY_MS) - ws_day + 1) as usize;
         if (lk.camp_ids.len() + 1) * ndays > (1 << 19) {
@@ -452,33 +454,43 @@ impl<'a> ParseState<'a> {
             let ekey = ids::pack_in(base.add(s[0] as usize), id_len, known);
             let user_len = (e[1] - s[1]) as usize;
             let ukey = ids::pack_in(base.add(s[1] as usize), user_len, known);
-            let mut ingest = parse_ts(base.add(s[3] as usize), (e[3] - s[3]) as usize, cache);
-            let ts = parse_ts(base.add(s[2] as usize), (e[2] - s[2]) as usize, cache);
+            let (ts, ingest) = parse_ts_ingest(
+                base.add(s[2] as usize),
+                (e[2] - s[2]) as usize,
+                base.add(s[3] as usize),
+                (e[3] - s[3]) as usize,
+                cache,
+            );
             let type_len = e[4] - s[4];
             let tp = base.add(s[4] as usize);
             let word = load32(tp);
-            let plain = (type_len == 4) & ((word == VIEW) | (word == CART));
-            let purchase = type_len == 8 && load64(tp) == PURCHASE;
             let ts_rel = ts.wrapping_sub(ws) as u64;
-            let mut valid = (plain | purchase) & (user_len != 0) & (e[5] != s[5]) & (ts_rel < wlen);
-            if ingest == BAD {
-                // Never happens under the rules. Such a copy sorts last and
-                // is never valid, as in the reference.
-                ingest = i64::MAX;
-                valid = false;
-            }
-            valid &= ingest.saturating_sub(ts) <= LATE_MS;
-            let mut pc = 0u64;
-            if purchase & valid {
+            // Late is `ingest - ts > 24 h`, which is `ingest > ts + 24 h`
+            // whenever that sum does not overflow; with `ts` in the window
+            // (the only case where the answer is used) it cannot, see
+            // `Fast::new`. An ingest_ts that is no timestamp is `i64::MAX`
+            // here, later than any `ts + 24 h`: the copy sorts last and is
+            // never valid, as in the reference.
+            let fresh = ingest <= ts.wrapping_add(LATE_MS);
+            // Nearly every row passes these four rules and is a view or a
+            // cart: one well-predicted branch for the rules, one for the
+            // length of the type.
+            let sound = (user_len != 0) & (e[5] != s[5]) & (ts_rel < wlen) & fresh;
+            let mut w3 = DEAD;
+            if !sound {
+                std::hint::cold_path();
+            } else if type_len == 4 {
+                // View or cart is a coin toss, so it selects, it does not
+                // branch.
+                let plain = (word == VIEW) | (word == CART);
+                w3 = std::hint::select_unpredictable(plain, ts_rel << 32, DEAD);
+            } else if type_len == 8 && load64(tp) == PURCHASE {
                 let price = parse_price(base.add(s[6] as usize), (e[6] - s[6]) as usize);
-                if price == 0 {
-                    valid = false;
-                } else {
+                if price != 0 {
                     let cat = fast.category(base.add(s[5] as usize), (e[5] - s[5]) as usize);
-                    pc = (price << 8) | u64::from(cat);
+                    w3 = (ts_rel << 32) | (price << 8) | u64::from(cat);
                 }
             }
-            let w3 = if valid { (ts_rel << 32) | pc } else { DEAD };
             let part = (mix(ekey) >> shift1) as usize;
             entries.push(part, Entry { ekey, ukey, ingest, w3 });
         })

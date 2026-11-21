@@ -47,13 +47,18 @@ unsafe fn padded_digits(p: *const u8, len: usize) -> u64 {
 /// Remembers the last two `YYYY-MM-` prefixes seen: the day number before
 /// the first of the month and the month's length. A window touches one or
 /// two months, so nearly every timestamp hits.
+///
+/// Slots 2 and 3 of `lim` and `base_ms` are not months. They stand for "no
+/// calendar": no bounds and no base, which is what a digits-only timestamp
+/// needs when it runs through the same code as the calendar forms (see
+/// `parse_ts`).
 #[repr(C, align(16))]
 pub struct DateCache {
     /// Upper bounds for `[DD - 1, HH, MM, SS]` as 16-bit lanes.
-    lim: [[u16; 8]; 2],
+    lim: [[u16; 8]; 4],
     key: [u64; 2],
     /// Milliseconds at the start of the day before the month's first day.
-    base_ms: [i64; 2],
+    base_ms: [i64; 4],
     next: usize,
 }
 
@@ -63,7 +68,8 @@ impl DateCache {
     /// so there is no key that could stand for "empty": a zeroed slot would
     /// accept eight NUL bytes as a month whose only day is the 1st.
     pub fn new() -> Self {
-        let mut cache = DateCache { lim: [[0; 8]; 2], key: [0; 2], base_ms: [0; 2], next: 0 };
+        let mut cache =
+            DateCache { lim: [[0; 8], [0; 8], [u16::MAX; 8], [u16::MAX; 8]], key: [0; 2], base_ms: [0; 4], next: 0 };
         for month in [b"1970-01-", b"1970-02-"] {
             let filled = cache.fill(u64::from_le_bytes(*month));
             assert!(filled);
@@ -95,16 +101,28 @@ impl DateCache {
     }
 }
 
-/// `YYYY-MM-DDTHH:MM:SS` at `p` as milliseconds, or `BAD`. With `need_z`
+impl DateCache {
+    /// The slot of the month `a` (the field's first eight bytes), filled
+    /// first if need be; `None` when `a` is not a month. A window can lie
+    /// across two months in any proportion, so the slot is computed, not
+    /// branched on; the one branch is the miss.
+    #[inline(always)]
+    fn slot(&mut self, a: u64) -> Option<usize> {
+        let slot = usize::from(a != self.key[0]);
+        if a == self.key[slot] {
+            return Some(slot);
+        }
+        self.fill(a).then(|| usize::from(a != self.key[0]))
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` at `p` as milliseconds, or `None`. With `need_z`
 /// the next byte must be `Z` as well (form F1).
 #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3")))]
 #[inline(always)]
-pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> i64 {
+pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> Option<i64> {
     let a = load64(p);
-    if a != cache.key[0] && a != cache.key[1] && !cache.fill(a) {
-        return BAD;
-    }
-    let slot = usize::from(a != cache.key[0]);
+    let slot = cache.slot(a)?;
     let base_ms = cache.base_ms[slot];
     let dim = u32::from(cache.lim[slot][0]) + 1;
     // "DDTHH:MM": turn the two separators into '0', then all must be digits.
@@ -129,9 +147,9 @@ pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> i64 
         & (ss < 60)
         & (!need_z | (tail >> 24 == u32::from(b'Z')));
     if !ok {
-        return BAD;
+        return None;
     }
-    base_ms + (i64::from(dd) * 86_400 + i64::from(hh * 3_600 + mm * 60 + ss)) * 1_000
+    Some(base_ms + (i64::from(dd) * 86_400 + i64::from(hh * 3_600 + mm * 60 + ss)) * 1_000)
 }
 
 /// The same contract with SSE: one 16-byte load covers `-MM-DDTHH:MM:SS`
@@ -141,13 +159,10 @@ pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> i64 
 /// are range-checked as a vector, and folded to seconds with another.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
 #[inline(always)]
-pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> i64 {
+pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> Option<i64> {
     use core::arch::x86_64::*;
     let a = load64(p);
-    if a != cache.key[0] && a != cache.key[1] && !cache.fill(a) {
-        return BAD;
-    }
-    let slot = usize::from(a != cache.key[0]);
+    let slot = cache.slot(a)?;
     let base_ms = *cache.base_ms.get_unchecked(slot);
     let lim = _mm_load_si128(cache.lim.as_ptr().add(slot) as *const __m128i);
     // Bytes 4..20 of the field: - M M - D D T H H : M M : S S ?
@@ -168,22 +183,335 @@ pub unsafe fn civil19(p: *const u8, cache: &mut DateCache, need_z: bool) -> i64 
     let shifted = _mm_sub_epi16(pairs, _mm_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0));
     let ok_range = _mm_cmpeq_epi16(_mm_min_epu16(shifted, lim), shifted);
     if _mm_movemask_epi8(_mm_and_si128(ok_bytes, ok_range)) != 0xFFFF {
-        return BAD;
+        return None;
     }
     let sums = _mm_madd_epi16(pairs, _mm_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0));
     let both = _mm_cvtsi128_si64(sums) as u64;
     let hours = both & 0xFFFF_FFFF;
     let seconds = both >> 32;
-    base_ms + ((hours * 3_600 + seconds) * 1_000) as i64
+    Some(base_ms + ((hours * 3_600 + seconds) * 1_000) as i64)
 }
 
-/// Any `ts` or `ingest_ts` field: epoch milliseconds, `BAD` when it is not
-/// a timestamp, `i64::MAX` for a digits-only value too long to matter.
+/// An `ingest_ts` field: epoch milliseconds, or `i64::MAX` when it is not a
+/// timestamp, so that such a copy sorts last. The rules promise form F1,
+/// which is checked in full here; any other field goes through the general
+/// reader, as it does in the reference.
+#[inline(always)]
+pub unsafe fn parse_ingest(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
+    if len == 20 {
+        if let Some(v) = civil19(p, cache, true) {
+            return v;
+        }
+    }
+    parse_ingest_cold(p, len, cache)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn parse_ingest_cold(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
+    match parse_ts_general(p, len, cache) {
+        BAD => i64::MAX,
+        v => v,
+    }
+}
+
+/// What tells the three timestamp forms apart in `parse_ts`: where the 16
+/// bytes to convert start, what they must look like, and how their digits
+/// add up. One entry per form, picked by the field length.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+#[repr(C, align(64))]
+struct Form {
+    /// XOR with this leaves 0 at a correct separator and 0..=9 at a digit.
+    expect: [u8; 16],
+    /// The largest value each byte may then have (255: not looked at).
+    limit: [u8; 16],
+    /// Moves the digits into place for the pairwise multiply-adds.
+    shuf: [i8; 16],
+    /// Weights that fold eight two-digit numbers into four numbers.
+    fold4: [i16; 8],
+    /// Weights that fold those into the two halves of the value.
+    fold2: [i16; 8],
+    /// value = low half * scale + high half + base of the cache slot.
+    scale: u64,
+    /// Offset of the 16 bytes in the field.
+    off: usize,
+    /// All ones when the first eight bytes must be a cached `YYYY-MM-`.
+    keymask: u64,
+    /// Added to the cache slot: 2 moves it to the slots without a calendar.
+    slot: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+const fn civil_form(last: u8) -> Form {
+    Form {
+        // Bytes 4..20 of the field: - M M - D D T H H : M M : S S, then Z.
+        expect: [0, 0, 0, 0, b'0', b'0', b'T', b'0', b'0', b':', b'0', b'0', b':', b'0', b'0', b'Z'],
+        // The first four are covered by the cache key.
+        limit: [255, 255, 255, 255, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, last],
+        shuf: [4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1],
+        // [DD, HH, MM, SS] to [hours, seconds] to seconds.
+        fold4: [24, 1, 60, 1, 0, 0, 0, 0],
+        fold2: [3600, 1, 0, 0, 0, 0, 0, 0],
+        scale: 1000,
+        off: 4,
+        keymask: u64::MAX,
+        slot: 0,
+    }
+}
+
+/// Index 0: thirteen digits (F3 as the generator writes it). 1: F1. 2: F2,
+/// whose byte 19 is the sign of the offset and is checked with the offset.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+const FORM_LIST: [Form; 3] = [
+    Form {
+        expect: [b'0'; 16],
+        limit: [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 255, 255, 255],
+        // Right-aligned behind three zeros: sixteen digits.
+        shuf: [-1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        fold4: [100, 1, 100, 1, 100, 1, 100, 1],
+        fold2: [10000, 1, 10000, 1, 0, 0, 0, 0],
+        scale: 100_000_000,
+        off: 0,
+        keymask: 0,
+        slot: 2,
+    },
+    civil_form(0),
+    civil_form(255),
+];
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+static FORMS: [Form; 3] = FORM_LIST;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+const NO_FORM: u8 = 255;
+
+/// Field length to index in `FORMS`.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+static LEN_FORM: [u8; 32] = {
+    let mut t = [NO_FORM; 32];
+    t[13] = 0;
+    t[20] = 1;
+    t[25] = 2;
+    t
+};
+
+/// Any `ts` field: epoch milliseconds, `BAD` when it is not a timestamp,
+/// `i64::MAX` for a digits-only value too long to matter.
+///
+/// The three forms come in a random mix (58% F1, 32% F3, 10% F2), so a
+/// branch on the form is mispredicted on four rows in ten. Here the form
+/// only selects constants: all three run the same instructions, and the
+/// branches left are the ones that are almost never taken (whatever this
+/// path does not recognise goes to `parse_ts_general`) and the F2 offset.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
 #[inline(always)]
 pub unsafe fn parse_ts(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
+    use core::arch::x86_64::*;
+    let form = if len < 32 { *LEN_FORM.get_unchecked(len) } else { NO_FORM };
+    if form == NO_FORM {
+        return parse_ts_cold(p, len, cache);
+    }
+    let f = FORMS.as_ptr().add(form as usize);
+    // The month, for the forms that have one: it must be in the cache.
+    let a = load64(p);
+    let slot = usize::from(a != cache.key[0]);
+    if (a ^ *cache.key.get_unchecked(slot)) & (*f).keymask != 0 {
+        return parse_ts_cold(p, len, cache);
+    }
+    let slot = slot + (*f).slot;
+    let v = _mm_loadu_si128(p.add((*f).off) as *const __m128i);
+    let x = _mm_xor_si128(v, _mm_load_si128((*f).expect.as_ptr() as *const __m128i));
+    let limit = _mm_load_si128((*f).limit.as_ptr() as *const __m128i);
+    let ok_bytes = _mm_cmpeq_epi8(_mm_max_epu8(x, limit), limit);
+    let digits = _mm_shuffle_epi8(x, _mm_load_si128((*f).shuf.as_ptr() as *const __m128i));
+    let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010A));
+    // [DD - 1, HH, MM, SS] must not exceed the month's limits (unsigned, so
+    // day 0 wraps and fails). The slots without a calendar allow anything.
+    let shifted = _mm_sub_epi16(pairs, _mm_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0));
+    let lim = _mm_load_si128(cache.lim.as_ptr().add(slot) as *const __m128i);
+    let ok_range = _mm_cmpeq_epi16(_mm_min_epu16(shifted, lim), shifted);
+    if _mm_movemask_epi8(_mm_and_si128(ok_bytes, ok_range)) != 0xFFFF {
+        return parse_ts_cold(p, len, cache);
+    }
+    let fours = _mm_madd_epi16(pairs, _mm_load_si128((*f).fold4.as_ptr() as *const __m128i));
+    let packed = _mm_packus_epi32(fours, fours);
+    let halves = _mm_madd_epi16(packed, _mm_load_si128((*f).fold2.as_ptr() as *const __m128i));
+    let both = _mm_cvtsi128_si64(halves) as u64;
+    let v = ((both & 0xFFFF_FFFF) * (*f).scale + (both >> 32)) as i64 + *cache.base_ms.get_unchecked(slot);
+    if form == 2 {
+        return match offset_minutes(p) {
+            Some(minutes) => v - minutes * 60_000,
+            None => parse_ts_cold(p, len, cache),
+        };
+    }
+    v
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3")))]
+#[inline(always)]
+pub unsafe fn parse_ts(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
+    parse_ts_general(p, len, cache)
+}
+
+/// `FORMS` with a second lane that is always form F1: the constants for
+/// converting an event's `ts` (low lane, any form) and its `ingest_ts`
+/// (high lane) in one pass of 256-bit instructions.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[repr(C, align(64))]
+struct Form2 {
+    expect: [[u8; 16]; 2],
+    limit: [[u8; 16]; 2],
+    shuf: [[i8; 16]; 2],
+    fold4: [[i16; 8]; 2],
+    fold2: [[i16; 8]; 2],
+    scale: u64,
+    off: usize,
+    keymask: u64,
+    slot: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const fn with_ingest(form: usize) -> Form2 {
+    let (t, i) = (&FORM_LIST[form], &FORM_LIST[1]);
+    Form2 {
+        expect: [t.expect, i.expect],
+        limit: [t.limit, i.limit],
+        shuf: [t.shuf, i.shuf],
+        fold4: [t.fold4, i.fold4],
+        fold2: [t.fold2, i.fold2],
+        scale: t.scale,
+        off: t.off,
+        keymask: t.keymask,
+        slot: t.slot,
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static FORMS2: [Form2; 3] = [with_ingest(0), with_ingest(1), with_ingest(2)];
+
+/// `ts` and `ingest_ts` of one event: what `parse_ts` and `parse_ingest`
+/// return for them. Each timestamp takes one 128-bit lane of the same
+/// instructions, so the pair costs little more than one of them.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn parse_ts_ingest(
+    tp: *const u8,
+    tlen: usize,
+    ip: *const u8,
+    ilen: usize,
+    cache: &mut DateCache,
+) -> (i64, i64) {
+    use core::arch::x86_64::*;
+    let form = if tlen < 32 { *LEN_FORM.get_unchecked(tlen) } else { NO_FORM };
+    if (form == NO_FORM) | (ilen != 20) {
+        return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
+    }
+    let f = FORMS2.as_ptr().add(form as usize);
+    // Both months (`ts` only if its form has one) must be in the cache.
+    let (a, b) = (load64(tp), load64(ip));
+    let (sa, sb) = (usize::from(a != cache.key[0]), usize::from(b != cache.key[0]));
+    if ((a ^ *cache.key.get_unchecked(sa)) & (*f).keymask) | (b ^ *cache.key.get_unchecked(sb)) != 0 {
+        return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
+    }
+    let sa = sa + (*f).slot;
+    let two = |low: *const u8, high: *const u8| -> __m256i {
+        _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128(low as *const __m128i)),
+            _mm_loadu_si128(high as *const __m128i),
+            1,
+        )
+    };
+    let v = two(tp.add((*f).off), ip.add(4));
+    let x = _mm256_xor_si256(v, _mm256_load_si256((*f).expect.as_ptr() as *const __m256i));
+    let limit = _mm256_load_si256((*f).limit.as_ptr() as *const __m256i);
+    let ok_bytes = _mm256_cmpeq_epi8(_mm256_max_epu8(x, limit), limit);
+    let digits = _mm256_shuffle_epi8(x, _mm256_load_si256((*f).shuf.as_ptr() as *const __m256i));
+    let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
+    let shifted = _mm256_sub_epi16(pairs, _mm256_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0));
+    let lim = two(cache.lim.as_ptr().add(sa) as *const u8, cache.lim.as_ptr().add(sb) as *const u8);
+    let ok_range = _mm256_cmpeq_epi16(_mm256_min_epu16(shifted, lim), shifted);
+    if _mm256_movemask_epi8(_mm256_and_si256(ok_bytes, ok_range)) != -1 {
+        return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache);
+    }
+    let fours = _mm256_madd_epi16(pairs, _mm256_load_si256((*f).fold4.as_ptr() as *const __m256i));
+    let packed = _mm256_packus_epi32(fours, fours);
+    let halves = _mm256_madd_epi16(packed, _mm256_load_si256((*f).fold2.as_ptr() as *const __m256i));
+    let both = _mm_cvtsi128_si64(_mm256_castsi256_si128(halves)) as u64;
+    // The high half of an F1 value is zero.
+    let seconds = _mm_cvtsi128_si64(_mm256_extracti128_si256(halves, 1)) as u64;
+    let ingest = (seconds * 1000) as i64 + *cache.base_ms.get_unchecked(sb);
+    let ts = ((both & 0xFFFF_FFFF) * (*f).scale + (both >> 32)) as i64 + *cache.base_ms.get_unchecked(sa);
+    if form == 2 {
+        match offset_minutes(tp) {
+            Some(minutes) => return (ts - minutes * 60_000, ingest),
+            None => return parse_ts_ingest_cold(tp, tlen, ip, ilen, cache),
+        }
+    }
+    (ts, ingest)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+pub unsafe fn parse_ts_ingest(
+    tp: *const u8,
+    tlen: usize,
+    ip: *const u8,
+    ilen: usize,
+    cache: &mut DateCache,
+) -> (i64, i64) {
+    (parse_ts(tp, tlen, cache), parse_ingest(ip, ilen, cache))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cold]
+#[inline(never)]
+unsafe fn parse_ts_ingest_cold(
+    tp: *const u8,
+    tlen: usize,
+    ip: *const u8,
+    ilen: usize,
+    cache: &mut DateCache,
+) -> (i64, i64) {
+    (parse_ts_general(tp, tlen, cache), parse_ingest(ip, ilen, cache))
+}
+
+/// The offset of a 25-byte F2 field at `p` (bytes 19..25: a sign, then
+/// `HH:MM`) in minutes east of UTC, or `None` when it is not one.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn offset_minutes(p: *const u8) -> Option<i64> {
+    let t = load64(p.add(17)) >> 16;
+    let sign = (t & 0xFF) as u8;
+    let x = (t >> 8) ^ (u64::from(b':' ^ b'0') << 16) | (ZEROS8 << 40);
+    let d = x.wrapping_sub(ZEROS8);
+    let hh = (d & 0xFF) * 10 + ((d >> 8) & 0xFF);
+    let mm = ((d >> 24) & 0xFF) * 10 + ((d >> 32) & 0xFF);
+    let ok = ((sign == b'+') | (sign == b'-'))
+        & all_digits(x)
+        & ((x >> 16) & 0xFF == u64::from(b'0'))
+        & (hh < 24)
+        & (mm < 60);
+    if !ok {
+        return None;
+    }
+    let minutes = (hh * 60 + mm) as i64;
+    Some(if sign == b'+' { minutes } else { -minutes })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+#[cold]
+#[inline(never)]
+unsafe fn parse_ts_cold(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
+    parse_ts_general(p, len, cache)
+}
+
+/// Any `ts` or `ingest_ts` field, one form at a time: epoch milliseconds,
+/// `BAD` when it is not a timestamp, `i64::MAX` for a digits-only value too
+/// long to matter. This is the path that fills the date cache.
+#[inline(always)]
+pub unsafe fn parse_ts_general(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
     if len == 20 {
-        let v = civil19(p, cache, true);
-        if v != BAD {
+        if let Some(v) = civil19(p, cache, true) {
             return v;
         }
     } else if len == 13 {
@@ -201,13 +529,12 @@ pub unsafe fn parse_ts(p: *const u8, len: usize, cache: &mut DateCache) -> i64 {
         let d = x.wrapping_sub(ZEROS8);
         let hh = (d & 0xFF) * 10 + ((d >> 8) & 0xFF);
         let mm = ((d >> 24) & 0xFF) * 10 + ((d >> 32) & 0xFF);
-        let ok = (v != BAD)
-            & ((sign == b'+') | (sign == b'-'))
+        let ok = ((sign == b'+') | (sign == b'-'))
             & all_digits(x)
             & ((x >> 16) & 0xFF == u64::from(b'0'))
             & (hh < 24)
             & (mm < 60);
-        if ok {
+        if let (Some(v), true) = (v, ok) {
             let offset = ((hh * 60 + mm) * 60_000) as i64;
             return if sign == b'+' { v - offset } else { v + offset };
         }
@@ -262,11 +589,37 @@ mod tests {
         z ^ (z >> 31)
     }
 
+    fn fast_single(text: &[u8], cache: &mut DateCache) -> i64 {
+        let mut buf = text.to_vec();
+        buf.extend_from_slice(&[b'5'; 32]);
+        unsafe { parse_ts(buf.as_ptr(), text.len(), cache) }
+    }
+
     fn fast(text: &[u8], cache: &mut DateCache) -> i64 {
         let mut buf = text.to_vec();
         // Hostile padding: digits and separators after the field must not leak in.
         buf.extend_from_slice(b"9Z:59+0101234567890123456789");
-        unsafe { parse_ts(buf.as_ptr(), text.len(), cache) }
+        let got = unsafe { parse_ts(buf.as_ptr(), text.len(), cache) };
+        // The one-form-at-a-time path (ingest_ts, and the fallback of the
+        // other) must say the same, whatever follows the field.
+        let mut other = text.to_vec();
+        other.extend_from_slice(&[0xFF; 32]);
+        assert_eq!(unsafe { parse_ts_general(other.as_ptr(), text.len(), cache) }, got, "{:?}", String::from_utf8_lossy(text));
+        // And the ingest_ts reader, which says `i64::MAX` for "not one".
+        let ingest = unsafe { parse_ingest(other.as_ptr(), text.len(), cache) };
+        assert_eq!(ingest, if got == BAD { i64::MAX } else { got }, "{:?}", String::from_utf8_lossy(text));
+        // The pair reader, with this field on either side and a partner
+        // that is sometimes fine and sometimes not.
+        for partner in [&b"2026-10-03T23:58:10Z"[..], b"2026-10-32T23:58:10Z", b"1791071890000", b"2026-11-03T19:58:10-04:00", b""] {
+            let want = fast_single(partner, cache);
+            let mut padded = partner.to_vec();
+            padded.extend_from_slice(b"7Z:59+0101234567890123456789012345");
+            let pair = unsafe { parse_ts_ingest(buf.as_ptr(), text.len(), padded.as_ptr(), partner.len(), cache) };
+            assert_eq!(pair, (got, if want == BAD { i64::MAX } else { want }), "{:?}", String::from_utf8_lossy(text));
+            let pair = unsafe { parse_ts_ingest(padded.as_ptr(), partner.len(), other.as_ptr(), text.len(), cache) };
+            assert_eq!(pair, (want, ingest), "{:?}", String::from_utf8_lossy(text));
+        }
+        got
     }
 
     fn check(text: &[u8], cache: &mut DateCache) {
@@ -423,6 +776,38 @@ mod tests {
                     _ => text[at] = subs[(rng(&mut state) % subs.len() as u64) as usize],
                 }
                 check(&text, &mut cache);
+            }
+        }
+    }
+
+    /// Thirteen bytes that are digits or nearly digits (the neighbours of
+    /// '0' and '9', digits with the high bit set, NUL), and the calendar
+    /// forms with every single byte replaced by every byte value: the
+    /// table-driven path and the reference agree, on a cold and a warm cache.
+    #[test]
+    fn near_misses_match_reference() {
+        let mut cache = DateCache::new();
+        let mut state = 77;
+        let odd: &[u8] = b"/:\x00\xb0\xb9 +-\xff";
+        for _ in 0..300_000 {
+            let mut text: Vec<u8> = (0..13).map(|_| b'0' + (rng(&mut state) % 10) as u8).collect();
+            for _ in 0..rng(&mut state) % 3 {
+                let at = (rng(&mut state) % 13) as usize;
+                text[at] = odd[(rng(&mut state) % odd.len() as u64) as usize];
+            }
+            check(&text, &mut cache);
+        }
+        for digits in ["0000000000000", "9999999999999", "0000000000001", "1791071890000", "0001791071890"] {
+            assert_eq!(fast(digits.as_bytes(), &mut cache), digits.parse::<i64>().unwrap());
+        }
+        for base in ["2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "2028-02-29T00:00:00+13:59", "1791071890000"] {
+            for at in 0..base.len() {
+                for byte in 0..=255u8 {
+                    let mut text = base.as_bytes().to_vec();
+                    text[at] = byte;
+                    check(&text, &mut cache);
+                    check(&text, &mut DateCache::new());
+                }
             }
         }
     }
