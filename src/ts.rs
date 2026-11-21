@@ -35,13 +35,31 @@ pub fn parse8(v: u64) -> u64 {
     (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
 }
 
-/// The digits of a field of 1 to 8 bytes, left-padded with '0' to a full
-/// word. Bytes past the field are shifted out.
+/// The digit values (0..=9 a byte) of a field of 1 to 8 bytes, left-padded
+/// with zeros to a full word in `parse_values` order, or `None` unless
+/// every byte of the field is an ASCII digit.
+///
+/// The `'0'` is taken off the whole word before the shift: a borrow only
+/// runs from a byte to the one after it, so the field's bytes see no
+/// borrow from the bytes past it (which the shift drops), and a byte below
+/// `'0'` wraps above 9 itself whatever it does to the next.
 #[inline(always)]
-unsafe fn padded_digits(p: *const u8, len: usize) -> u64 {
+unsafe fn digit_values(p: *const u8, len: usize) -> Option<u64> {
     debug_assert!((1..=8).contains(&len));
-    let shift = 8 * (8 - len as u32);
-    (load64(p) << shift) | (ZEROS8 >> 1 >> (8 * len as u32 - 1))
+    let x = load64(p).wrapping_sub(ZEROS8) << (8 * (8 - len as u32));
+    // Bytes of at most 9 stay below 0x80 after adding 0x76.
+    if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    Some(x)
+}
+
+/// `parse8` of eight digit values (0..=9 a byte) rather than characters.
+#[inline(always)]
+fn parse_values(v: u64) -> u64 {
+    let v = v.wrapping_mul(2561) >> 8;
+    let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
 }
 
 /// Remembers the last two `YYYY-MM-` prefixes seen: the day number before
@@ -571,9 +589,8 @@ fn parse_ts_slow(b: &[u8]) -> i64 {
 #[inline(always)]
 pub unsafe fn parse_price(p: *const u8, len: usize) -> u64 {
     if (1..=8).contains(&len) {
-        let w = padded_digits(p, len);
-        if all_digits(w) {
-            let v = parse8(w);
+        if let Some(w) = digit_values(p, len) {
+            let v = parse_values(w);
             return if v <= MAX_PRICE { v } else { 0 };
         }
         return 0;
@@ -589,11 +606,7 @@ pub unsafe fn canonical_number(p: *const u8, len: usize) -> Option<u32> {
     if !(1..=7).contains(&len) || *p == b'0' {
         return None;
     }
-    let w = padded_digits(p, len);
-    if !all_digits(w) {
-        return None;
-    }
-    Some(parse8(w) as u32)
+    Some(parse_values(digit_values(p, len)?) as u32)
 }
 
 #[cfg(test)]
@@ -872,6 +885,35 @@ mod tests {
             let mut buf = text.as_bytes().to_vec();
             buf.extend_from_slice(b"1234567890123456");
             assert_eq!(unsafe { canonical_number(buf.as_ptr(), text.len()) }, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_numbers_match_reference() {
+        let reference = |b: &[u8]| -> Option<u32> {
+            if !(1..=7).contains(&b.len()) || b[0] == b'0' || !b.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            std::str::from_utf8(b).ok()?.parse().ok()
+        };
+        // Bytes next to the digits, below and above them, and high bytes
+        // whose low seven bits are digits.
+        let alphabet = b"0123456789/:\x00\x7f\xb0\xb9\xff.c_p";
+        let mut state = 11;
+        for _ in 0..300_000 {
+            let len = (rng(&mut state) % 10) as usize;
+            let digits_only = rng(&mut state) % 2 == 0;
+            let case: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = rng(&mut state) as usize;
+                    if digits_only && r % 16 != 0 { b'0' + (r % 10) as u8 } else { alphabet[r % alphabet.len()] }
+                })
+                .collect();
+            for pad in [&[0u8; 16][..], &[0xFF; 16], b"0000000000000000", b"/:/:/:/:/:/:/:/:"] {
+                let mut buf = case.clone();
+                buf.extend_from_slice(pad);
+                assert_eq!(unsafe { canonical_number(buf.as_ptr(), len) }, reference(&case), "{case:?}");
+            }
         }
     }
 }

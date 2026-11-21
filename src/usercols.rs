@@ -41,11 +41,13 @@ struct IdCol {
     /// Rows per dictionary entry.
     runs: Vec<u32>,
     last: u64,
+    /// Rows the last `reserve` made room for.
+    reserved: usize,
 }
 
 impl IdCol {
     fn with_capacity(rows: usize) -> Self {
-        IdCol { dict: Vec::with_capacity(rows * 13), runs: Vec::with_capacity(rows), last: 0 }
+        IdCol { dict: Vec::with_capacity(rows * 13), runs: Vec::with_capacity(rows), last: 0, reserved: 0 }
     }
 
     #[inline(always)]
@@ -74,7 +76,10 @@ impl IdCol {
                 std::ptr::copy_nonoverlapping(buf.as_ptr(), at.add(4), 9);
                 self.dict.set_len(self.dict.len() + 4 + len);
             } else {
+                // A long id takes more than the 13 bytes `reserve` counted
+                // for its row, so make the room again for the rows after it.
                 push_id(&mut self.dict, pkey);
+                self.dict.reserve(self.reserved * 13 + 16);
             }
             put(&mut self.runs, 1);
             self.last = pkey;
@@ -83,6 +88,7 @@ impl IdCol {
 
     /// Room for `rows` more rows: 4 + 9 dictionary bytes a packed id.
     fn reserve(&mut self, rows: usize) {
+        self.reserved = rows;
         self.dict.reserve(rows * 13 + 16);
         self.runs.reserve(rows);
     }
@@ -492,5 +498,41 @@ impl<'a> UserOut<'a> {
         buf.events.clear();
         buf.revenue.clear();
         buf.top.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Long ids take more dictionary room than `reserve` counts per row.
+    /// The room for the packed ids after them must still be there.
+    #[test]
+    fn long_ids_keep_reserved_room() {
+        for long_len in [10usize, 30, 200, 5000] {
+            for long_every in [1usize, 2, 3, 7] {
+                let rows = 100;
+                let mut col = IdCol::default();
+                col.reserve(rows);
+                let mut want = Vec::new();
+                for row in 0..rows {
+                    let id: Vec<u8> = if row % long_every == 0 {
+                        (0..long_len).map(|i| b'a' + ((row + i) % 26) as u8).collect()
+                    } else {
+                        format!("u{row:07}").into_bytes()
+                    };
+                    let left = rows - row;
+                    assert!(
+                        col.dict.capacity() - col.dict.len() >= left * 13,
+                        "no room for {left} rows (long {long_len}, every {long_every})"
+                    );
+                    unsafe { col.push_reserved(ids::pack_slice(&id)) };
+                    assert!(col.dict.len() <= col.dict.capacity());
+                    plain_bytes(&id, &mut want);
+                }
+                assert_eq!(col.dict, want);
+                assert_eq!(col.runs, vec![1u32; rows]);
+            }
+        }
     }
 }
