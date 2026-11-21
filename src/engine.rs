@@ -39,7 +39,7 @@ impl Config {
         let num = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok());
         Config {
             threads: sys::threads(),
-            timing: cfg!(feature = "diag") || std::env::var_os("ENGINE_TIMING").is_some(),
+            timing: std::env::var_os("ENGINE_TIMING").is_some(),
             collect: false,
             chunk_bytes: num("ENGINE_CHUNK_KB").map_or(4 << 20, |kb| (kb as usize) << 10),
             p1_bits: num("ENGINE_P1_BITS"),
@@ -201,8 +201,17 @@ impl<'a> Fast<'a> {
 
 /// user key -> person key (the byte-wise smallest ID of the person), for
 /// every linked ID whose person is not named by that ID itself. A miss
-/// means the ID is its own person. Open addressing, 16-byte slots, on huge
-/// pages where the kernel gives them.
+/// means the ID is its own person. On huge pages where the kernel gives
+/// them.
+///
+/// The table is an array of buckets of one cache line: four keys, then
+/// their four persons. A key lives in the bucket its hash names unless
+/// that bucket was full when it came, in which case it went to the next
+/// one with room. So a lookup reads one line, compares four keys at once,
+/// and goes further only when the bucket is full and does not hold the
+/// key. The table has room for two to four times its keys, so a bucket
+/// holds one to two on average and under 1% of the keys overflow at 1.5 a
+/// bucket, about 4% at 2.
 ///
 /// Most IDs that are looked up are their own person's name and so are not
 /// in the map at all. A small blocked Bloom filter (two bits in one word
@@ -211,10 +220,14 @@ impl<'a> Fast<'a> {
 /// filter miss is exact; a filter hit is always confirmed by the table.
 #[derive(Clone, Copy)]
 pub struct LinkMap {
+    /// During the build of the node ids this memory is a plain table of
+    /// (key, value) slots; the final map reads it as buckets.
     slots: *mut [u64; 2],
+    /// Slots (node id table) or buckets (final map), minus one.
     mask: usize,
-    /// Index of a slot past the table that is always empty: where lookups
-    /// the filter rejected are sent, so the probe needs no extra branch.
+    /// Index of a bucket past the table that is always empty: where
+    /// lookups the filter rejected are sent, so the probe needs no extra
+    /// branch.
     nowhere: usize,
     filter: *mut u64,
     fmask: usize,
@@ -222,18 +235,28 @@ pub struct LinkMap {
 unsafe impl Send for LinkMap {}
 unsafe impl Sync for LinkMap {}
 
+/// Keys in a bucket of the link map: a 64-byte line of keys and persons.
+const BUCKET: usize = 4;
+
 impl LinkMap {
-    /// A table of `cap` slots and a filter sized for `keys` keys.
-    fn with_slots(cap: usize, keys: usize) -> LinkMap {
+    /// A table of `cap` slots, or of `cap` buckets when `bucket` is set, and
+    /// a filter sized for `keys` keys.
+    fn with_slots(cap: usize, keys: usize, bucket: bool) -> LinkMap {
         // Fresh anonymous memory is zero, and 0 is the empty key. One extra
-        // slot at the end stays empty for ever (`nowhere`).
+        // slot or bucket at the end stays empty for ever (`nowhere`).
+        let unit = if bucket { BUCKET * 16 } else { 16 };
         let words = (keys / 8).next_power_of_two().clamp(64, 1 << 21);
         // The filter is small; put it on a 2 MiB boundary so one huge page
         // can back it.
         const HUGE: usize = 2 << 20;
         let raw = sys::anon(words * 8 + HUGE) as usize;
         let filter = ((raw + HUGE - 1) & !(HUGE - 1)) as *mut u64;
-        LinkMap { slots: sys::anon((cap + 1) * 16) as *mut [u64; 2], mask: cap - 1, nowhere: cap, filter, fmask: words - 1 }
+        LinkMap { slots: sys::anon((cap + 1) * unit) as *mut [u64; 2], mask: cap - 1, nowhere: cap, filter, fmask: words - 1 }
+    }
+    /// Bucket `b` of the final map: `BUCKET` keys, then their persons.
+    #[inline(always)]
+    fn bucket(&self, b: usize) -> *mut u64 {
+        unsafe { self.slots.add(b * BUCKET) as *mut u64 }
     }
     #[inline(always)]
     fn home_of(&self, h: u64) -> usize {
@@ -251,8 +274,8 @@ impl LinkMap {
     fn filter_bits(h: u64) -> u64 {
         (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
     }
-    /// Where the lookup of a key with hash `h` starts: its home slot if
-    /// the filter says the key may be present, else the empty slot.
+    /// Where the lookup of a key with hash `h` starts: its home bucket if
+    /// the filter says the key may be present, else the empty bucket.
     #[inline(always)]
     fn start(&self, h: u64) -> usize {
         let bits = Self::filter_bits(h);
@@ -267,8 +290,8 @@ impl LinkMap {
     }
     /// A lookup in three stages, so that a block of them can overlap their
     /// cache misses: `stage1` hashes the key and asks for its filter word,
-    /// `stage2` reads the filter and asks for the table slot (or for the
-    /// empty slot), `stage3` reads the slot and returns the person.
+    /// `stage2` reads the filter and asks for the bucket (or for the empty
+    /// bucket), `stage3` reads the bucket and returns the person.
     #[inline(always)]
     fn stage1(&self, key: u64) -> u64 {
         let h = mix(key);
@@ -278,40 +301,72 @@ impl LinkMap {
     #[inline(always)]
     fn stage2(&self, h: u64) -> usize {
         let i = self.start(h);
-        prefetch(unsafe { self.slots.add(i) });
+        prefetch(self.bucket(i));
         i
+    }
+    /// Which of the bucket's keys equal `key`, as a bit mask.
+    #[inline(always)]
+    unsafe fn matches(b: *const u64, key: u64) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            use core::arch::x86_64::*;
+            let keys = _mm256_load_si256(b as *const __m256i);
+            let eq = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
+            _mm256_movemask_pd(_mm256_castsi256_pd(eq)) as u32
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            let mut m = 0u32;
+            for j in 0..BUCKET {
+                m |= u32::from(*b.add(j) == key) << j;
+            }
+            m
+        }
     }
     #[inline(always)]
     fn stage3(&self, i: usize, key: u64) -> u64 {
-        let s = unsafe { *self.slots.add(i) };
-        // Hit or empty slot is another coin toss; a slot holding some other
-        // key is rare and goes out of line.
-        let found = std::hint::select_unpredictable(s[0] == key, s[1], key);
-        if (s[0] != key) & (s[0] != 0) {
-            return self.person_far(key, i);
+        unsafe {
+            let b = self.bucket(i);
+            let m = Self::matches(b, key);
+            // Hit or miss is another coin toss. A full bucket without the
+            // key is rare and goes out of line.
+            let person = *b.add(BUCKET + (m.trailing_zeros() as usize & (BUCKET - 1)));
+            let found = std::hint::select_unpredictable(m != 0, person, key);
+            if (m == 0) & (*b.add(BUCKET - 1) != 0) {
+                return self.person_far(key, i);
+            }
+            found
         }
-        found
     }
-    /// The rest of the probe sequence after a first slot held another key.
+    /// The rest of the probe sequence after a full bucket without the key.
     #[inline(never)]
     fn person_far(&self, key: u64, first: usize) -> u64 {
         let mut i = (first + 1) & self.mask;
         loop {
-            let s = unsafe { *self.slots.add(i) };
-            if s[0] == key {
-                return s[1];
-            }
-            if s[0] == 0 {
-                return key;
+            unsafe {
+                let b = self.bucket(i);
+                let m = Self::matches(b, key);
+                if m != 0 {
+                    return *b.add(BUCKET + m.trailing_zeros() as usize);
+                }
+                if *b.add(BUCKET - 1) == 0 {
+                    return key;
+                }
             }
             i = (i + 1) & self.mask;
         }
     }
 
     fn build(pairs: &[(u64, u64)]) -> LinkMap {
+        // Room for twice the keys, so a bucket holds one to two on average.
+        Self::build_with_room(pairs, 8)
+    }
+
+    /// `room` is the table's key capacity in quarters of the key count.
+    fn build_with_room(pairs: &[(u64, u64)], room: usize) -> LinkMap {
         // Pass 1: a dense node id per distinct ID, and union-find over them.
         let cap = (pairs.len() * 4).next_power_of_two().max(16);
-        let ids = LinkMap::with_slots(cap, 0);
+        let ids = LinkMap::with_slots(cap, 0, false);
         let mut keys: Vec<u64> = Vec::with_capacity(pairs.len() * 2 + 16);
         let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 2 + 16);
         fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -370,19 +425,28 @@ impl LinkMap {
                 renamed.push([keys[id as usize], keys[root as usize]]);
             }
         }
-        let map = LinkMap::with_slots((renamed.len() * 2).next_power_of_two().max(16), renamed.len());
+        let buckets = (renamed.len() * room / 4).next_power_of_two().max(16) / BUCKET;
+        let map = LinkMap::with_slots(buckets, renamed.len(), true);
         for block in renamed.chunks(16) {
             for pair in block {
-                map.prefetch_home(pair[0]);
+                prefetch(map.bucket(map.home(pair[0])));
             }
             for pair in block {
                 let h = mix(pair[0]);
                 let mut i = map.home_of(h);
                 unsafe {
-                    while (*map.slots.add(i))[0] != 0 {
+                    // Buckets fill from the front and nothing is ever
+                    // removed, so the last key tells whether one is full.
+                    while *map.bucket(i).add(BUCKET - 1) != 0 {
                         i = (i + 1) & map.mask;
                     }
-                    *map.slots.add(i) = *pair;
+                    let b = map.bucket(i);
+                    let mut j = 0;
+                    while *b.add(j) != 0 {
+                        j += 1;
+                    }
+                    *b.add(j) = pair[0];
+                    *b.add(BUCKET + j) = pair[1];
                     *map.filter_word(h) |= Self::filter_bits(h);
                 }
             }
@@ -723,6 +787,12 @@ struct Resolver<'a> {
 }
 
 const PTR_MASK: u64 = (1 << 48) - 1;
+/// Dedup is the first reader of entries the parser wrote with streaming
+/// stores, so they come from memory, and the hardware prefetcher starts
+/// over at every 4 KiB page and every chunk. Measured at 20M events:
+/// 256, 512, 1024 and 2048 bytes ahead give 374, 367, 355 and 366 CPU ms
+/// of dedup against 404 to 415 without.
+const DEDUP_AHEAD: usize = 1024;
 /// Link lookups run in blocks of this many records, one stage at a time.
 const BLOCK: usize = 128;
 
@@ -741,8 +811,14 @@ impl<'a> Resolver<'a> {
         let mask = cap - 1;
         let table = self.table.as_mut_ptr();
         for list in lists {
-            list.for_each_chunk(|chunk| {
+            list.for_each_chunk_ahead(|chunk, next| {
+                let end = chunk.as_ptr().add(chunk.len()) as usize;
                 for entry in chunk.iter_mut() {
+                    // Ask for the entries a little ahead, into the next
+                    // chunk at the end of this one.
+                    let ahead = entry as *const Entry as usize + DEDUP_AHEAD;
+                    let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
+                    prefetch(ahead as *const u8);
                     let h = mix(entry.ekey);
                     let tag = h << 48;
                     let me = entry as *mut Entry;
@@ -841,10 +917,11 @@ impl<'a> Resolver<'a> {
 
 struct PersonPhase<'a> {
     fast: &'a Fast<'a>,
-    // person key -> local id
-    tab_keys: Vec<u64>,
-    tab_ids: Vec<u32>,
-    pkeys: Vec<u64>,
+    /// Person key -> local id: an open-addressing table of `id + 1`, 0 for
+    /// an empty slot, and the keys by `id + 1`. `keys[0]` is 0, which is no
+    /// person, so one compare tells a hit from an empty or foreign slot.
+    tab: Vec<u32>,
+    keys: Vec<u64>,
     counts: Vec<u32>,
     /// Events per time bin, then the write cursor of each bin.
     bins: Vec<u32>,
@@ -862,14 +939,30 @@ struct PersonPhase<'a> {
     ccounts: Vec<u32>,
     cids: Vec<u32>,
     cl: Vec<(u64, u64)>,
-    // sliding window of campaigns with a click in reach
-    cnt: Vec<u32>,
-    pos: Vec<u32>,
-    active: Vec<u32>,
+    /// Per campaign, for the person at hand: how many of its clicks are in
+    /// reach of the current session, and the session and day slot at which
+    /// it came into reach.
+    reach: Vec<[u32; 4]>,
+    /// The person's days so far, in order: the day, and the index of the
+    /// first session of that day. One slot past the last holds `u32::MAX`.
+    slot_day: Vec<u32>,
+    slot_first: Vec<u32>,
+    /// The sessions of the person at hand, when the person has clicks: the
+    /// start on the click clock, the day and the revenue.
+    s_at: Vec<u32>,
+    s_day: Vec<u32>,
+    s_revenue: Vec<u64>,
+    /// Per campaign: the sessions of the person it assists, one bit each
+    /// (people with few sessions only).
+    cover: Vec<u64>,
     catsum: Vec<u64>,
     touched: Vec<u8>,
-    /// (campaign, day) -> [sessions, purchasing, revenue, assisted]
+    /// (campaign, day) -> [sessions, purchasing, revenue, 0]
     agg: Vec<[u64; 4]>,
+    /// (campaign, day) -> assisted sessions. Apart from `agg` and narrow:
+    /// these cells are hit at random, far more often than the others, and
+    /// this way they all stay in the cache.
+    assists: Vec<u32>,
     out: UserOut<'a>,
     /// Summed sessions and revenue of the rows emitted, for the self-check.
     check: (u64, u64),
@@ -888,6 +981,67 @@ struct PersonPhase<'a> {
 /// takes those up to its last event when it closes.
 const BIN_SHIFT: u32 = 20;
 const _: () = assert!((1i64 << BIN_SHIFT) - 1 <= SESSION_GAP_MS);
+
+/// The hash of a person key inside one partition: the top bits of one
+/// multiply. The partition was chosen by `mix`, which shares no constant
+/// with this.
+#[inline(always)]
+fn person_hash(key: u64) -> u64 {
+    key.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+}
+
+/// Sessions are compared with a click eight at a time.
+const LANES: usize = 8;
+/// The most sessions a person can have for their clicks to be attributed
+/// without sorting them (`PersonPhase::few_sessions`).
+const FEW: usize = 32;
+
+/// One click against a block of `LANES` sessions. `at` holds their starts,
+/// `best_t` and `best_c` the time plus one and the campaign of the latest
+/// click in reach of each so far. The click is at `t`, of campaign `camp`,
+/// and reaches the starts in `t..=upto`. All times are under 2^31.
+///
+/// Returns the sessions of the block the click reaches, one bit each, and
+/// whether the click ties with the latest click of a session while being of
+/// another campaign.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32, upto: u32, camp: u32) -> (u64, bool) {
+    use core::arch::x86_64::*;
+    let starts = _mm256_loadu_si256(at as *const __m256i);
+    let before = _mm256_cmpgt_epi32(_mm256_set1_epi32(t as i32), starts);
+    let after = _mm256_cmpgt_epi32(starts, _mm256_set1_epi32(upto as i32));
+    let out = _mm256_or_si256(before, after);
+    let key = _mm256_set1_epi32(t as i32 + 1);
+    let camps = _mm256_set1_epi32(camp as i32);
+    let old_t = _mm256_loadu_si256(best_t as *const __m256i);
+    let old_c = _mm256_loadu_si256(best_c as *const __m256i);
+    let later = _mm256_andnot_si256(out, _mm256_cmpgt_epi32(key, old_t));
+    let same = _mm256_andnot_si256(out, _mm256_cmpeq_epi32(key, old_t));
+    let tie = _mm256_andnot_si256(_mm256_cmpeq_epi32(old_c, camps), same);
+    _mm256_storeu_si256(best_t as *mut __m256i, _mm256_blendv_epi8(old_t, key, later));
+    _mm256_storeu_si256(best_c as *mut __m256i, _mm256_blendv_epi8(old_c, camps, later));
+    let reached = !_mm256_movemask_ps(_mm256_castsi256_ps(out)) as u32 & 0xFF;
+    (u64::from(reached), _mm256_testz_si256(tie, tie) == 0)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32, upto: u32, camp: u32) -> (u64, bool) {
+    let key = t + 1;
+    let (mut reached, mut tie) = (0u64, false);
+    for k in 0..LANES {
+        let start = *at.add(k);
+        let covers = (start >= t) & (start <= upto);
+        reached |= u64::from(covers) << k;
+        let (old_t, old_c) = (*best_t.add(k), *best_c.add(k));
+        let later = covers & (key > old_t);
+        tie |= covers & (key == old_t) & (old_c != camp);
+        *best_t.add(k) = if later { key } else { old_t };
+        *best_c.add(k) = if later { camp } else { old_c };
+    }
+    (reached, tie)
+}
 
 #[inline(always)]
 fn sort_u64(v: &mut [u64]) {
@@ -910,9 +1064,8 @@ impl<'a> PersonPhase<'a> {
     fn new(fast: &'a Fast<'a>, out: UserOut<'a>) -> Self {
         PersonPhase {
             fast,
-            tab_keys: Vec::new(),
-            tab_ids: Vec::new(),
-            pkeys: Vec::new(),
+            tab: Vec::new(),
+            keys: Vec::new(),
             counts: Vec::new(),
             bins: Vec::new(),
             words: Vec::new(),
@@ -924,34 +1077,39 @@ impl<'a> PersonPhase<'a> {
             ccounts: Vec::new(),
             cids: Vec::new(),
             cl: Vec::new(),
-            cnt: vec![0; fast.ncamp],
-            pos: vec![0; fast.ncamp],
-            active: Vec::new(),
+            reach: vec![[0; 4]; fast.ncamp],
+            slot_day: vec![0; fast.ndays + 2],
+            slot_first: vec![0; fast.ndays + 2],
+            s_at: Vec::new(),
+            s_day: Vec::new(),
+            s_revenue: Vec::new(),
+            cover: vec![0; fast.ncamp],
             catsum: vec![0; 256],
             touched: Vec::new(),
             agg: vec![[0; 4]; (fast.ncamp + 1) * fast.ndays],
+            assists: vec![0; (fast.ncamp + 1) * fast.ndays],
             out,
             check: (0, 0),
         }
     }
 
+    /// Double the table and put the `people` keys back in. Returns the new
+    /// shift of the hash.
     #[cold]
     #[inline(never)]
-    fn grow_table(&mut self) {
-        let cap = self.tab_keys.len() * 2;
-        self.tab_keys.clear();
-        self.tab_keys.resize(cap, 0);
-        self.tab_ids.clear();
-        self.tab_ids.resize(cap, 0);
-        let mask = cap - 1;
-        for (id, &key) in self.pkeys.iter().enumerate() {
-            let mut i = (mix(key) >> 8) as usize & mask;
-            while self.tab_keys[i] != 0 {
-                i = (i + 1) & mask;
+    unsafe fn grow_table(tab: &mut Vec<u32>, keys: *const u64, people: usize) -> u32 {
+        let cap = tab.len() * 2;
+        tab.clear();
+        tab.resize(cap, 0);
+        let shift = 64 - cap.trailing_zeros();
+        for id1 in 1..=people {
+            let mut i = (person_hash(*keys.add(id1)) >> shift) as usize;
+            while tab[i] != 0 {
+                i = (i + 1) & (cap - 1);
             }
-            self.tab_keys[i] = key;
-            self.tab_ids[i] = id as u32;
+            tab[i] = id1 as u32;
         }
+        shift
     }
 
     unsafe fn partition(&mut self, evs: &[List<Ev>], cls: &[List<Click>]) {
@@ -961,12 +1119,21 @@ impl<'a> PersonPhase<'a> {
             return;
         }
         let cap = (n / 8).next_power_of_two().max(256);
-        self.tab_keys.clear();
-        self.tab_keys.resize(cap, 0);
-        self.tab_ids.clear();
-        self.tab_ids.resize(cap, 0);
-        self.pkeys.clear();
+        self.tab.clear();
+        self.tab.resize(cap, 0);
+        // At most one person per event. The vectors are filled through
+        // pointers, so the loop below reloads nothing.
+        self.keys.clear();
+        self.keys.reserve(n + 1);
         self.counts.clear();
+        self.counts.reserve(n);
+        let keys = self.keys.as_mut_ptr();
+        let counts = self.counts.as_mut_ptr();
+        *keys = 0;
+        let mut tab = self.tab.as_mut_ptr();
+        let mut mask = cap - 1;
+        let mut shift = 64 - cap.trailing_zeros();
+        let mut people = 0usize;
         // `ts_rel < wlen`, so the last bin is that of `wlen - 1`.
         let nbins = ((self.fast.wlen - 1) >> BIN_SHIFT) as usize + 1;
         self.bins.clear();
@@ -975,6 +1142,7 @@ impl<'a> PersonPhase<'a> {
         self.words.reserve(n);
         self.buys.clear();
         let words = self.words.as_mut_ptr();
+        let bins = self.bins.as_mut_ptr();
         let mut at = 0usize;
 
         // Pass 1: a local id per person, how many events each person has
@@ -982,31 +1150,30 @@ impl<'a> PersonPhase<'a> {
         for list in evs {
             list.for_each_chunk(|chunk| {
                 for rec in chunk.iter() {
-                    let mut mask = self.tab_keys.len() - 1;
-                    let mut i = (mix(rec.pkey) >> 8) as usize & mask;
+                    let mut i = (person_hash(rec.pkey) >> shift) as usize;
                     let id = loop {
-                        let k = *self.tab_keys.get_unchecked(i);
-                        if k == rec.pkey {
-                            break *self.tab_ids.get_unchecked(i);
+                        let id1 = *tab.add(i) as usize;
+                        if *keys.add(id1) == rec.pkey {
+                            break id1 as u32 - 1;
                         }
-                        if k == 0 {
-                            if (self.pkeys.len() + 1) * 2 > self.tab_keys.len() {
-                                self.grow_table();
-                                mask = self.tab_keys.len() - 1;
-                                i = (mix(rec.pkey) >> 8) as usize & mask;
+                        if id1 == 0 {
+                            if (people + 1) * 2 > mask + 1 {
+                                shift = Self::grow_table(&mut self.tab, keys, people);
+                                tab = self.tab.as_mut_ptr();
+                                mask = self.tab.len() - 1;
+                                i = (person_hash(rec.pkey) >> shift) as usize;
                                 continue;
                             }
-                            let id = self.pkeys.len() as u32;
-                            *self.tab_keys.get_unchecked_mut(i) = rec.pkey;
-                            *self.tab_ids.get_unchecked_mut(i) = id;
-                            self.pkeys.push(rec.pkey);
-                            self.counts.push(0);
-                            break id;
+                            *counts.add(people) = 0;
+                            people += 1;
+                            *keys.add(people) = rec.pkey;
+                            *tab.add(i) = people as u32;
+                            break people as u32 - 1;
                         }
                         i = (i + 1) & mask;
                     };
-                    *self.counts.get_unchecked_mut(id as usize) += 1;
-                    *self.bins.get_unchecked_mut((rec.v >> (32 + BIN_SHIFT)) as usize) += 1;
+                    *counts.add(id as usize) += 1;
+                    *bins.add((rec.v >> (32 + BIN_SHIFT)) as usize) += 1;
                     *words.add(at) = (rec.v & !0xFFFF_FFFF) | u64::from(id);
                     at += 1;
                     if rec.v as u32 != 0 {
@@ -1016,7 +1183,8 @@ impl<'a> PersonPhase<'a> {
             });
         }
         self.words.set_len(n);
-        let people = self.pkeys.len();
+        self.keys.set_len(people + 1);
+        self.counts.set_len(people);
         // Pass 2: the whole partition into bin order.
         let mut sum = 0u32;
         for c in self.bins.iter_mut() {
@@ -1080,17 +1248,16 @@ impl<'a> PersonPhase<'a> {
         if nc > 0 {
             self.cids.clear();
             self.cids.reserve(nc);
-            let mask = self.tab_keys.len() - 1;
             for list in cls {
                 list.for_each_chunk(|chunk| {
                     for rec in chunk.iter() {
-                        let mut i = (mix(rec.key) >> 8) as usize & mask;
+                        let mut i = (person_hash(rec.key) >> shift) as usize;
                         let id = loop {
-                            let k = *self.tab_keys.get_unchecked(i);
-                            if k == rec.key {
-                                break *self.tab_ids.get_unchecked(i);
+                            let id1 = *tab.add(i) as usize;
+                            if *keys.add(id1) == rec.key {
+                                break id1 as u32 - 1;
                             }
-                            if k == 0 {
+                            if id1 == 0 {
                                 break u32::MAX;
                             }
                             i = (i + 1) & mask;
@@ -1177,23 +1344,33 @@ impl<'a> PersonPhase<'a> {
         buy_start: usize,
         buy_end: usize,
     ) {
-        let pkey = self.pkeys[p];
+        let pkey = self.keys[p + 1];
         let ev = std::slice::from_raw_parts(self.ev.as_ptr().add(ev_start), ev_end - ev_start);
         let cl = std::slice::from_raw_parts_mut(self.cl.as_mut_ptr().add(cl_start), cl_end - cl_start);
-        if cl.len() > 1 {
-            // By ts, then by click id descending: the last click at or
-            // before a session start is the latest with the smallest id.
-            cl.sort_unstable_by(|a, b| (a.0 >> 32).cmp(&(b.0 >> 32)).then_with(|| cmp_ids(b.1, a.1)));
-        }
         if buy_end - buy_start > 1 {
             // The time is the top half of a value.
             sort_u64(std::slice::from_raw_parts_mut(self.bought.as_mut_ptr().add(buy_start), buy_end - buy_start));
         }
         let mut buy = buy_start;
         let ws_in_day = self.fast.ws_in_day;
+        let ndays = self.fast.ndays;
+        let organic = self.fast.ncamp;
         let gap = SESSION_GAP_MS as u32;
         let n = ev.len();
-        let mut win = (0usize, 0usize);
+        let clicked = !cl.is_empty();
+        if clicked {
+            // Room for every session and a block of padding.
+            for v in [&mut self.s_at, &mut self.s_day] {
+                if v.capacity() < n + LANES {
+                    v.reserve(n + LANES - v.len());
+                }
+            }
+            if self.s_revenue.capacity() < n {
+                self.s_revenue.reserve(n - self.s_revenue.len());
+            }
+        }
+        // Sessions opened and day slots filled so far.
+        let (mut opened, mut slots) = (0u32, 0usize);
         let mut cur_day = u32::MAX;
         let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
         // The open session: its start and the largest time seen in it.
@@ -1234,7 +1411,20 @@ impl<'a> PersonPhase<'a> {
                         buy += 1;
                     }
                     d_revenue += revenue;
-                    self.credit(cl, &mut win, u64::from(start), cur_day as usize, revenue);
+                    if clicked {
+                        // Click times are relative to window_start - 7
+                        // days, so a session start S is S + reach on that
+                        // clock.
+                        let at = opened as usize - 1;
+                        *self.s_at.as_mut_ptr().add(at) = start + CLICK_REACH_MS as u32;
+                        *self.s_day.as_mut_ptr().add(at) = cur_day;
+                        *self.s_revenue.as_mut_ptr().add(at) = revenue;
+                    } else {
+                        let cell = self.agg.get_unchecked_mut(organic * ndays + cur_day as usize);
+                        cell[0] += 1;
+                        cell[1] += u64::from(revenue > 0);
+                        cell[2] += revenue;
+                    }
                 }
                 if i == n {
                     break;
@@ -1249,8 +1439,13 @@ impl<'a> PersonPhase<'a> {
                     d_sessions = 0;
                     d_events = 0;
                     d_revenue = 0;
+                    *self.slot_day.get_unchecked_mut(slots) = day_rel;
+                    *self.slot_first.get_unchecked_mut(slots) = opened;
+                    slots += 1;
+                    *self.slot_first.get_unchecked_mut(slots) = u32::MAX;
                 }
                 d_sessions += 1;
+                opened += 1;
             }
             last = latest;
             d_events += (j - i) as u32;
@@ -1259,59 +1454,200 @@ impl<'a> PersonPhase<'a> {
         if cur_day != u32::MAX {
             self.emit(pkey, cur_day, d_sessions, d_events, d_revenue);
         }
-        for &c in &self.active {
-            *self.cnt.get_unchecked_mut(c as usize) = 0;
+        if clicked {
+            let sessions = opened as usize;
+            // The few-sessions path compares times as signed 32-bit.
+            let narrow = self.fast.cwlen < (1 << 31) - 1;
+            if sessions > FEW || !narrow || !self.few_sessions(cl, sessions, slots) {
+                self.many_sessions(cl, sessions);
+            }
         }
-        self.active.clear();
     }
 
-    /// Credit one finished session to a click and count its assists. `cl`
-    /// is the person's clicks in order, `win` the range of them in reach of
-    /// the previous session; sessions come in order of their start.
+    /// Attribute the clicks of a person with at most `FEW` sessions, the
+    /// clicks in any order. False, with nothing done, if two clicks of
+    /// different campaigns tie for a session: then the click ids decide and
+    /// the caller takes the sorted path.
+    ///
+    /// A click at `t` is in reach of the sessions that start in `t..=t +
+    /// reach`. Each session keeps the latest click in reach, and each
+    /// campaign the set of sessions its clicks reach.
     #[inline(always)]
-    unsafe fn credit(&mut self, cl: &[(u64, u64)], win: &mut (usize, usize), start: u64, day: usize, revenue: u64) {
+    unsafe fn few_sessions(&mut self, cl: &[(u64, u64)], sessions: usize, slots: usize) -> bool {
+        let ndays = self.fast.ndays;
+        let reach = CLICK_REACH_MS as u64;
+        // Whole blocks: past the last session come starts that no click
+        // reaches. A real start is under `LAST - 1` (the caller checked).
+        const LAST: u32 = i32::MAX as u32;
+        let lanes = sessions.div_ceil(LANES) * LANES;
+        let at = self.s_at.as_mut_ptr();
+        for pad in sessions..lanes {
+            *at.add(pad) = LAST;
+        }
+        // Per session: the time of the latest click in reach, plus one, and
+        // its campaign.
+        let mut best_t = [0u32; FEW];
+        let mut best_c = [self.fast.ncamp as u32; FEW];
+        let mut tie = false;
+        for click in cl.iter() {
+            let t = (click.0 >> 32) as u32;
+            let camp = click.0 as u32;
+            let upto = (u64::from(t) + reach).min(u64::from(LAST) - 1) as u32;
+            let mut reached = 0u64;
+            let mut lane = 0;
+            while lane < lanes {
+                let (bits, tied) = click_block(at.add(lane), best_t.as_mut_ptr().add(lane), best_c.as_mut_ptr().add(lane), t, upto, camp);
+                reached |= bits << lane;
+                tie |= tied;
+                lane += LANES;
+            }
+            *self.cover.get_unchecked_mut(camp as usize) |= reached;
+        }
+        if tie {
+            for click in cl.iter() {
+                *self.cover.get_unchecked_mut(click.0 as u32 as usize) = 0;
+            }
+            return false;
+        }
+        // Assists: per campaign and day, the sessions of that day it covers.
+        let mut day_bits = [0u64; FEW + 1];
+        for k in 0..slots {
+            let from = *self.slot_first.get_unchecked(k);
+            let to = (*self.slot_first.get_unchecked(k + 1)).min(sessions as u32);
+            *day_bits.get_unchecked_mut(k) = ((1u64 << to) - 1) & !((1u64 << from) - 1);
+        }
+        for click in cl.iter() {
+            let c = click.0 as u32 as usize;
+            let bits = *self.cover.get_unchecked(c);
+            if bits != 0 {
+                *self.cover.get_unchecked_mut(c) = 0;
+                let row = c * ndays;
+                for k in 0..slots {
+                    let count = (bits & *day_bits.get_unchecked(k)).count_ones();
+                    *self.assists.get_unchecked_mut(row + *self.slot_day.get_unchecked(k) as usize) += count;
+                }
+            }
+        }
+        for k in 0..sessions {
+            let revenue = *self.s_revenue.as_ptr().add(k);
+            let cell = self.agg.get_unchecked_mut(*best_c.get_unchecked(k) as usize * ndays + *self.s_day.as_ptr().add(k) as usize);
+            cell[0] += 1;
+            cell[1] += u64::from(revenue > 0);
+            cell[2] += revenue;
+        }
+        true
+    }
+
+    /// Attribute the clicks of a person with any number of sessions: sort
+    /// the clicks and slide over them, session by session.
+    #[inline(never)]
+    unsafe fn many_sessions(&mut self, cl: &mut [(u64, u64)], sessions: usize) {
+        if cl.len() > 1 {
+            // By ts, then by click id descending: the last click at or
+            // before a session start is the latest with the smallest id.
+            cl.sort_unstable_by(|a, b| (a.0 >> 32).cmp(&(b.0 >> 32)).then_with(|| cmp_ids(b.1, a.1)));
+        }
+        let mut win = Window { lo: 0, hi: 0, session: 0, slot: 0 };
+        for k in 0..sessions {
+            win.session = k as u32;
+            win.slot += u32::from(*self.slot_first.get_unchecked(win.slot as usize + 1) == k as u32);
+            let (at, day, revenue) = (*self.s_at.as_ptr().add(k), *self.s_day.as_ptr().add(k), *self.s_revenue.as_ptr().add(k));
+            self.credit(cl, &mut win, u64::from(at), day as usize, revenue);
+        }
+        // The campaigns still in reach after the last session assisted up
+        // to it.
+        for click in cl.get_unchecked(win.lo..win.hi) {
+            let c = click.0 as u32 as usize;
+            let state = *self.reach.get_unchecked(c);
+            if state[0] != 0 {
+                self.reach.get_unchecked_mut(c)[0] = 0;
+                self.assisted(c, state[1], state[2], sessions as u32);
+            }
+        }
+    }
+
+    /// Credit one session to a click. `cl` is the person's clicks in
+    /// order, `win` the range of them in reach of the previous session, `at`
+    /// the start of the session on the click clock; sessions come in order
+    /// of their start.
+    ///
+    /// Assists are not counted session by session. A campaign assists every
+    /// session from the one at which its count of clicks in reach leaves
+    /// zero to the one at which it returns to zero, so that stretch of
+    /// sessions is counted when it ends, once per day it touches.
+    #[inline(always)]
+    unsafe fn credit(&mut self, cl: &[(u64, u64)], win: &mut Window, at: u64, day: usize, revenue: u64) {
         let ndays = self.fast.ndays;
         let mut credit = self.fast.ncamp;
-        if !cl.is_empty() {
-            let reach = CLICK_REACH_MS as u64;
-            let (mut lo, mut hi) = *win;
-            // Click times are relative to window_start - 7 days, so a
-            // session start S is S + reach on that clock.
-            let upto = start + reach;
-            while hi < cl.len() && (cl.get_unchecked(hi).0 >> 32) <= upto {
+        {
+            let (mut lo, mut hi) = (win.lo, win.hi);
+            let start = at - CLICK_REACH_MS as u64;
+            while hi < cl.len() && (cl.get_unchecked(hi).0 >> 32) <= at {
                 let c = cl.get_unchecked(hi).0 as u32 as usize;
-                if *self.cnt.get_unchecked(c) == 0 {
-                    *self.pos.get_unchecked_mut(c) = self.active.len() as u32;
-                    self.active.push(c as u32);
-                }
-                *self.cnt.get_unchecked_mut(c) += 1;
+                let state = self.reach.get_unchecked_mut(c);
+                let fresh = state[0] == 0;
+                state[1] = if fresh { win.session } else { state[1] };
+                state[2] = if fresh { win.slot } else { state[2] };
+                state[0] += 1;
                 hi += 1;
             }
             while lo < hi && (cl.get_unchecked(lo).0 >> 32) < start {
                 let c = cl.get_unchecked(lo).0 as u32 as usize;
-                *self.cnt.get_unchecked_mut(c) -= 1;
-                if *self.cnt.get_unchecked(c) == 0 {
-                    let at = *self.pos.get_unchecked(c) as usize;
-                    let moved = *self.active.last().unwrap_unchecked();
-                    *self.active.get_unchecked_mut(at) = moved;
-                    *self.pos.get_unchecked_mut(moved as usize) = at as u32;
-                    self.active.pop();
+                let state = self.reach.get_unchecked_mut(c);
+                state[0] -= 1;
+                if state[0] == 0 {
+                    let (from, slot) = (state[1], state[2]);
+                    self.assisted(c, from, slot, win.session);
                 }
                 lo += 1;
             }
             if hi > lo {
                 credit = cl.get_unchecked(hi - 1).0 as u32 as usize;
             }
-            for &c in &self.active {
-                self.agg.get_unchecked_mut(c as usize * ndays + day)[3] += 1;
-            }
-            *win = (lo, hi);
+            win.lo = lo;
+            win.hi = hi;
         }
         let cell = self.agg.get_unchecked_mut(credit * ndays + day);
         cell[0] += 1;
         cell[1] += u64::from(revenue > 0);
         cell[2] += revenue;
     }
+
+    /// Campaign `c` assisted the person's sessions `from..to`; `slot` is the
+    /// day slot of session `from`. Sessions of a day are consecutive, so
+    /// each day gets the length of its overlap with the stretch.
+    #[inline(always)]
+    unsafe fn assisted(&mut self, c: usize, from: u32, slot: u32, to: u32) {
+        let row = c * self.fast.ndays;
+        let mut k = slot as usize;
+        loop {
+            let a = from.max(*self.slot_first.get_unchecked(k));
+            let next = *self.slot_first.get_unchecked(k + 1);
+            let b = to.min(next);
+            *self.assists.get_unchecked_mut(row + *self.slot_day.get_unchecked(k) as usize) += b - a;
+            k += 1;
+            if next >= to {
+                break;
+            }
+        }
+    }
+
+    /// The campaign cells of this thread, assists folded in.
+    fn cells(&mut self) -> Vec<[u64; 4]> {
+        for (cell, &assists) in self.agg.iter_mut().zip(&self.assists) {
+            cell[3] = u64::from(assists);
+        }
+        std::mem::take(&mut self.agg)
+    }
+}
+
+/// The clicks in reach of the session being credited, and where that
+/// session stands among the person's sessions and days.
+struct Window {
+    lo: usize,
+    hi: usize,
+    session: u32,
+    slot: u32,
 }
 
 // ---------------------------------------------------------------- driver
@@ -1338,8 +1674,6 @@ impl Timer {
     fn lap(&mut self, name: &str, cpu: f64) {
         if self.on {
             let now = Instant::now();
-            #[cfg(feature = "diag")]
-            crate::diag::phase(name, (now - self.last).as_secs_f64() * 1e3, cpu * 1e3);
             eprintln!(
                 "[engine] {name:<10} wall {:7.1} ms  cpu {:7.1} ms  (at {:7.1} ms)",
                 (now - self.last).as_secs_f64() * 1e3,
@@ -1557,7 +1891,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                     phase.out.finish();
                     prof::add(9, t0);
                     *cpu_total.lock().unwrap() += sys::thread_cpu();
-                    (phase.agg, phase.out.rows_written, phase.check)
+                    (phase.cells(), phase.out.rows_written, phase.check)
                 })
             })
             .collect();
@@ -1666,24 +2000,35 @@ mod link_tests {
                     parent.insert(hi, lo);
                 }
             }
-            let map = LinkMap::build(&pairs);
-            let mut probes: Vec<u64> = parent.keys().copied().collect();
-            for _ in 0..(2 * pairs_n + 1000) {
-                probes.push(key(&mut state));
-                probes.push(1 + rng(&mut state) % (1 << 62));
-            }
-            probes.push(0);
-            let mut renamed = 0;
-            for block in probes.chunks(BLOCK) {
-                let hashes: Vec<u64> = block.iter().map(|&k| map.stage1(k)).collect();
-                let starts: Vec<usize> = hashes.iter().map(|&h| map.stage2(h)).collect();
-                for (&k, &at) in block.iter().zip(&starts) {
-                    let want = if parent.contains_key(&k) { root(&parent, k) } else { k };
-                    assert_eq!(map.stage3(at, k), want, "round {round} key {k:#x}");
-                    renamed += usize::from(want != k);
+            // The table as the engine builds it (at most half full), and a
+            // denser one (up to 80% full) where far more buckets overflow.
+            for room in [8, 5] {
+                let map = LinkMap::build_with_room(&pairs, room);
+                let mut probes: Vec<u64> = parent.keys().copied().collect();
+                for _ in 0..(2 * pairs_n + 1000) {
+                    probes.push(key(&mut state));
+                    probes.push(1 + rng(&mut state) % (1 << 62));
                 }
+                probes.push(0);
+                let mut renamed = 0;
+                for block in probes.chunks(BLOCK) {
+                    let hashes: Vec<u64> = block.iter().map(|&k| map.stage1(k)).collect();
+                    let starts: Vec<usize> = hashes.iter().map(|&h| map.stage2(h)).collect();
+                    for (&k, &at) in block.iter().zip(&starts) {
+                        let want = if parent.contains_key(&k) { root(&parent, k) } else { k };
+                        assert_eq!(map.stage3(at, k), want, "round {round} room {room} key {k:#x}");
+                        renamed += usize::from(want != k);
+                    }
+                }
+                assert!(pairs_n < 50 || renamed > pairs_n / 4, "round {round}: only {renamed} renamed keys probed");
+                // Keys that are not in their own bucket were found above by
+                // the out-of-line probe; make sure the big round has some.
+                let far = parent
+                    .keys()
+                    .filter(|&&k| root(&parent, k) != k && unsafe { LinkMap::matches(map.bucket(map.home(k)), k) } == 0)
+                    .count();
+                assert!(pairs_n < 100_000 || far > 20, "round {round} room {room}: only {far} keys overflowed");
             }
-            assert!(pairs_n < 50 || renamed > pairs_n / 4, "round {round}: only {renamed} renamed keys probed");
         }
     }
 }

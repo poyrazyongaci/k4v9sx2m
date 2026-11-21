@@ -7,11 +7,6 @@ edition = "2021"
 name = "sessions"
 path = "src/main.rs"
 
-[features]
-# One-off diagnostic build: environment probes and micro-benchmarks on
-# stderr, plus marker rows in user_daily. Never for a scored submission.
-diag = []
-
 [dependencies]
 libc = { version = "0.2", default-features = false }
 
