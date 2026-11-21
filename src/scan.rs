@@ -217,6 +217,128 @@ unsafe fn bad_quotes(bad: *mut u32, mut nbad: usize, at: u32, mut illegal: u64, 
     nbad
 }
 
+/// Stage 1 variants, decided once at start-up (`init_simd`). AVX2 is the
+/// default.
+pub const MODE_AVX2: u8 = 0;
+/// AVX-512 F, BW and VL: one 64-byte load, compares straight to masks.
+pub const MODE_AVX512: u8 = 1;
+/// MODE_AVX512 plus VBMI2 `vpcompressb` for positions and flag bytes.
+pub const MODE_VBMI2: u8 = 2;
+
+static SIMD_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(MODE_AVX2);
+
+#[inline(always)]
+pub fn simd_mode() -> u8 {
+    SIMD_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pick the stage 1 variant for this CPU. 512-bit instructions lower the
+/// clock of the whole core on Skylake and Cascade Lake (measured: parse
+/// +43 ms), so AVX-512 is on by default only where VBMI2 says the core is
+/// Ice Lake or newer. `ENGINE_AVX512=0|1` forces it off or on (on still
+/// needs F, BW and VL); `ENGINE_AVX512_VBMI2=1` adds the `vpcompressb`
+/// variant, and only on a CPU that has VBMI2. Returns the mode.
+pub fn init_simd() -> u8 {
+    #[allow(unused_mut)]
+    let mut mode = MODE_AVX2;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fbw = std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vl")
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("popcnt");
+        let vbmi2 = fbw && std::is_x86_feature_detected!("avx512vbmi2");
+        let on = match std::env::var("ENGINE_AVX512").as_deref() {
+            Ok("0") => false,
+            Ok("1") => fbw,
+            _ => vbmi2,
+        };
+        if on {
+            mode = MODE_AVX512;
+            if vbmi2 && std::env::var("ENGINE_AVX512_VBMI2").is_ok_and(|v| v == "1") {
+                mode = MODE_VBMI2;
+            }
+        }
+    }
+    SIMD_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    mode
+}
+
+/// Tests: whether this CPU can run `mode`.
+#[cfg(test)]
+pub fn can_run(mode: u8) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fbw = std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vl");
+        match mode {
+            MODE_AVX2 => true,
+            MODE_AVX512 => fbw,
+            _ => fbw && std::is_x86_feature_detected!("avx512vbmi2"),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        mode == MODE_AVX2
+    }
+}
+
+/// `masks` with one 64-byte load and three compares into mask registers;
+/// also folds the block into the running signed minimum.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks512(p: *const u8, lowest: &mut core::arch::x86_64::__m512i) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const _);
+    *lowest = _mm512_min_epi8(*lowest, v);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn all_above_zero512(acc: core::arch::x86_64::__m512i) -> bool {
+    use core::arch::x86_64::*;
+    _mm512_cmpgt_epi8_mask(acc, _mm512_setzero_si512()) == u64::MAX
+}
+
+/// Positions and flag bytes of the (at most 16) delimiters of one block:
+/// byte offsets and per-byte flags are packed by `delim` with
+/// `vpcompressb`, widened and stored whole. Writes 16 slots of each.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2")]
+#[inline]
+unsafe fn compress16(out: *mut u32, fout: *mut u8, base_pos: u32, delim: u64, before: u64, after: u64, nm: u64) {
+    use core::arch::x86_64::*;
+    const IOTA: [u8; 64] = {
+        let mut t = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            t[i] = i as u8;
+            i += 1;
+        }
+        t
+    };
+    let iota = _mm512_loadu_si512(IOTA.as_ptr() as *const _);
+    let idx = _mm512_maskz_compress_epi8(delim, iota);
+    let pos = _mm512_add_epi32(_mm512_cvtepu8_epi32(_mm512_castsi512_si128(idx)), _mm512_set1_epi32(base_pos as i32));
+    _mm512_storeu_si512(out as *mut _, pos);
+    let flags = _mm512_or_si512(
+        _mm512_or_si512(_mm512_maskz_set1_epi8(before, CLOSES as i8), _mm512_maskz_set1_epi8(after, OPENS as i8)),
+        _mm512_maskz_set1_epi8(nm, NEWLINE as i8),
+    );
+    let packed = _mm512_maskz_compress_epi8(delim, flags);
+    _mm_storeu_si128(fout as *mut __m128i, _mm512_castsi512_si128(packed));
+}
+
 impl Scan {
     pub fn new(window: usize) -> Self {
         Scan {
@@ -245,7 +367,50 @@ impl Scan {
     /// Scan `len` bytes at `base`. The byte before `base` must be a line
     /// break (or the start of the file), and at least 64 bytes past
     /// `base + len` must be readable.
+    #[inline]
     pub unsafe fn scan(&mut self, base: *const u8, len: usize) {
+        #[cfg(target_arch = "x86_64")]
+        match simd_mode() {
+            MODE_AVX512 => return self.scan512(base, len),
+            MODE_VBMI2 => return self.scan512v(base, len),
+            _ => {}
+        }
+        self.scan_body::<MODE_AVX2>(base, len)
+    }
+
+    /// Tests: `scan` in a given mode, which `can_run` must allow.
+    #[cfg(test)]
+    pub unsafe fn scan_in(&mut self, mode: u8, base: *const u8, len: usize) {
+        #[cfg(target_arch = "x86_64")]
+        match mode {
+            MODE_AVX512 => return self.scan512(base, len),
+            MODE_VBMI2 => return self.scan512v(base, len),
+            _ => {}
+        }
+        let _ = mode;
+        self.scan_body::<MODE_AVX2>(base, len)
+    }
+
+    /// Stage 1 with AVX-512 compares into mask registers (F, BW, VL).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi1,bmi2,popcnt")]
+    unsafe fn scan512(&mut self, base: *const u8, len: usize) {
+        self.scan_body::<MODE_AVX512>(base, len)
+    }
+
+    /// The same, with the positions and flag bytes of up to 16 delimiters
+    /// a block packed by `vpcompressb` (VBMI2: Ice Lake and newer).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi1,bmi2,popcnt")]
+    unsafe fn scan512v(&mut self, base: *const u8, len: usize) {
+        self.scan_body::<MODE_VBMI2>(base, len)
+    }
+
+    /// The scan loop. `MODE` picks how a block becomes masks and how the
+    /// masks become positions; everything else is shared, so the variants
+    /// cannot disagree.
+    #[inline(always)]
+    unsafe fn scan_body<const MODE: u8>(&mut self, base: *const u8, len: usize) {
         debug_assert!(len + 64 + PAD < self.d.len());
         let d = self.d.as_mut_ptr().add(1);
         let fl = self.fl.as_mut_ptr().add(1);
@@ -256,6 +421,8 @@ impl Scan {
         let mut pending = 0u64;
         let mut at = 0usize;
         let mut lowest = lowest_start();
+        #[cfg(target_arch = "x86_64")]
+        let mut lowest512: core::arch::x86_64::__m512i = std::mem::transmute([127i8; 64]);
         *d.sub(1) = u32::MAX;
         *fl.sub(1) = if *base == b'"' { OPENS } else { 0 };
         while at < len {
@@ -263,8 +430,18 @@ impl Scan {
             // and the hardware prefetcher stops at every page end. Without
             // this a third of the scan is spent waiting on the two loads.
             crate::sys::prefetch(base.wrapping_add(at + AHEAD));
-            let (mut cm, mut nm, mut qm) = masks(base.add(at));
-            lowest = lowest_add(lowest, base.add(at));
+            #[cfg(target_arch = "x86_64")]
+            let (mut cm, mut nm, mut qm) = if MODE == MODE_AVX2 {
+                lowest = lowest_add(lowest, base.add(at));
+                masks(base.add(at))
+            } else {
+                masks512(base.add(at), &mut lowest512)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let (mut cm, mut nm, mut qm) = {
+                lowest = lowest_add(lowest, base.add(at));
+                masks(base.add(at))
+            };
             let left = len - at;
             if left < 64 {
                 let keep = (1u64 << left) - 1;
@@ -294,6 +471,13 @@ impl Scan {
 
             let base_pos = at as u32;
             let count = delim.count_ones() as usize;
+            #[cfg(target_arch = "x86_64")]
+            if MODE == MODE_VBMI2 && count <= 16 {
+                compress16(d.add(nd), fl.add(nd), base_pos, delim, before, after, nm);
+                nd += count;
+                at += 64;
+                continue;
+            }
             let mut m = delim;
             let out = d.add(nd);
             let fout = fl.add(nd);
@@ -335,6 +519,11 @@ impl Scan {
         }
         *bad.add(nbad) = u32::MAX;
         self.nd = nd;
+        #[cfg(target_arch = "x86_64")]
+        if MODE != MODE_AVX2 {
+            self.clean = all_above_zero512(lowest512);
+            return;
+        }
         self.clean = lowest_above_zero(lowest);
     }
 }
@@ -663,6 +852,72 @@ mod tests {
                     // line of this window.
                     if p + 1 < n {
                         assert_eq!(flag & OPENS != 0, body[p + 1] == b'"', "round {round} delimiter {k} at {p}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every stage 1 variant this CPU can run gives the AVX2 result exactly:
+    /// positions, flags, illegal quotes, sentinels and `clean`, on soups of
+    /// structural bytes with quotes and delimiters at the 64-byte block
+    /// edges, dense blocks (over 8 and over 16 delimiters), odd bytes, and
+    /// windows of every length mod 64.
+    #[test]
+    fn simd_variants_match() {
+        let modes: Vec<u8> = [MODE_AVX512, MODE_VBMI2].into_iter().filter(|&m| can_run(m)).collect();
+        eprintln!("stage 1 variants checked against AVX2: {modes:?}");
+        let mut state = 77;
+        let mut reference = Scan::new(4096);
+        let mut other = Scan::new(4096);
+        for round in 0..6000 {
+            let n = 1 + (rng(&mut state) % 900) as usize;
+            let alphabet: &[u8] = match round % 6 {
+                0 => b"\",\n",
+                1 => b",,,,,,,\n",
+                2 => b"ab\"\",\n",
+                3 => b"abcdefghij\",",
+                4 => b"\x80\x00a,\"\n\x7f\x01",
+                _ => b"abcdefghijklmnopqrstuvwxyz0123456789\"\"\",,,,,\n",
+            };
+            let mut text = vec![b'\n'];
+            for i in 0..n {
+                // Push structural bytes onto the block edges now and then.
+                let edge = (i % 64 == 63 || i % 64 == 0) && rng(&mut state) % 3 == 0;
+                let c = if edge {
+                    b"\",\n"[(rng(&mut state) % 3) as usize]
+                } else {
+                    alphabet[(rng(&mut state) % alphabet.len() as u64) as usize]
+                };
+                text.push(c);
+            }
+            let tail: &[u8] = if round % 2 == 0 { b"\"" } else { b"a" };
+            for _ in 0..160 {
+                text.push(tail[0]);
+            }
+            unsafe {
+                let base = text.as_ptr().add(1);
+                reference.scan_in(MODE_AVX2, base, n);
+                for &mode in &modes {
+                    other.scan_in(mode, base, n);
+                    assert_eq!(other.nd, reference.nd, "round {round} mode {mode}");
+                    assert_eq!(other.clean, reference.clean, "round {round} mode {mode}");
+                    let nd = reference.nd;
+                    for k in 0..nd + 16 {
+                        assert_eq!(*other.delims().add(k), *reference.delims().add(k), "round {round} mode {mode} slot {k}");
+                    }
+                    assert_eq!(*other.delims().sub(1), *reference.delims().sub(1));
+                    for k in 0..nd {
+                        assert_eq!(*other.flags().add(k), *reference.flags().add(k), "round {round} mode {mode} flag {k}");
+                    }
+                    assert_eq!(*other.flags().sub(1), *reference.flags().sub(1));
+                    let mut k = 0;
+                    loop {
+                        assert_eq!(other.badq[k], reference.badq[k], "round {round} mode {mode} badq {k}");
+                        if reference.badq[k] == u32::MAX {
+                            break;
+                        }
+                        k += 1;
                     }
                 }
             }

@@ -2911,6 +2911,10 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let mut timer = Timer { on: cfg.timing, t0: started, last: started };
     timer.lap("lookups", 0.0);
     prof::ON.store(cfg.timing, Ordering::Relaxed);
+    let simd = crate::scan::init_simd();
+    if cfg.timing {
+        eprintln!("[engine] stage 1 simd mode {simd}");
+    }
     let event_files: Vec<Mapped> = list_csv(&data.join("events")).iter().map(|p| sys::map_file(p)).collect();
     let click_files: Vec<Mapped> = list_csv(&data.join("clicks")).iter().map(|p| sys::map_file(p)).collect();
     let link_files: Vec<Mapped> = list_csv(&data.join("links")).iter().map(|p| sys::map_file(p)).collect();
