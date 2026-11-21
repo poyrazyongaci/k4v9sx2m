@@ -227,6 +227,17 @@ impl<T> List<T> {
             at = (*at).next;
         }
     }
+    /// Append this list's chunks to `out` as `(data, len)`, oldest first:
+    /// the order the records were pushed in.
+    pub unsafe fn chunks_oldest_first(&self, out: &mut Vec<(*const T, usize)>) {
+        let start = out.len();
+        let mut at = self.head;
+        while !at.is_null() {
+            out.push(((at as *const u8).add(HDR) as *const T, (*at).len as usize));
+            at = (*at).next;
+        }
+        out[start..].reverse();
+    }
     /// Hand every chunk's memory to `f`. The list must not be used again.
     pub unsafe fn release(&self, mut f: impl FnMut(*mut u8)) {
         let mut at = self.head;
@@ -278,6 +289,35 @@ unsafe fn stream_lines(src: *const u8, dst: *mut u8, lines: usize) {
 /// move to the partition's current chunk one full buffer at a time, so the
 /// scatter touches one staging line per record, not a chunk tail and a TLB
 /// entry per partition. Chunks are cut from a thread-local arena.
+impl Scatter<u64> {
+    /// Push a run of words to one partition, in order.
+    #[inline(always)]
+    pub unsafe fn push_words(&mut self, p: usize, src: &[u64]) {
+        let mut from = src.as_ptr();
+        let mut len = src.len();
+        let mut n = *self.fill.get_unchecked(p) as usize;
+        let buf = self.stage.add(p * self.stage_bytes);
+        while len > 0 {
+            let take = (self.per - n).min(len);
+            copy_words(from, (buf as *mut u64).add(n), take);
+            n += take;
+            from = from.add(take);
+            len -= take;
+            if n == self.per {
+                n = 0;
+                let mut part = self.parts.as_mut_ptr().add(p);
+                if (*part).dst == (*part).end {
+                    self.grow(p);
+                    part = self.parts.as_mut_ptr().add(p);
+                }
+                stream_lines(buf, (*part).dst, self.stage_bytes / 64);
+                (*part).dst = (*part).dst.add(self.stage_bytes);
+            }
+        }
+        *self.fill.get_unchecked_mut(p) = n as u8;
+    }
+}
+
 pub struct Scatter<T> {
     parts: Vec<Part>,
     /// Records waiting in each staging buffer.
@@ -415,6 +455,32 @@ impl<T: Copy> Scatter<T> {
     }
 }
 
+/// Copy `n` 8-byte words. Inline, so that a short run pays no call into
+/// `memcpy`.
+#[inline(always)]
+pub unsafe fn copy_words(mut src: *const u64, mut dst: *mut u64, mut n: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        while n >= 4 {
+            _mm256_storeu_si256(dst as *mut __m256i, _mm256_loadu_si256(src as *const __m256i));
+            src = src.add(4);
+            dst = dst.add(4);
+            n -= 4;
+        }
+        if n & 2 != 0 {
+            _mm_storeu_si128(dst as *mut __m128i, _mm_loadu_si128(src as *const __m128i));
+            src = src.add(2);
+            dst = dst.add(2);
+        }
+        if n & 1 != 0 {
+            dst.write(src.read());
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
 #[inline(always)]
 pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
@@ -434,7 +500,7 @@ pub fn prefetch<T>(p: *const T) {
 pub mod prof {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    pub const NAMES: [&str; 10] = [
+    pub const NAMES: [&str; 17] = [
         "parse.scan",
         "parse.fields",
         "links.parse",
@@ -445,9 +511,16 @@ pub mod prof {
         "person.group",
         "person.sessions",
         "person.flush",
+        "raw.group",
+        "raw.lookup",
+        "raw.order",
+        "raw.clicks",
+        "raw.sessions",
+        "raw.forward",
+        "raw.recycle",
     ];
     pub static ON: AtomicBool = AtomicBool::new(false);
-    static NANOS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    static NANOS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
     #[inline(always)]
     pub fn start() -> f64 {

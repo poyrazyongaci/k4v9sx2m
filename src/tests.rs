@@ -339,6 +339,176 @@ fn generate(dir: &Path, seed: u64, events: usize) {
     write_parts(&dir.join("links"), "user_id_a,user_id_b", link_parts, seed % 3 == 2);
 }
 
+/// Extra part files for a generated dataset whose lines are far longer than
+/// a scan window (64 KB): a long field in every position, valid and not,
+/// quoted and not, copies of one event among them, and malformed long lines.
+fn add_long_lines(dir: &Path, seed: u64) {
+    let mut r = Rng(seed ^ 0x10C0);
+    let lk = load_lookups(dir);
+    let t = lk.window_start - lk.window_start.rem_euclid(1000) + 3_600_000;
+    let f1 = |ms: i64| format!("{}Z", utc(ms));
+    let mut long = |byte: char| -> String { std::iter::repeat_n(byte, 66_000 + r.below(150_000) as usize).collect() };
+    let row = |fields: &[&str]| -> String { fields.join(",") + "\n" };
+    let quoted = |s: &str| format!("\"{s}\"");
+    let (id_a, id_b, user_y, name_a) = (long('x'), long('w'), long('y'), long('A'));
+    let zeros = long('0');
+    let mut events = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+    // One event with a long id in two copies: the earlier one is kept.
+    events += &row(&[&id_a, "u1", &f1(t), &f1(t + 60_000), "view", "p1", ""]);
+    events += &row(&[&quoted(&id_a), "u2", &f1(t), &f1(t + 120_000), "view", "p1", ""]);
+    // Another whose earliest copy is invalid: the event is dropped.
+    events += &row(&[&id_b, "u1", &f1(t + 1000), &f1(t + 60_000), "view", "p1", ""]);
+    events += &row(&[&id_b, "u1", "2026-10-03 10:00:00Z", &quoted(&f1(t + 30_000)), "view", "p1", ""]);
+    events += &row(&["L1", &user_y, &f1(t), &f1(t + 5000), "purchase", "p2", "250"]);
+    events += &row(&["L2", "u1", &format!("{zeros}{}", t + 7), &f1(t + 5000), "cart", "p3", ""]);
+    events += &row(&["L3", "u2", &f1(t), &format!("{zeros}{}", t + 9000), "view", "p1", ""]);
+    events += &row(&["L3b", "u2", &f1(t), &format!("{zeros}{}", t + 9000 + 2 * DAY_MS), "view", "p1", ""]);
+    events += &row(&["L4", "u1", &f1(t), &f1(t + 5000), &long('v'), "p1", ""]);
+    events += &row(&["L5", "u1", &f1(t + 2000), &f1(t + 5000), "purchase", &quoted(&long('p')), "300"]);
+    events += &row(&["L6", "u2", &f1(t + 3000), &f1(t + 5000), "purchase", "p4", &format!("{zeros}0250")]);
+    events += &row(&["L7", "u2", &f1(t + 4000), &f1(t + 5000), "purchase", "p4", &long('9')]);
+    events += &row(&["L8", "u2", &f1(t + 4000), &long('2'), "view", "p4", ""]);
+    events += &row(&["L9", "u2", &long('T'), &f1(t + 5000), "view", "p4", ""]);
+    // A long copy that takes an event of the generated files over.
+    events += &row(&["e5", &user_y, &f1(t + 60_000), &f1(t - 10 * DAY_MS), "view", "p1", ""]);
+    // Malformed: a field too many, one too few, a quote inside, commas only.
+    events += &row(&["M1", "u1", &f1(t), &f1(t), "view", "p1", "", &long('z')]);
+    events += &row(&["M2", "u1", &f1(t), &f1(t), "view", &long('z')]);
+    events += &row(&["M3", "u1", &f1(t), &f1(t), "view", &format!("{}\"{}", long('q'), long('q')), ""]);
+    events += &row(&["M4", "u1", &f1(t), &f1(t), "view", &format!("\"{}", long('q')), ""]);
+    events += &long(',');
+    events += "\n";
+    events += &row(&["N1", "u1", &f1(t + 300_000), &f1(t + 300_000), "view", "p1", ""]);
+    events += &row(&["N2", &name_a, &f1(t + 9 * 3_600_000), &f1(t + 9 * 3_600_000), "purchase", "p5", "777"]);
+    if seed % 2 == 0 {
+        // The file ends inside a long line.
+        events += &row(&["N3", "u2", &f1(t + 400_000), &f1(t + 400_000), "view", &long('p'), ""]);
+        events.pop();
+    }
+    std::fs::write(dir.join("events/part-90000.csv"), events).unwrap();
+
+    let click_k = long('k');
+    let mut clicks = String::from("click_id,user_id,campaign_id,ts\n");
+    // Two clicks at one instant: the long id is the smaller one and wins.
+    clicks += &row(&[&click_k, "u1", "c_1", &f1(t - 3_600_000)]);
+    clicks += &row(&["kzz", "u1", "c_2", &f1(t - 3_600_000)]);
+    clicks += &row(&["K2", &quoted(&user_y), "c_3", &f1(t - 7_200_000)]);
+    clicks += &row(&["K3", "u1", &long('c'), &f1(t - 60_000)]);
+    clicks += &row(&["K4", "u2", "c_4", &format!("{zeros}{}", t - 1_800_000)]);
+    clicks += &row(&["K5", "u2", "c_5", &long('9')]);
+    clicks += &row(&["K6", "u2", "c_5", &f1(t - 1000), &long('z')]);
+    clicks += &row(&["K7", &name_a, "c_6", &f1(t + 8 * 3_600_000)]);
+    clicks += &long(',');
+    clicks += "\n";
+    clicks += &row(&["K8", "u1", "c_7", &f1(t + 200_000)]);
+    if seed % 2 == 1 {
+        clicks += &row(&[&long('j'), "u2", "c_8", &f1(t + 100_000)]);
+        clicks.pop();
+    }
+    std::fs::write(dir.join("clicks/part-90000.csv"), clicks).unwrap();
+
+    let mut links = String::from("user_id_a,user_id_b\n");
+    links += &row(&[&user_y, "u2"]);
+    links += &row(&["u1", &quoted(&name_a)]);
+    links += &row(&[&long('m'), ""]);
+    links += &row(&[&long('m'), "u1", "u2"]);
+    links += &row(&[&format!("{}\"", long('m')), "u1"]);
+    links += &row(&["u3", "u4"]);
+    if seed % 3 == 0 {
+        links += &row(&[&long('B'), &long('C')]);
+        links.pop();
+    }
+    std::fs::write(dir.join("links/part-90000.csv"), links).unwrap();
+}
+
+/// Lines longer than a scan window take the slice path. Its rows must be
+/// the reference's rows, whatever the chunk size.
+#[test]
+fn long_lines_match_reference() {
+    let root = std::env::temp_dir().join(format!("sessions-long-{}", std::process::id()));
+    let mut long_names = 0;
+    for seed in 0..6u64 {
+        let dir = root.join(format!("s{seed}"));
+        generate(&dir, seed, 300);
+        add_long_lines(&dir, seed);
+        let stats = compare(&dir, &cfg(3, 5000, 2));
+        assert_eq!(compare(&dir, &cfg(1, 4 << 20, 1)), stats);
+        assert_eq!(compare(&dir, &cfg(4, 256, 4)), stats);
+        // Rows named by a long ID (when no shorter ID of the person sorts
+        // before it) show that the long lines reached the output.
+        let lk = load_lookups(&dir);
+        long_names += naive::run(&dir, &lk).user.iter().filter(|row| row.user_id.len() > 60_000).count();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(long_names >= 6, "only {long_names} rows with a long name");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A dataset whose events file has one line with a `hole`-byte product_id
+/// (all NUL bytes), written as a sparse file. `false` when the file system
+/// stored the hole for real.
+fn giant_line_dataset(dir: &Path, hole: u64) -> bool {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::fs::remove_dir_all(dir);
+    for sub in ["events", "clicks", "links"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::write(
+        dir.join("manifest.json"),
+        "{\"window_start\": \"2026-10-01T00:00:00Z\", \"window_end\": \"2026-10-15T00:00:00Z\"}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\n").unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\n").unwrap();
+    std::fs::write(dir.join("clicks/part-00000.csv"), "click_id,user_id,campaign_id,ts\nk1,u1,c_1,2026-10-03T09:00:00Z\n").unwrap();
+    std::fs::write(dir.join("links/part-00000.csv"), "user_id_a,user_id_b\nu4,u5\n").unwrap();
+    let path = dir.join("events/part-00000.csv");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n").unwrap();
+    file.write_all(b"e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:00:05Z,purchase,p1,500\n").unwrap();
+    // The giant line is the kept copy of g1: a later, ordinary copy names
+    // another user, so losing the giant line moves the event to `u3`.
+    file.write_all(b"g1,u1,2026-10-05T10:01:00Z,2026-10-05T10:01:05Z,view,").unwrap();
+    file.seek(SeekFrom::Current(hole as i64)).unwrap();
+    file.write_all(b",\n").unwrap();
+    file.write_all(b"g1,u3,2026-10-05T10:01:00Z,2026-10-05T10:01:09Z,view,p1,\n").unwrap();
+    file.write_all(b"e2,u2,2026-10-04T10:00:00Z,2026-10-04T10:00:05Z,purchase,p2,700\n").unwrap();
+    drop(file);
+    let meta = std::fs::metadata(&path).unwrap();
+    assert!(meta.len() > hole);
+    meta.blocks() * 512 < (64 << 20)
+}
+
+fn giant_line_case(hole: u64) {
+    let dir = std::env::temp_dir().join(format!("sessions-giant-{}-{}", std::process::id(), hole >> 20));
+    if !giant_line_dataset(&dir, hole) {
+        eprintln!("no sparse files here, skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let stats = compare(&dir, &cfg(4, 4 << 20, 2));
+    // u1 has two days (the purchase and the giant view), u2 one; no u3.
+    assert_eq!(stats[0], 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The rules set no maximum line length. One line of over 1 GiB (which the
+/// engine used to skip) is an ordinary event. The input is a sparse file,
+/// so it costs no disk; the reference still reads it into memory.
+#[test]
+fn line_over_one_gib_matches_reference() {
+    giant_line_case((1 << 30) + 4097);
+}
+
+/// The same past 4 GiB, where a 32-bit offset would wrap. Costs 5 GiB of
+/// memory for the reference, so it only runs on request.
+#[test]
+#[ignore]
+fn line_over_four_gib_matches_reference() {
+    giant_line_case((5 << 30) + 4097);
+}
+
 #[test]
 fn random_datasets_match_reference() {
     let root = std::env::temp_dir().join(format!("sessions-fuzz-{}", std::process::id()));
@@ -433,5 +603,220 @@ fn bin_edges_match_reference() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     assert!(sessions > 2_000, "only {sessions} sessions");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- where identity is resolved
+//
+// The engine looks a person up once per raw user, not once per event: a
+// user in no link is finished where it lands, every linked user is
+// forwarded to the partition of its person's name as one run of words. The
+// tests below aim at that path.
+
+/// A dataset with a 14-day window from 2026-10-01, four products and three
+/// campaigns. `events`, `clicks` and `links` are the rows without headers.
+fn write_case(dir: &Path, events: &str, clicks: &str, links: &str) -> i64 {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+    let we = ws + 14 * DAY_MS;
+    std::fs::write(
+        dir.join("manifest.json"),
+        format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(we)),
+    )
+    .unwrap();
+    std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\np3,a\np4,shoes\n").unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+    for (name, header, body) in [
+        ("events", "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", events),
+        ("clicks", "click_id,user_id,campaign_id,ts", clicks),
+        ("links", "user_id_a,user_id_b", links),
+    ] {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(dir.join(name).join("part-0.csv"), format!("{header}\n{body}")).unwrap();
+    }
+    ws
+}
+
+/// One event row: a view of `p1` by `user` at `ts`, ingested `after` ms
+/// later.
+fn view(id: &str, user: &str, ts: i64, after: i64) -> String {
+    format!("{id},{user},{ts},{}Z,view,p1,\n", utc(ts + after))
+}
+
+/// Hand-made cases, with the answer written out: the reference must agree,
+/// and so must the counts below.
+#[test]
+fn identity_cases_match_reference() {
+    let dir = std::env::temp_dir().join(format!("sessions-identity-{}", std::process::id()));
+    let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+    let (day, hour) = (DAY_MS, 3_600_000i64);
+    let links = "a1,b1\nb2,a2\nm3,n3\np4,q4\na5,b5\nd5,e5\n";
+    let mut events = String::new();
+    // A session of the name, clicked under the renamed ID, and the reverse.
+    events += &view("x1", "a1", ws + day + 10 * hour, 1000);
+    events += &view("x2", "b2", ws + day + 10 * hour, 1000);
+    // The name `m3` has no events of its own.
+    events += &view("x3", "n3", ws + 2 * day, 1000);
+    // Copies under two users of ONE person. The earliest is invalid: the
+    // event is gone. The earliest is valid: one event, once.
+    events += &format!("x4,a5,bad,{}Z,view,p1,\n", utc(ws + 3 * day + 1000));
+    events += &view("x4", "b5", ws + 3 * day, 2000);
+    events += &view("x5", "a5", ws + 3 * day + hour, 1000);
+    events += &view("x5", "b5", ws + 3 * day + hour, 3000);
+    // Copies under users of DIFFERENT persons: `c5` is in no link, `e5` is
+    // `d5`. Earliest invalid, earliest under `e5`, earliest under `c5`.
+    events += &format!("x6,c5,{},{}Z,view,,\n", ws + 6 * day, utc(ws + 6 * day + 1000));
+    events += &view("x6", "e5", ws + 6 * day, 2000);
+    events += &view("x7", "e5", ws + 4 * day, 1000);
+    events += &view("x7", "c5", ws + 4 * day, 2000);
+    events += &view("x8", "c5", ws + 5 * day, 1000);
+    events += &view("x8", "e5", ws + 5 * day, 2000);
+    let mut clicks = String::new();
+    clicks += &format!("k1,b1,c_1,{}\n", ws + day + 9 * hour);
+    clicks += &format!("k2,a2,c_2,{}\n", ws + day + 9 * hour);
+    // A person with clicks under every ID and no event: no session, no row.
+    clicks += &format!("k3,p4,c_1,{}\nk4,q4,c_2,{}\n", ws + day, ws + day);
+    // Under the name `d5`, which has no events: credits the session of `e5`.
+    clicks += &format!("k5,d5,c_3,{}\n", ws + 4 * day - hour);
+    // Under `e5`, an hour before the session of `c5`, who is someone else.
+    clicks += &format!("k6,e5,c_1,{}\n", ws + 5 * day - hour);
+    for (threads, chunk, bits) in [(1, 4 << 20, 1), (4, 256, 4), (3, 5000, 2), (2, 4096, 6)] {
+        write_case(&dir, &events, &clicks, links);
+        let stats = compare(&dir, &cfg(threads, chunk, bits));
+        // Rows: a1, a2, m3, a5, d5, c5, one session each. Credited: x1 to
+        // c_1, x2 to c_2, x7 to c_3, each assisted once.
+        assert_eq!(stats, [6, 0, 6, 3, 3], "threads {threads} bits {bits}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Thousands of IDs joined into one person through a shared device ID, and
+/// a chain of 50,000 links in a shuffled order. Events and clicks sit on
+/// IDs all along both; neither name has events of its own.
+#[test]
+fn device_and_chain_match_reference() {
+    let dir = std::env::temp_dir().join(format!("sessions-device-{}", std::process::id()));
+    let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+    let span = (14 * DAY_MS) as u64;
+    let mut r = Rng(77);
+    let mut pairs: Vec<String> = Vec::new();
+    let (mut events, mut clicks) = (String::new(), String::new());
+    let (mut n, mut k) = (0, 0);
+    // `D0` sorts before every `d<i>`: the device ID is the name.
+    for i in 0..3000 {
+        pairs.push(if r.chance(2) { format!("d{i},D0\n") } else { format!("D0,d{i}\n") });
+        for _ in 0..r.below(8) / 6 {
+            events += &view(&format!("v{n}"), &format!("d{i}"), ws + (r.below(span / 1000) * 1000) as i64, 1000);
+            n += 1;
+        }
+        if r.chance(3) {
+            clicks += &format!("k{k},d{i},c_{},{}\n", 1 + r.below(3), ws + r.below(span) as i64);
+            k += 1;
+        }
+    }
+    // `c0` is the smallest ID of the chain and has no events.
+    for i in 0..50_000 {
+        pairs.push(format!("c{},c{i}\n", i + 1));
+        if i > 0 && i % 97 == 0 {
+            events += &view(&format!("v{n}"), &format!("c{i}"), ws + (r.below(span / 1000) * 1000) as i64, 1000);
+            n += 1;
+        }
+        if i % 91 == 5 {
+            clicks += &format!("k{k},c{i},c_{},{}\n", 1 + r.below(3), ws + r.below(span) as i64);
+            k += 1;
+        }
+    }
+    events += &view(&format!("v{n}"), "c50000", ws + 5000, 1000);
+    // Somebody in no link, so the two big people are not alone.
+    events += &view("solo", "s1", ws + 7000, 1000);
+    for i in (1..pairs.len()).rev() {
+        pairs.swap(i, r.below(i as u64 + 1) as usize);
+    }
+    let links: String = pairs.concat();
+    for (threads, chunk, bits) in [(4, 4 << 20, 3), (1, 1 << 16, 1), (3, 5000, 5)] {
+        write_case(&dir, &events, &clicks, &links);
+        let stats = compare(&dir, &cfg(threads, chunk, bits));
+        // Three people: the device, the chain and `s1`. A row a day at
+        // most for each, and the two big ones have hundreds of sessions.
+        assert!((3..=14 + 14 + 1).contains(&stats[0]), "threads {threads} bits {bits}: {stats:?}");
+        assert!(stats[2] > 100 && stats[3] > 50, "threads {threads} bits {bits}: {stats:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs that cross chunks: a few people with several busy IDs (runs longer
+/// than a chunk, odd and even counts, purchases), names with no events of
+/// their own, an ID linked only to itself, event copies that name another
+/// user, and clicks under IDs with no events (a linked person with events
+/// elsewhere, a linked person with none, and nobody at all).
+#[test]
+fn forwarded_runs_match_reference() {
+    let root = std::env::temp_dir().join(format!("sessions-runs-{}", std::process::id()));
+    let mut totals = [0i64; 5];
+    for seed in 0..6u64 {
+        let mut r = Rng(seed + 5000);
+        let dir = root.join(format!("r{seed}"));
+        let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+        let span = (14 * DAY_MS) as u64;
+        // (user, events). `w<k>0` sorts first, so it is the name of person k.
+        let sizes = [5000usize, 4999, 1, 2, 7001, 2041, 0, 33];
+        let mut users: Vec<(String, usize)> = Vec::new();
+        let mut links = String::new();
+        for k in 0..4usize {
+            for j in 0..=2 + k {
+                let events = if j == 0 { [0, 3, 0, 4500][k] } else { sizes[(k * 3 + j + seed as usize) % sizes.len()] };
+                users.push((format!("w{k}{j}"), events));
+                if j > 0 {
+                    // A chain when k is odd, a star when it is even.
+                    let to = if k % 2 == 1 { j - 1 } else { 0 };
+                    links += &format!("w{k}{j},w{k}{to}\n");
+                }
+            }
+        }
+        for s in 0..40 {
+            users.push((format!("s{s}"), 1 + r.below(20) as usize));
+        }
+        users.push(("t0".into(), 9));
+        links += "t0,t0\nz0,z1\nz2,w10\n";
+        let silent = ["z0", "z1", "z2", "y0", "w00", "w20"];
+        let mut events = String::new();
+        let mut n = 0;
+        for (who, count) in &users {
+            for _ in 0..*count {
+                let t = ws + r.below(span) as i64;
+                let ingest = t - t.rem_euclid(1000) + 2000;
+                let kind = if r.chance(20) { "purchase" } else { "view" };
+                let row = format!("{kind},p{},{}\n", 1 + r.below(5), 100 + r.below(900));
+                events += &format!("r{n},{who},{t},{}Z,{row}", utc(ingest));
+                if r.chance(40) {
+                    // A copy under another user: later, so it loses, or
+                    // earlier, so the event moves to that user.
+                    let other = &users[r.below(users.len() as u64) as usize].0;
+                    let shift = if r.chance(2) { 1000 } else { -1000 };
+                    events += &format!("r{n},{other},{t},{}Z,{row}", utc(ingest + shift));
+                }
+                n += 1;
+            }
+        }
+        let mut clicks = String::new();
+        for k in 0..3000 {
+            let who = if r.chance(5) {
+                silent[r.below(silent.len() as u64) as usize].to_string()
+            } else {
+                users[r.below(users.len() as u64) as usize].0.clone()
+            };
+            let t = ws - CLICK_REACH_MS + r.below(span + CLICK_REACH_MS as u64) as i64;
+            clicks += &format!("k{k},{who},c_{},{t}\n", 1 + r.below(3));
+        }
+        write_case(&dir, &events, &clicks, &links);
+        let (threads, chunk, bits) = [(3, 5000, 1), (4, 1 << 20, 2), (1, 4096, 3)][(seed % 3) as usize];
+        let stats = compare(&dir, &cfg(threads, chunk, bits));
+        for i in 0..5 {
+            totals[i] += stats[i];
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(totals[2] > 1_500 && totals[1] > 100 && totals[3] > 1_000, "{totals:?}");
     let _ = std::fs::remove_dir_all(&root);
 }

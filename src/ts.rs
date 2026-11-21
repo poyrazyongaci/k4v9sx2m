@@ -58,8 +58,17 @@ pub struct DateCache {
 }
 
 impl DateCache {
+    /// Both slots start out holding real months. A slot is trusted whenever
+    /// its key matches, and every eight bytes are a possible field prefix,
+    /// so there is no key that could stand for "empty": a zeroed slot would
+    /// accept eight NUL bytes as a month whose only day is the 1st.
     pub fn new() -> Self {
-        DateCache { lim: [[0; 8]; 2], key: [0; 2], base_ms: [0; 2], next: 0 }
+        let mut cache = DateCache { lim: [[0; 8]; 2], key: [0; 2], base_ms: [0; 2], next: 0 };
+        for month in [b"1970-01-", b"1970-02-"] {
+            let filled = cache.fill(u64::from_le_bytes(*month));
+            assert!(filled);
+        }
+        cache
     }
 
     #[cold]
@@ -319,6 +328,40 @@ mod tests {
             assert_eq!(fast(bad.as_bytes(), &mut cache), BAD, "{bad:?}");
             assert_eq!(parse_ts_naive(bad.as_bytes()), None, "{bad:?}");
         }
+    }
+
+    /// A fresh cache knows no month that is not one. Eight NUL bytes used
+    /// to match its zeroed keys and parse as 1970-01-02.
+    #[test]
+    fn fresh_cache_rejects_odd_prefixes() {
+        let tails: [&[u8]; 4] = [b"01T00:00:00Z", b"01T00:00:00+00:00", b"00T00:00:00Z", b"02T23:59:59-01:30"];
+        let mut prefixes: Vec<[u8; 8]> = vec![[0; 8], [0xFF; 8], [b' '; 8], [b'0'; 8], [b'-'; 8], *b"0000-00-", *b"\0\0\0\0-\0\0-"];
+        for byte in [0u8, 1, b'0', b'-', 0x80] {
+            for at in 0..8 {
+                let mut p = *b"1970-01-";
+                p[at] = byte;
+                prefixes.push(p);
+                let mut p = [0u8; 8];
+                p[at] = byte;
+                prefixes.push(p);
+            }
+        }
+        for prefix in prefixes {
+            for tail in tails {
+                let text = [&prefix[..], tail].concat();
+                // A new cache each time: the first lookup is the one at risk.
+                check(&text, &mut DateCache::new());
+                let mut warm = DateCache::new();
+                check(b"2026-10-03T23:58:10Z", &mut warm);
+                check(&text, &mut warm);
+            }
+        }
+        let nul = b"\0\0\0\0\0\0\0\001T00:00:00Z";
+        assert_eq!(fast(nul, &mut DateCache::new()), BAD);
+        // The months a cache starts with are real ones.
+        assert_eq!(fast(b"1970-01-01T00:00:00Z", &mut DateCache::new()), 0);
+        assert_eq!(fast(b"1970-02-28T00:00:01Z", &mut DateCache::new()), 58 * DAY_MS + 1000);
+        assert_eq!(fast(b"1970-02-29T00:00:00Z", &mut DateCache::new()), BAD);
     }
 
     #[test]
