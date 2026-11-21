@@ -605,6 +605,7 @@ impl<'a> DensePhase<'a> {
 
         let t = prof::add(7, t);
         let (mut ev_start, mut cl_start, mut buy_start) = (0usize, 0usize, 0usize);
+        ph.reserve_rows(people);
         for k in 0..people {
             let ev_end = ph.counts[k] as usize;
             let cl_end = if nc > 0 { ph.ccounts[k] as usize } else { 0 };

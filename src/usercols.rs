@@ -59,12 +59,58 @@ impl IdCol {
         }
     }
 
+    /// `push` with no capacity checks: `reserve(rows)` came first.
+    #[inline(always)]
+    unsafe fn push_reserved(&mut self, pkey: u64) {
+        let runs = self.runs.len();
+        if pkey == self.last && runs != 0 {
+            *self.runs.as_mut_ptr().add(runs - 1) += 1;
+        } else {
+            if pkey & FALLBACK == 0 {
+                let mut buf = [0u8; 16];
+                let len = ids::unpack_packed(pkey, &mut buf);
+                let at = self.dict.as_mut_ptr().add(self.dict.len());
+                (at as *mut u32).write_unaligned((len as u32).to_le());
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), at.add(4), 9);
+                self.dict.set_len(self.dict.len() + 4 + len);
+            } else {
+                push_id(&mut self.dict, pkey);
+            }
+            put(&mut self.runs, 1);
+            self.last = pkey;
+        }
+    }
+
+    /// Room for `rows` more rows: 4 + 9 dictionary bytes a packed id.
+    fn reserve(&mut self, rows: usize) {
+        self.dict.reserve(rows * 13 + 16);
+        self.runs.reserve(rows);
+    }
+
     /// The data page body: bit width, then one run per dictionary entry.
     fn encode(&self, out: &mut Vec<u8>) {
         let width = bits(self.runs.len().max(2) - 1);
         out.push(width as u8);
-        for (index, &count) in self.runs.iter().enumerate() {
-            rle_run(count as usize, index as u32, width, out);
+        // `rle_run` per entry, into reserved room: a varint of at most 5
+        // bytes (count < 2^32), then the index in `width / 8` rounded up
+        // bytes, stored as 4 and kept as many as needed.
+        let value_bytes = width.div_ceil(8) as usize;
+        out.reserve(self.runs.len() * 9);
+        unsafe {
+            let base = out.as_mut_ptr().add(out.len());
+            let mut p = base;
+            for (index, &count) in self.runs.iter().enumerate() {
+                let mut v = u64::from(count) << 1;
+                while v >= 0x80 {
+                    *p = (v as u8) | 0x80;
+                    p = p.add(1);
+                    v >>= 7;
+                }
+                *p = v as u8;
+                (p.add(1) as *mut u32).write_unaligned((index as u32).to_le());
+                p = p.add(1 + value_bytes);
+            }
+            out.set_len(out.len() + p.offset_from(base) as usize);
         }
     }
 
@@ -114,6 +160,27 @@ pub struct UserOut<'a> {
     scratch: [Vec<u8>; 6],
     flush_rows: usize,
     pub rows_written: u64,
+}
+
+/// Append to a vector whose capacity is known to suffice.
+#[inline(always)]
+unsafe fn put<T>(v: &mut Vec<T>, x: T) {
+    let len = v.len();
+    v.as_mut_ptr().add(len).write(x);
+    v.set_len(len + 1);
+}
+
+impl Compact {
+    fn reserve(&mut self, rows: usize, with_revenue: bool) {
+        self.ids.reserve(rows);
+        self.day.reserve(rows);
+        self.sessions.reserve(rows);
+        self.events.reserve(rows);
+        if with_revenue {
+            self.revenue.reserve(rows);
+            self.top.reserve(rows);
+        }
+    }
 }
 
 #[inline(always)]
@@ -184,19 +251,35 @@ impl<'a> UserOut<'a> {
         }
     }
 
+    /// Room for `rows` more compact rows of either kind, so `push` needs no
+    /// capacity checks until the next call.
+    pub fn reserve(&mut self, rows: usize) {
+        self.quiet.reserve(rows, false);
+        self.buying.reserve(rows, true);
+    }
+
     /// One row. `top` is a category id, or 0xFF when the day has no
-    /// purchase (and then `revenue` is 0).
+    /// purchase (and then `revenue` is 0). `reserve` must have made room
+    /// for it.
     #[inline(always)]
     pub fn push(&mut self, pkey: u64, day_rel: u32, sessions: u32, events: u32, revenue: u64, top: u8) {
         if sessions < MAX_SESSIONS && events < MAX_EVENTS && revenue <= i32::MAX as u64 && day_rel < 256 {
-            let buf = if top == 0xFF { &mut self.quiet } else { &mut self.buying };
-            buf.ids.push(pkey);
-            buf.day.push(day_rel as u8);
-            buf.sessions.push(sessions as u8);
-            buf.events.push(events as u8);
-            if top != 0xFF {
-                buf.revenue.push(revenue as i32);
-                buf.top.push(top);
+            unsafe {
+                if top == 0xFF {
+                    let buf = &mut self.quiet;
+                    buf.ids.push_reserved(pkey);
+                    put(&mut buf.day, day_rel as u8);
+                    put(&mut buf.sessions, sessions as u8);
+                    put(&mut buf.events, events as u8);
+                } else {
+                    let buf = &mut self.buying;
+                    buf.ids.push_reserved(pkey);
+                    put(&mut buf.day, day_rel as u8);
+                    put(&mut buf.sessions, sessions as u8);
+                    put(&mut buf.events, events as u8);
+                    put(&mut buf.revenue, revenue as i32);
+                    put(&mut buf.top, top);
+                }
             }
         } else {
             let buf = &mut self.wide;

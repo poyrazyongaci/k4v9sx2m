@@ -383,22 +383,39 @@ pub fn bitpack_run(values: impl Iterator<Item = u32>, count: usize, width: u32, 
     }
     out.push(v as u8);
     let start = out.len();
-    out.reserve(groups * width as usize + 8);
+    let total = groups * width as usize;
+    // Room for the packed bytes plus one 8-byte store past them. Values are
+    // collected 32 bits at a time and stored without capacity checks.
+    out.reserve(total + 8);
+    debug_assert!(width <= 32);
     let mut acc: u64 = 0;
     let mut bits = 0u32;
-    for value in values {
-        acc |= u64::from(value) << bits;
-        bits += width;
-        while bits >= 8 {
-            out.push(acc as u8);
-            acc >>= 8;
-            bits -= 8;
+    let mut n = 0usize;
+    unsafe {
+        let base = out.as_mut_ptr().add(start);
+        let mut p = base;
+        for value in values {
+            debug_assert!(n < count && u64::from(value) >> width == 0);
+            n += 1;
+            acc |= u64::from(value) << bits;
+            bits += width;
+            if bits >= 32 {
+                (p as *mut u32).write_unaligned((acc as u32).to_le());
+                p = p.add(4);
+                acc >>= 32;
+                bits -= 32;
+            }
         }
+        // The rest of the bits, then zeros up to the whole groups. Bits of
+        // `acc` above `bits` are zero, so the 8-byte store writes zeros.
+        (p as *mut u64).write_unaligned(acc.to_le());
+        let written = p.offset_from(base) as usize + 8;
+        for i in written.min(total)..total {
+            *base.add(i) = 0;
+        }
+        out.set_len(start + total);
     }
-    if bits > 0 {
-        out.push(acc as u8);
-    }
-    out.resize(start + groups * width as usize, 0);
+    debug_assert!(n <= count);
 }
 
 /// One RLE run of the hybrid encoding: `count` copies of `value`.

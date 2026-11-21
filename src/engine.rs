@@ -1528,6 +1528,7 @@ impl<'a> Resolver<'a> {
         let links = *self.links;
         let shift2 = self.shift2;
         let ev = &mut self.ev;
+        let hot = ev.hot();
         let mut hashes = [0u64; BLOCK];
         let mut starts = [0usize; BLOCK];
         for list in lists {
@@ -1554,7 +1555,7 @@ impl<'a> Resolver<'a> {
                     for (&at, entry) in starts.iter().zip(block) {
                         if entry.w3 != DEAD {
                             let pkey = links.stage3(at, entry.ukey);
-                            ev.push((mix1(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                            ev.push_hot(&hot, (mix1(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
                         }
                     }
                 }
@@ -1585,6 +1586,7 @@ impl<'a> Resolver<'a> {
         let links = *self.links;
         let shift2 = self.shift2;
         let cl = &mut self.cl;
+        let hot = cl.hot();
         let mut hashes = [0u64; BLOCK];
         let mut starts = [0usize; BLOCK];
         for part in block.chunks(BLOCK) {
@@ -1598,7 +1600,7 @@ impl<'a> Resolver<'a> {
             }
             for (&at, click) in starts.iter().zip(part) {
                 let pkey = links.stage3(at, click.key);
-                cl.push((mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+                cl.push_hot(&hot, (mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
             }
         }
         // The block is dead now. Its pages are faulted in already, so its
@@ -1845,6 +1847,9 @@ struct PersonPhase<'a> {
     out: UserOut<'a>,
     /// Summed sessions and revenue of the rows emitted, for the self-check.
     check: (u64, u64),
+    /// Person records may be marked `DEAD` (one-pass dedup); the
+    /// three-phase resolve never writes one.
+    dropped: bool,
 }
 
 /// The events of a person are only times here: each person's times are
@@ -1912,11 +1917,11 @@ const FEW: usize = 32;
 /// and reaches the starts in `t..=upto`. All times are under 2^31.
 ///
 /// Returns the sessions of the block the click reaches, one bit each, and
-/// whether the click ties with the latest click of a session while being of
-/// another campaign.
+/// adds to `tie` whether the click ties with the latest click of a session
+/// while being of another campaign (`tied` reads it out at the end).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32, upto: u32, camp: u32) -> (u64, bool) {
+unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32, upto: u32, camp: u32, tie_acc: &mut Tie) -> u64 {
     use core::arch::x86_64::*;
     let starts = _mm256_loadu_si256(at as *const __m256i);
     let before = _mm256_cmpgt_epi32(_mm256_set1_epi32(t as i32), starts);
@@ -1932,12 +1937,41 @@ unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32
     _mm256_storeu_si256(best_t as *mut __m256i, _mm256_blendv_epi8(old_t, key, later));
     _mm256_storeu_si256(best_c as *mut __m256i, _mm256_blendv_epi8(old_c, camps, later));
     let reached = !_mm256_movemask_ps(_mm256_castsi256_ps(out)) as u32 & 0xFF;
-    (u64::from(reached), _mm256_testz_si256(tie, tie) == 0)
+    *tie_acc = _mm256_or_si256(*tie_acc, tie);
+    u64::from(reached)
+}
+
+/// The ties `click_block` saw, kept as lanes so the test is done once.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+type Tie = core::arch::x86_64::__m256i;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+type Tie = bool;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn no_tie() -> Tie {
+    unsafe { core::arch::x86_64::_mm256_setzero_si256() }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn no_tie() -> Tie {
+    false
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn tied(t: Tie) -> bool {
+    unsafe { core::arch::x86_64::_mm256_testz_si256(t, t) == 0 }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn tied(t: Tie) -> bool {
+    t
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32, upto: u32, camp: u32) -> (u64, bool) {
+unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32, upto: u32, camp: u32, tie_acc: &mut Tie) -> u64 {
     let key = t + 1;
     let (mut reached, mut tie) = (0u64, false);
     for k in 0..LANES {
@@ -1950,7 +1984,8 @@ unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32
         *best_t.add(k) = if later { key } else { old_t };
         *best_c.add(k) = if later { camp } else { old_c };
     }
-    (reached, tie)
+    *tie_acc |= tie;
+    reached
 }
 
 /// Bitonic sorting network over 8 times in 1 register, ascending
@@ -3219,6 +3254,7 @@ impl<'a> PersonPhase<'a> {
             assists: vec![0; (fast.ncamp + 1) * fast.ndays],
             out,
             check: (0, 0),
+            dropped: true,
         }
     }
 
@@ -3247,7 +3283,7 @@ impl<'a> PersonPhase<'a> {
     /// line, so the loop gets the registers to itself. Returns the people,
     /// the words, and the shift and mask of the table.
     #[inline(never)]
-    unsafe fn group(
+    unsafe fn group<const DROPPED: bool>(
         evs: &[List<Ev>],
         table: &mut Vec<u32>,
         keys: *mut u64,
@@ -3267,7 +3303,7 @@ impl<'a> PersonPhase<'a> {
         for list in evs {
             for chunk in list.chunks() {
                 for rec in chunk.iter() {
-                    if rec.v == DEAD {
+                    if DROPPED && rec.v == DEAD {
                         // Dropped by the one-pass dedup.
                         continue;
                     }
@@ -3326,7 +3362,11 @@ impl<'a> PersonPhase<'a> {
         self.words.reserve(n);
         self.buys.clear();
         let words = self.words.as_mut_ptr();
-        let (people, n, shift, mask) = Self::group(evs, &mut self.tab, keys, counts, words, &mut self.buys);
+        let (people, n, shift, mask) = if self.dropped {
+            Self::group::<true>(evs, &mut self.tab, keys, counts, words, &mut self.buys)
+        } else {
+            Self::group::<false>(evs, &mut self.tab, keys, counts, words, &mut self.buys)
+        };
         let tab = self.tab.as_ptr();
         // Records the dedup dropped are not counted from here on.
         self.words.set_len(n);
@@ -3440,10 +3480,11 @@ impl<'a> PersonPhase<'a> {
         let mut ev_start = 0usize;
         let mut cl_start = 0usize;
         let mut buy_start = 0usize;
+        self.reserve_rows(people);
         for p in 0..people {
-            let ev_end = self.counts[p] as usize;
-            let cl_end = if nc > 0 { self.ccounts[p] as usize } else { 0 };
-            let buy_end = self.bcounts[p] as usize;
+            let ev_end = *self.counts.get_unchecked(p) as usize;
+            let cl_end = if nc > 0 { *self.ccounts.get_unchecked(p) as usize } else { 0 };
+            let buy_end = *self.bcounts.get_unchecked(p) as usize;
             self.person(p, ev_start, ev_end, cl_start, cl_end, buy_start, buy_end);
             ev_start = ev_end;
             cl_start = cl_end;
@@ -3453,6 +3494,13 @@ impl<'a> PersonPhase<'a> {
         if self.out.flush_full() {
             prof::add(9, t);
         }
+    }
+
+    /// Room in the output for the rows of `people` persons: at most one
+    /// per event (`counts` holds the end offsets by now).
+    fn reserve_rows(&mut self, people: usize) {
+        let events = if people == 0 { 0 } else { self.counts[people - 1] as usize };
+        self.out.reserve(events);
     }
 
     #[inline(always)]
@@ -3487,7 +3535,7 @@ impl<'a> PersonPhase<'a> {
         buy_start: usize,
         buy_end: usize,
     ) {
-        let pkey = self.keys[p + 1];
+        let pkey = *self.keys.get_unchecked(p + 1);
         let ev = std::slice::from_raw_parts(self.ev.as_ptr().add(ev_start), ev_end - ev_start);
         let cl = std::slice::from_raw_parts_mut(self.cl.as_mut_ptr().add(cl_start), cl_end - cl_start);
         if buy_end - buy_start > 1 {
@@ -3608,7 +3656,7 @@ impl<'a> PersonPhase<'a> {
         // its campaign.
         let mut best_t = [0u32; FEW];
         let mut best_c = [self.fast.ncamp as u32; FEW];
-        let mut tie = false;
+        let mut tie = no_tie();
         for click in cl.iter() {
             let t = (click.0 >> 32) as u32;
             let camp = click.0 as u32;
@@ -3616,14 +3664,13 @@ impl<'a> PersonPhase<'a> {
             let mut reached = 0u64;
             let mut lane = 0;
             while lane < lanes {
-                let (bits, tied) = click_block(at.add(lane), best_t.as_mut_ptr().add(lane), best_c.as_mut_ptr().add(lane), t, upto, camp);
+                let bits = click_block(at.add(lane), best_t.as_mut_ptr().add(lane), best_c.as_mut_ptr().add(lane), t, upto, camp, &mut tie);
                 reached |= bits << lane;
-                tie |= tied;
                 lane += LANES;
             }
             *self.cover.get_unchecked_mut(camp as usize) |= reached;
         }
-        if tie {
+        if tied(tie) {
             for click in cl.iter() {
                 *self.cover.get_unchecked_mut(click.0 as u32 as usize) = 0;
             }
@@ -4228,6 +4275,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                     let user_out =
                         UserOut::new(out_dir.as_deref(), t, lk, fast.ws_day, fast.ndays, cfg.collect.then_some(collected_ref));
                     let mut phase = PersonPhase::new(fast, user_out);
+                    phase.dropped = onepass;
                     let mut evs: Vec<List<Ev>> = Vec::with_capacity(threads);
                     let mut cls: Vec<List<Click>> = Vec::with_capacity(threads);
                     loop {

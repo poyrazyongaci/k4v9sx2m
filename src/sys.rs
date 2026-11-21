@@ -204,6 +204,8 @@ const STAGE_BUDGET: usize = 256 << 10;
 pub struct List<T> {
     head: *mut ChunkHdr,
     pub chunks: u32,
+    /// Records in all chunks, so counting them reads no chunk header.
+    len: usize,
     _t: PhantomData<T>,
 }
 impl<T> Clone for List<T> {
@@ -257,13 +259,16 @@ impl<T> List<T> {
         }
     }
     pub unsafe fn count(&self) -> usize {
-        let mut n = 0;
-        let mut at = self.head;
-        while !at.is_null() {
-            n += (*at).len as usize;
-            at = (*at).next;
-        }
-        n
+        debug_assert_eq!(self.len, {
+            let mut n = 0;
+            let mut at = self.head;
+            while !at.is_null() {
+                n += (*at).len as usize;
+                at = (*at).next;
+            }
+            n
+        });
+        self.len
     }
 }
 
@@ -286,6 +291,15 @@ impl<T: 'static> Iterator for Chunks<T> {
             Some(std::slice::from_raw_parts(data, len))
         }
     }
+}
+
+/// See `Scatter::hot`.
+#[derive(Clone, Copy)]
+pub struct Hot {
+    fill: *mut u8,
+    stage: *mut u8,
+    stage_bytes: usize,
+    per: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +498,40 @@ impl<T: Copy> Scatter<T> {
         self.chunk_bytes
     }
 
+    /// The fields `push_hot` reads on every record. They never change for
+    /// the life of the scatter, so a caller keeps a copy in locals, which
+    /// its own stores cannot alias.
+    pub fn hot(&mut self) -> Hot {
+        Hot { fill: self.fill.as_mut_ptr(), stage: self.stage, stage_bytes: self.stage_bytes, per: self.per }
+    }
+
+    /// `push` with the per-record fields from `hot()`.
+    #[inline(always)]
+    pub unsafe fn push_hot(&mut self, h: &Hot, p: usize, value: T) {
+        let fill = h.fill.add(p);
+        let n = *fill as usize;
+        let buf = h.stage.add(p * h.stage_bytes);
+        (buf as *mut T).add(n).write(value);
+        if n + 1 == h.per {
+            *fill = 0;
+            self.write_out(p, buf);
+        } else {
+            *fill = (n + 1) as u8;
+        }
+    }
+
+    /// Move the full staging buffer `buf` of partition `p` to its chunk.
+    #[inline(always)]
+    unsafe fn write_out(&mut self, p: usize, buf: *mut u8) {
+        let mut part = self.parts.as_mut_ptr().add(p);
+        if (*part).dst == (*part).end {
+            self.grow(p);
+            part = self.parts.as_mut_ptr().add(p);
+        }
+        stream_lines(buf, (*part).dst, self.stage_bytes / 64);
+        (*part).dst = (*part).dst.add(self.stage_bytes);
+    }
+
     #[inline(always)]
     pub unsafe fn push(&mut self, p: usize, value: T) {
         let n = *self.fill.get_unchecked(p) as usize;
@@ -584,12 +632,15 @@ impl<T: Copy> Scatter<T> {
         self.parts
             .iter()
             .map(|part| {
+                let mut len = 0;
                 if !part.head.is_null() {
                     let start = unsafe { (part.head as *mut u8).add(HDR) };
                     let used = (part.dst as usize - start as usize) / size;
                     unsafe { (*part.head).len = used as u32 };
+                    // Every chunk but the head is full (`grow`).
+                    len = (part.chunks as usize - 1) * self.cap + used;
                 }
-                List { head: part.head, chunks: part.chunks, _t: PhantomData }
+                List { head: part.head, chunks: part.chunks, len, _t: PhantomData }
             })
             .collect()
     }
