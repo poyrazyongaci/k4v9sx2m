@@ -296,21 +296,12 @@ impl<T: 'static> Iterator for Chunks<T> {
 /// See `Scatter::hot`.
 #[derive(Clone, Copy)]
 pub struct Hot {
-    pub(crate) fill: *mut u8,
-    pub(crate) stage: *mut u8,
-    pub(crate) stage_bytes: usize,
-    pub(crate) per: usize,
-    /// The partitions (`Part`, `PART_BYTES` each: `dst` at 0, `end` at 8),
-    /// for the asm event loop (`engine/hot.rs`).
-    pub(crate) parts: *mut u8,
+    fill: *mut u8,
+    stage: *mut u8,
+    stage_bytes: usize,
+    per: usize,
 }
 
-pub(crate) const PART_BYTES: usize = std::mem::size_of::<Part>();
-/// Where `dst` and `end` sit in a `Part` (the asm event loop reads them).
-pub(crate) const PART_DST: usize = std::mem::offset_of!(Part, dst);
-pub(crate) const PART_END: usize = std::mem::offset_of!(Part, end);
-
-#[repr(C)]
 #[derive(Clone, Copy)]
 struct Part {
     /// Next line-aligned write position in the current chunk, and its end.
@@ -538,7 +529,7 @@ impl<T: Copy> Scatter<T> {
     /// the life of the scatter, so a caller keeps a copy in locals, which
     /// its own stores cannot alias.
     pub fn hot(&mut self) -> Hot {
-        Hot { fill: self.fill.as_mut_ptr(), stage: self.stage, stage_bytes: self.stage_bytes, per: self.per, parts: self.parts.as_mut_ptr() as *mut u8 }
+        Hot { fill: self.fill.as_mut_ptr(), stage: self.stage, stage_bytes: self.stage_bytes, per: self.per }
     }
 
     /// `push` with the per-record fields from `hot()`.
@@ -766,52 +757,5 @@ pub fn threads() -> usize {
 }
 
 pub fn exit_now(code: i32) -> ! {
-    crate::layout_pad!(layout::EXIT_PAD);
     unsafe { libc::_exit(code) }
-}
-
-/// Code layout knobs, read at build time; all 0 (no effect) by default.
-/// They exist to time builds that differ only in where code sits. None
-/// changes an executed instruction except one `jmp` over the padding.
-///
-/// - `SS_EVENTS_PAD=N`: N bytes (a 2-byte `jmp` over N-2 `int3`) at the head
-///   of `ParseState::events`, which moves its loop by N bytes.
-/// - `SS_EXIT_PAD=N`: the same in `exit_now`, run once at exit; it moves the
-///   code laid out after `exit_now`.
-/// - `SS_DIE_PAD=N`: the same in `common::die`, never run on a good input;
-///   it moves the code laid out after `die`.
-/// - RUSTFLAGS `--cfg ss_hot`: `events` in a section of its own, aligned to
-///   4096 bytes, so its address mod 4096 does not depend on other code.
-pub mod layout {
-    const fn num(v: Option<&str>) -> usize {
-        let Some(s) = v else {
-            return 0;
-        };
-        let b = s.as_bytes();
-        let mut i = 0;
-        let mut n = 0;
-        while i < b.len() {
-            assert!(b[i].is_ascii_digit(), "layout knob: digits only");
-            n = n * 10 + (b[i] - b'0') as usize;
-            i += 1;
-        }
-        assert!(n == 0 || (n >= 2 && n <= 65536), "layout knob: 0 or 2..=65536");
-        n
-    }
-    pub const EVENTS_PAD: usize = num(option_env!("SS_EVENTS_PAD"));
-    pub const EXIT_PAD: usize = num(option_env!("SS_EXIT_PAD"));
-    pub const DIE_PAD: usize = num(option_env!("SS_DIE_PAD"));
-}
-
-/// `$n` bytes of padding jumped over (nothing for 0); see `layout`.
-#[macro_export]
-macro_rules! layout_pad {
-    ($n:expr) => {
-        #[cfg(target_arch = "x86_64")]
-        if $n >= 2 {
-            unsafe {
-                core::arch::asm!("jmp 2f", ".skip {n}, 0xcc", "2:", n = const $n.saturating_sub(2), options(nomem, nostack, preserves_flags));
-            }
-        }
-    };
 }
