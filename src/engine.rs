@@ -787,14 +787,19 @@ impl<'a> Parser<'a> {
 
 struct Resolver<'a> {
     links: &'a LinkMap,
-    table: Vec<u64>,
+    table: Vec<u32>,
+    /// The entry chunks of the partition at hand, by number from 1.
+    bases: Vec<*mut Entry>,
     ev: Scatter<Ev>,
     cl: Scatter<Click>,
     shift2: u32,
     entry_chunk_bytes: usize,
 }
 
-const PTR_MASK: u64 = (1 << 48) - 1;
+/// Entries per chunk fit in this many bits of a dedup slot.
+const OFF_BITS: u32 = 9;
+const OFF_MASK: u32 = (1 << OFF_BITS) - 1;
+const _: () = assert!((CHUNK_BYTES - 64) / std::mem::size_of::<Entry>() <= 1 << OFF_BITS);
 /// Dedup is the first reader of entries the parser wrote with streaming
 /// stores, so they come from memory, and the hardware prefetcher starts
 /// over at every 4 KiB page and every chunk. Measured at 20M events:
@@ -817,40 +822,58 @@ impl<'a> Resolver<'a> {
         if n == 0 {
             return;
         }
+        // Slots of 32 bits: a tag from the hash above the position of the
+        // entry, `chunk << OFF_BITS | offset`, chunks counted from 1 so a
+        // used slot is never 0. Half the bytes of a pointer table at the
+        // same load. A partition has far fewer than 2^23 chunks (the
+        // events are under 16 GB), so the position always fits; the tag
+        // gets what is left and only ever filters: equality is decided by
+        // the full key.
+        let chunks: usize = lists.iter().map(|l| l.chunks as usize).sum();
+        let pos_bits = usize::BITS - chunks.leading_zeros() + OFF_BITS;
+        let pos_mask = if pos_bits >= 32 { u32::MAX } else { (1u32 << pos_bits) - 1 };
         let cap = (n * 2).next_power_of_two().max(64);
         self.table.clear();
         self.table.resize(cap, 0);
+        self.bases.clear();
+        self.bases.push(std::ptr::null_mut());
         let mask = cap - 1;
         let table = self.table.as_mut_ptr();
+        let bases = &mut self.bases;
         for list in lists {
             list.for_each_chunk_ahead(|chunk, next| {
                 let end = chunk.as_ptr().add(chunk.len()) as usize;
-                for entry in chunk.iter_mut() {
+                let first = (bases.len() as u32) << OFF_BITS;
+                bases.push(chunk.as_mut_ptr());
+                let bases = bases.as_ptr();
+                for (k, entry) in chunk.iter_mut().enumerate() {
                     // Ask for the entries a little ahead, into the next
                     // chunk at the end of this one.
                     let ahead = entry as *const Entry as usize + DEDUP_AHEAD;
                     let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
                     prefetch(ahead as *const u8);
                     let h = mix1(entry.ekey);
-                    let tag = h << 48;
-                    let me = entry as *mut Entry;
+                    // Low hash bits, apart from the home bits (20 and up).
+                    let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
+                    let me = first | k as u32;
                     let mut i = (h >> 20) as usize & mask;
                     loop {
                         let slot = *table.add(i);
                         if slot == 0 {
-                            *table.add(i) = tag | me as u64;
+                            *table.add(i) = tag | me;
                             break;
                         }
-                        if slot & !PTR_MASK == tag {
-                            let other = (slot & PTR_MASK) as *mut Entry;
-                            if (*other).ekey == (*me).ekey {
+                        if slot & !pos_mask == tag {
+                            let at = slot & pos_mask;
+                            let other = (*bases.add((at >> OFF_BITS) as usize)).add((at & OFF_MASK) as usize);
+                            if (*other).ekey == entry.ekey {
                                 // Same event: the smaller ingest stays. On
                                 // a tie the copies are identical.
-                                if (*me).ingest < (*other).ingest {
+                                if entry.ingest < (*other).ingest {
                                     (*other).w3 = DEAD;
-                                    *table.add(i) = tag | me as u64;
+                                    *table.add(i) = tag | me;
                                 } else {
-                                    (*me).w3 = DEAD;
+                                    entry.w3 = DEAD;
                                 }
                                 break;
                             }
@@ -1063,6 +1086,58 @@ unsafe fn click_block(at: *const u32, best_t: *mut u32, best_c: *mut u32, t: u32
     (reached, tie)
 }
 
+/// The run of events in the bin of `ev[i]` that starts at `i`, up to `n`:
+/// its smallest and largest time and its end. `ev` is readable for
+/// `LANES` values past `n`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn bin_run(ev: *const u32, i: usize, n: usize) -> (u32, u32, usize) {
+    use core::arch::x86_64::*;
+    let bin = _mm256_set1_epi32((*ev.add(i) >> BIN_SHIFT) as i32);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let (mut lo, mut hi) = (_mm256_set1_epi32(-1), _mm256_setzero_si256());
+    let mut j = i;
+    loop {
+        // A run of `LANES` goes on in the next block: rare, so a branch.
+        let v = _mm256_loadu_si256(ev.add(j) as *const __m256i);
+        let same = _mm256_cmpeq_epi32(_mm256_srli_epi32(v, BIN_SHIFT as i32), bin);
+        let m = _bzhi_u32(_mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32, (n - j).min(LANES) as u32);
+        let len = (!m).trailing_zeros();
+        let take = _mm256_cmpgt_epi32(_mm256_set1_epi32(len as i32), lane);
+        lo = _mm256_min_epu32(lo, _mm256_or_si256(v, _mm256_xor_si256(take, _mm256_set1_epi32(-1))));
+        hi = _mm256_max_epu32(hi, _mm256_and_si256(v, take));
+        j += len as usize;
+        if len < LANES as u32 {
+            break;
+        }
+    }
+    let lo = _mm256_min_epu32(lo, _mm256_permute2x128_si256(lo, lo, 1));
+    let lo = _mm256_min_epu32(lo, _mm256_shuffle_epi32(lo, 0b01_00_11_10));
+    let lo = _mm256_min_epu32(lo, _mm256_shuffle_epi32(lo, 0b10_11_00_01));
+    let hi = _mm256_max_epu32(hi, _mm256_permute2x128_si256(hi, hi, 1));
+    let hi = _mm256_max_epu32(hi, _mm256_shuffle_epi32(hi, 0b01_00_11_10));
+    let hi = _mm256_max_epu32(hi, _mm256_shuffle_epi32(hi, 0b10_11_00_01));
+    (_mm256_cvtsi256_si32(lo) as u32, _mm256_cvtsi256_si32(hi) as u32, j)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+unsafe fn bin_run(ev: *const u32, i: usize, n: usize) -> (u32, u32, usize) {
+    let bin = *ev.add(i) >> BIN_SHIFT;
+    let (mut first, mut latest) = (u32::MAX, 0u32);
+    let mut j = i;
+    while j < n {
+        let t = *ev.add(j);
+        if t >> BIN_SHIFT != bin {
+            break;
+        }
+        first = first.min(t);
+        latest = latest.max(t);
+        j += 1;
+    }
+    (first, latest, j)
+}
+
 #[inline(always)]
 fn sort_u64(v: &mut [u64]) {
     if v.len() <= 20 {
@@ -1230,8 +1305,10 @@ impl<'a> PersonPhase<'a> {
             sum += k;
         }
         self.ev.clear();
-        self.ev.reserve(n);
-        self.ev.set_len(n);
+        // Padding: the run finder reads a block of `LANES` past any start.
+        self.ev.reserve(n + LANES);
+        self.ev.set_len(n + LANES);
+        self.ev[n..].fill(0);
         for &word in &self.binned {
             let w = self.counts.get_unchecked_mut(word as u32 as usize);
             *self.ev.get_unchecked_mut(*w as usize) = (word >> 32) as u32;
@@ -1398,20 +1475,7 @@ impl<'a> PersonPhase<'a> {
         let mut i = 0usize;
         loop {
             // One run of events in the same bin, and its extremes.
-            let (mut first, mut latest) = (u32::MAX, 0u32);
-            let mut j = i;
-            if i < n {
-                let bin = *ev.get_unchecked(i) >> BIN_SHIFT;
-                while j < n {
-                    let t = *ev.get_unchecked(j);
-                    if t >> BIN_SHIFT != bin {
-                        break;
-                    }
-                    first = first.min(t);
-                    latest = latest.max(t);
-                    j += 1;
-                }
-            }
+            let (first, latest, j) = if i < n { bin_run(ev.as_ptr(), i, n) } else { (u32::MAX, 0, i) };
             // `first` is past every time when the events have run out.
             if i == 0 || first - last > gap {
                 if i != 0 {
@@ -1839,6 +1903,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                     let mut r = Resolver {
                         links,
                         table: Vec::new(),
+                        bases: Vec::new(),
                         ev: Scatter::new(parts2, CHUNK_BYTES),
                         cl: Scatter::new(parts2, CHUNK_BYTES),
                         shift2: 64 - bits2,
