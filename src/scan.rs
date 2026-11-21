@@ -200,6 +200,23 @@ fn flag_bytes(before: u64, after: u64, nm: u64, delim: u64, skip: u32) -> u64 {
     }
 }
 
+/// Append the illegal quotes of the block at `at` to the list: the last
+/// byte of the previous block when `carried`, then the bits of `illegal`.
+#[cold]
+#[inline(never)]
+unsafe fn bad_quotes(bad: *mut u32, mut nbad: usize, at: u32, mut illegal: u64, carried: u64) -> usize {
+    if carried != 0 {
+        *bad.add(nbad) = at - 1;
+        nbad += 1;
+    }
+    while illegal != 0 {
+        *bad.add(nbad) = at + illegal.trailing_zeros();
+        nbad += 1;
+        illegal &= illegal - 1;
+    }
+    nbad
+}
+
 impl Scan {
     pub fn new(window: usize) -> Self {
         Scan {
@@ -256,20 +273,16 @@ impl Scan {
                 qm &= keep;
             }
             let delim = cm | nm;
-            if (qm | pending) != 0 {
-                // A quote that does not follow a delimiter must precede one.
-                let nonopen = qm & !((delim << 1) | prev_delim);
-                let mut illegal = nonopen & !(delim >> 1) & !(1u64 << 63);
-                if pending != 0 && (delim & 1) == 0 {
-                    *bad.add(nbad) = at as u32 - 1;
-                    nbad += 1;
-                }
-                pending = nonopen >> 63;
-                while illegal != 0 {
-                    *bad.add(nbad) = at as u32 + illegal.trailing_zeros();
-                    nbad += 1;
-                    illegal &= illegal - 1;
-                }
+            // A quote that does not follow a delimiter must precede one.
+            // Four blocks in five hold a quote, so a branch on "any quote"
+            // is a coin toss; the check runs on every block and only the
+            // rare illegal quote branches.
+            let nonopen = qm & !((delim << 1) | prev_delim);
+            let illegal = nonopen & !(delim >> 1) & !(1u64 << 63);
+            let carried = pending & !delim & 1;
+            pending = nonopen >> 63;
+            if (illegal | carried) != 0 {
+                nbad = bad_quotes(bad, nbad, at as u32, illegal, carried);
             }
             prev_delim = delim >> 63;
             // Quote flags per delimiter, so stage 2 never looks at the
@@ -381,6 +394,82 @@ pub unsafe fn fields<const N: usize>(d: *const u32, fl: *const u8) -> ([u32; 8],
     _mm256_storeu_si256(s.as_mut_ptr() as *mut __m256i, start);
     _mm256_storeu_si256(e.as_mut_ptr() as *mut __m256i, end);
     (s, e, lone | u32::from((uneven | breaks) != 0))
+}
+
+/// Starts and lengths of the fields of one line, in memory. The parsers
+/// read each one with a plain load: pulling the lanes out of a vector
+/// register costs two uops each, a load one.
+#[repr(C, align(32))]
+pub struct Bounds {
+    s: [u32; 8],
+    n: [u32; 8],
+}
+
+impl Bounds {
+    #[inline(always)]
+    pub fn start(&self, i: usize) -> usize {
+        // Volatile, or the compiler forwards the vector store and goes back
+        // to extracting lanes.
+        unsafe { std::ptr::read_volatile(self.s.as_ptr().add(i)) as usize }
+    }
+    #[inline(always)]
+    pub fn len(&self, i: usize) -> usize {
+        unsafe { std::ptr::read_volatile(self.n.as_ptr().add(i)) as usize }
+    }
+}
+
+/// `fields`, with the starts and lengths stored to `out`. Returns `bad`.
+#[inline(always)]
+unsafe fn fields_into<const N: usize>(d: *const u32, fl: *const u8, out: *mut Bounds) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use core::arch::x86_64::*;
+        let (s, e, bad) = fields::<N>(d, fl);
+        let start = _mm256_loadu_si256(s.as_ptr() as *const __m256i);
+        let end = _mm256_loadu_si256(e.as_ptr() as *const __m256i);
+        _mm256_store_si256((*out).s.as_mut_ptr() as *mut __m256i, start);
+        _mm256_store_si256((*out).n.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(end, start));
+        bad
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (s, e, bad) = fields::<N>(d, fl);
+        for i in 0..8 {
+            (*out).s[i] = s[i];
+            (*out).n[i] = e[i].wrapping_sub(s[i]);
+        }
+        bad
+    }
+}
+
+/// `for_each_line`, with the fields handed over as `Bounds`.
+#[inline(always)]
+pub unsafe fn for_each_line_b<const N: usize>(scan: &Scan, limit: u32, mut f: impl FnMut(&Bounds)) -> u32 {
+    let d = scan.delims();
+    let fl = scan.flags();
+    let badq = scan.badq.as_ptr();
+    let nd = scan.nd;
+    let mut b = Bounds { s: [0; 8], n: [0; 8] };
+    let mut di = 0usize;
+    let mut bq = 0usize;
+    let mut ls = 0u32;
+    while ls < limit {
+        if di + N <= nd {
+            let p = *d.add(di + N - 1);
+            let bad = fields_into::<N>(d.add(di), fl.add(di), &mut b);
+            if (bad == 0) & (*badq.add(bq) >= p) {
+                f(&b);
+                di += N;
+                ls = p + 1;
+                continue;
+            }
+        }
+        match skip_line(scan, di, bq) {
+            Some(next) => (di, bq, ls) = next,
+            None => break,
+        }
+    }
+    ls
 }
 
 /// The line whose delimiters start at `d[di]` is not a well-formed line of
@@ -516,6 +605,22 @@ mod tests {
                     assert_eq!(end as usize, body_len);
                 }
                 assert_eq!(got, expect, "round {round} fields {fields_n}: {:?}", String::from_utf8_lossy(&text[1..body_len]));
+                // The same lines and fields through `Bounds`.
+                let mut got_b: Vec<Vec<Vec<u8>>> = Vec::new();
+                unsafe {
+                    let mut collect = |b: &Bounds| {
+                        got_b.push(
+                            (0..fields_n).map(|i| text[1 + b.start(i)..1 + b.start(i) + b.len(i)].to_vec()).collect(),
+                        );
+                    };
+                    let end = match fields_n {
+                        2 => for_each_line_b::<2>(&scan, u32::MAX, |b| collect(b)),
+                        4 => for_each_line_b::<4>(&scan, u32::MAX, |b| collect(b)),
+                        _ => for_each_line_b::<7>(&scan, u32::MAX, |b| collect(b)),
+                    };
+                    assert_eq!(end as usize, body_len);
+                }
+                assert_eq!(got_b, expect, "bounds, round {round} fields {fields_n}");
             }
         }
     }

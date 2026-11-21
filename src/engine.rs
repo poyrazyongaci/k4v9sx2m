@@ -20,7 +20,7 @@ use crate::common::*;
 use crate::ids::{self, cmp_ids};
 use crate::output::write_camp_rows;
 use crate::usercols::UserOut;
-use crate::scan::{for_each_line, Scan};
+use crate::scan::{for_each_line, for_each_line_b, Scan};
 use crate::sys::{self, prefetch, prof, List, Mapped, Scatter};
 use crate::ts::{canonical_number, load32, load64, parse_price, parse_ts, parse_ts_ingest, DateCache, BAD};
 
@@ -97,6 +97,15 @@ fn mix(k: u64) -> u64 {
 fn mix1(k: u64) -> u64 {
     let x = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x ^ (x >> 32)
+}
+
+/// The event partition of an event key: the top bits of one multiply. Every
+/// copy of an event must land in the same partition, so the line parsers
+/// all use this. Its own multiplier keeps it independent of `mix1`, whose
+/// bits the dedup table uses inside a partition.
+#[inline(always)]
+fn event_part(ekey: u64, shift1: u32) -> usize {
+    (ekey.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
 }
 
 /// Lookup tables derived from the catalogs for the fast paths.
@@ -501,23 +510,17 @@ impl<'a> ParseState<'a> {
         let cache = &mut self.cache;
         let entries = &mut self.entries;
         let known = scan.clean;
-        for_each_line::<7>(scan, limit, |s, e| {
-            let id_len = (e[0] - s[0]) as usize;
+        for_each_line_b::<7>(scan, limit, |b| {
+            let id_len = b.len(0);
             if id_len == 0 {
                 return;
             }
-            let ekey = ids::pack_in(base.add(s[0] as usize), id_len, known);
-            let user_len = (e[1] - s[1]) as usize;
-            let ukey = ids::pack_in(base.add(s[1] as usize), user_len, known);
-            let (ts, ingest) = parse_ts_ingest(
-                base.add(s[2] as usize),
-                (e[2] - s[2]) as usize,
-                base.add(s[3] as usize),
-                (e[3] - s[3]) as usize,
-                cache,
-            );
-            let type_len = e[4] - s[4];
-            let tp = base.add(s[4] as usize);
+            let ekey = ids::pack_in(base.add(b.start(0)), id_len, known);
+            let user_len = b.len(1);
+            let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
+            let (ts, ingest) = parse_ts_ingest(base.add(b.start(2)), b.len(2), base.add(b.start(3)), b.len(3), cache);
+            let type_len = b.len(4);
+            let tp = base.add(b.start(4));
             let word = load32(tp);
             let ts_rel = ts.wrapping_sub(ws) as u64;
             // Late is `ingest - ts > 24 h`, which is `ingest > ts + 24 h`
@@ -530,7 +533,8 @@ impl<'a> ParseState<'a> {
             // Nearly every row passes these four rules and is a view or a
             // cart: one well-predicted branch for the rules, one for the
             // length of the type.
-            let sound = (user_len != 0) & (e[5] != s[5]) & (ts_rel < wlen) & fresh;
+            let prod_len = b.len(5);
+            let sound = (user_len != 0) & (prod_len != 0) & (ts_rel < wlen) & fresh;
             let mut w3 = DEAD;
             if !sound {
                 std::hint::cold_path();
@@ -540,13 +544,13 @@ impl<'a> ParseState<'a> {
                 let plain = (word == VIEW) | (word == CART);
                 w3 = std::hint::select_unpredictable(plain, ts_rel << 32, DEAD);
             } else if type_len == 8 && load64(tp) == PURCHASE {
-                let price = parse_price(base.add(s[6] as usize), (e[6] - s[6]) as usize);
+                let price = parse_price(base.add(b.start(6)), b.len(6));
                 if price != 0 {
-                    let cat = fast.category(base.add(s[5] as usize), (e[5] - s[5]) as usize);
+                    let cat = fast.category(base.add(b.start(5)), prod_len);
                     w3 = (ts_rel << 32) | (price << 8) | u64::from(cat);
                 }
             }
-            let part = (mix(ekey) >> shift1) as usize;
+            let part = event_part(ekey, shift1);
             entries.push(part, Entry { ekey, ukey, ingest, w3 });
         })
     }
@@ -558,23 +562,23 @@ impl<'a> ParseState<'a> {
         let cache = &mut self.cache;
         let clicks = &mut self.clicks;
         let known = scan.clean;
-        for_each_line::<4>(scan, limit, |s, e| {
-            let id_len = (e[0] - s[0]) as usize;
-            let user_len = (e[1] - s[1]) as usize;
+        for_each_line_b::<4>(scan, limit, |b| {
+            let id_len = b.len(0);
+            let user_len = b.len(1);
             if id_len == 0 || user_len == 0 {
                 return;
             }
-            let ts = parse_ts(base.add(s[3] as usize), (e[3] - s[3]) as usize, cache);
+            let ts = parse_ts(base.add(b.start(3)), b.len(3), cache);
             let rel = ts.wrapping_sub(cws) as u64;
             if rel >= cwlen {
                 return;
             }
-            let camp = fast.campaign(base.add(s[2] as usize), (e[2] - s[2]) as usize);
+            let camp = fast.campaign(base.add(b.start(2)), b.len(2));
             if camp == u32::MAX {
                 return;
             }
-            let ckey = ids::pack_in(base.add(s[0] as usize), id_len, known);
-            let ukey = ids::pack_in(base.add(s[1] as usize), user_len, known);
+            let ckey = ids::pack_in(base.add(b.start(0)), id_len, known);
+            let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
             if clicks.last().is_none_or(|b| b.len() == CLICK_BLOCK) {
                 clicks.push(Vec::with_capacity(CLICK_BLOCK));
             }
@@ -632,7 +636,7 @@ impl<'a> ParseState<'a> {
                     }
                 }
                 let w3 = if valid { (ts_rel << 32) | pc } else { DEAD };
-                let part = (mix(ekey) >> self.shift1) as usize;
+                let part = event_part(ekey, self.shift1);
                 self.entries.push(part, Entry { ekey, ukey, ingest: ingest.unwrap_or(i64::MAX), w3 });
             }
             Kind::Clicks => {
