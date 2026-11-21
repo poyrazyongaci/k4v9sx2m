@@ -18,7 +18,6 @@ fn cfg(threads: usize, chunk: usize, bits: u32) -> Config {
         p2_bits: Some(bits),
         onepass: true,
         dense: false,
-        index: false,
         dense_slots: None,
         fused: true,
     }
@@ -30,10 +29,9 @@ fn compare(data: &Path, config: &Config) -> [i64; 5] {
     // All shapes of the engine: one-pass, three-phase and dense.
     let other = Config { onepass: !config.onepass, ..*config };
     let dense = Config { dense: true, ..*config };
-    let indexed = Config { index: true, ..*config };
     // And the two-stage reader for events and clicks.
     let staged = Config { fused: !config.fused, onepass: false, ..*config };
-    for config in [config, &other, &dense, &indexed, &staged] {
+    for config in [config, &other, &dense, &staged] {
         check_shape(data, config, &lk, &want);
     }
     [
@@ -52,13 +50,11 @@ fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) -> boo
     got.sort();
     // The dense shape gives up only when its table fills or a click record
     // cannot hold its fields; the tests that force that set a tiny table.
-    if config.index && config.dense_slots.is_none() {
+    if config.dense && config.dense_slots.is_none() {
         assert!(got.dense, "{}: the dense shape gave up", data.display());
     }
     let data = Path::new(data);
-    let shape = if config.index {
-        "indexed"
-    } else if config.dense {
+    let shape = if config.dense {
         "dense"
     } else if config.onepass {
         "one-pass"
@@ -87,7 +83,7 @@ fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) -> boo
 
 fn fixtures_dir() -> Option<PathBuf> {
     let dir = std::env::var("SESSIONS_FIXTURES").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from("fixtures")
+        PathBuf::from("/Users/yamanakbas/Developer/buildathon-2026/tracks/shopping-sessions/kit/starter-duckdb/starter-duckdb/fixtures")
     });
     dir.is_dir().then_some(dir)
 }
@@ -211,46 +207,6 @@ fn write_parts(dir: &Path, header: &str, bodies: Vec<Vec<u8>>, drop_last_newline
     }
 }
 
-/// The key of `gen_user`.
-const GEN_KEY: u64 = 0x5D_2A71_C3E9;
-
-fn base36(mut v: u64) -> String {
-    let mut out = Vec::new();
-    loop {
-        out.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize]);
-        v /= 36;
-        if v == 0 {
-            break;
-        }
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap()
-}
-
-/// A user ID of person `p` the way the generator writes them (`u` and the
-/// base 36 of a scrambled `p * 512 + alias`), with the cases the indexed
-/// shape must route elsewhere: aliases from 8 up, shared devices at 2^39,
-/// person numbers past any table, upper case, a leading zero.
-fn gen_user(r: &mut Rng, p: u64) -> String {
-    use crate::engine::test_scramble as scramble;
-    let alias = match r.below(20) {
-        0 => 8 + r.below(500),
-        1..=6 => r.below(8),
-        _ => 0,
-    };
-    let v = match r.below(60) {
-        0 => (1 << 39) + r.below(6),
-        1 => (p + 3_000_000) * 512 + alias,
-        _ => p * 512 + alias,
-    };
-    let text = format!("u{}", base36(scramble(v, GEN_KEY)));
-    match r.below(80) {
-        0 => text.to_uppercase(),
-        1 => format!("u0{}", &text[1..]),
-        _ => text,
-    }
-}
-
 fn generate(dir: &Path, seed: u64, events: usize) {
     let mut r = Rng(seed);
     let _ = std::fs::remove_dir_all(dir);
@@ -284,10 +240,6 @@ fn generate(dir: &Path, seed: u64, events: usize) {
     std::fs::write(dir.join("campaigns.csv"), campaigns).unwrap();
 
     let odd_users = ["U1", " u1", "u1 ", "A\tB", "user_id_a", "averyveryverylonguserid", "u\u{00e9}", "u1", "u2"];
-    // Odd seeds name users as the generator does (`gen_user`), with the
-    // awkward neighbours of that form mixed in.
-    let like = seed % 2 == 1;
-    let people = events as u64 / 6 + 3;
     let user = |r: &mut Rng| -> String {
         if r.chance(60) {
             return String::new();
@@ -295,11 +247,7 @@ fn generate(dir: &Path, seed: u64, events: usize) {
         if r.chance(12) {
             return r.pick(&odd_users).to_string();
         }
-        if like {
-            let p = r.below(people);
-            return gen_user(r, p);
-        }
-        format!("u{}", r.below(people))
+        format!("u{}", r.below(events as u64 / 6 + 3))
     };
     let nparts = 1 + r.below(4) as usize;
     let mut event_parts = vec![Vec::new(); nparts + 1];
@@ -418,12 +366,7 @@ fn generate(dir: &Path, seed: u64, events: usize) {
         }
     }
     for _ in 0..events / 8 {
-        let mut fields = vec![user(&mut r), user(&mut r)];
-        if like && r.below(8) != 0 {
-            // Two IDs of one person, as most generator links are.
-            let p = r.below(people);
-            fields = vec![gen_user(&mut r, p), gen_user(&mut r, p)];
-        }
+        let fields = vec![user(&mut r), user(&mut r)];
         let part = r.below(2) as usize;
         emit(&mut r, &fields, &mut link_parts[part], true);
     }
@@ -488,15 +431,15 @@ fn add_long_lines(dir: &Path, seed: u64) {
     // Two clicks at one instant: the long id is the smaller one and wins.
     clicks += &row(&[&click_k, "u1", "c_1", &f1(t - 3_600_000)]);
     clicks += &row(&["kzz", "u1", "c_2", &f1(t - 3_600_000)]);
-    clicks += &row(&["Q2", &quoted(&user_y), "c_3", &f1(t - 7_200_000)]);
-    clicks += &row(&["Q3", "u1", &long('c'), &f1(t - 60_000)]);
-    clicks += &row(&["Q4", "u2", "c_4", &format!("{zeros}{}", t - 1_800_000)]);
-    clicks += &row(&["Q5", "u2", "c_5", &long('9')]);
-    clicks += &row(&["Q6", "u2", "c_5", &f1(t - 1000), &long('z')]);
-    clicks += &row(&["Q7", &name_a, "c_6", &f1(t + 8 * 3_600_000)]);
+    clicks += &row(&["K2", &quoted(&user_y), "c_3", &f1(t - 7_200_000)]);
+    clicks += &row(&["K3", "u1", &long('c'), &f1(t - 60_000)]);
+    clicks += &row(&["K4", "u2", "c_4", &format!("{zeros}{}", t - 1_800_000)]);
+    clicks += &row(&["K5", "u2", "c_5", &long('9')]);
+    clicks += &row(&["K6", "u2", "c_5", &f1(t - 1000), &long('z')]);
+    clicks += &row(&["K7", &name_a, "c_6", &f1(t + 8 * 3_600_000)]);
     clicks += &long(',');
     clicks += "\n";
-    clicks += &row(&["Q8", "u1", "c_7", &f1(t + 200_000)]);
+    clicks += &row(&["K8", "u1", "c_7", &f1(t + 200_000)]);
     if seed % 2 == 1 {
         clicks += &row(&[&long('j'), "u2", "c_8", &f1(t + 100_000)]);
         clicks.pop();
@@ -1256,59 +1199,4 @@ fn click_blocks_fill_across_long_lines() {
     assert_eq!(compare(&dir, &cfg(2, 300_000, 2)), a);
     assert!(a[3] > 100, "credited {}", a[3]);
     let _ = std::fs::remove_dir_all(&root);
-}
-
-/// The indexed shape on datasets whose user IDs are written as the
-/// generator writes them: the key must be found (so the indexed region is
-/// used), and the output must match the reference with tiny and roomy
-/// person partitions and tables, many threads and few.
-#[test]
-fn indexed_shape_matches_reference() {
-    let root = std::env::temp_dir().join(format!("sessions-indexed-{}", std::process::id()));
-    let mut found = 0;
-    for seed in 0..10u64 {
-        let dir = root.join(format!("s{seed}"));
-        generate(&dir, seed * 2 + 1, [3000, 12000][(seed % 2) as usize]);
-        if seed % 4 == 0 {
-            add_long_lines(&dir, seed);
-        }
-        let lk = load_lookups(&dir);
-        let want = naive::run(&dir, &lk);
-        for (threads, chunk, bits) in [(4, 256, 6), (3, 5000, 2), (8, 1024, 10), (1, 4 << 20, 1)] {
-            for slots in [None, Some(64), Some(1 << 16)] {
-                let config = Config { index: true, dense_slots: slots, ..cfg(threads, chunk, bits) };
-                check_shape(&dir, &config, &lk, &want);
-                if slots.is_none() {
-                    let got = engine::run(&dir, None, &lk, &config, std::time::Instant::now()).unwrap();
-                    found += usize::from(got.indexed);
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    assert!(found >= 36, "key found in only {found} of 40 runs");
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Write a generated dataset for a look by hand: `SS_GEN_DIR`,
-/// `SS_GEN_SEED`, `SS_GEN_EVENTS`, and `SS_GEN_LONG` for the long lines.
-#[test]
-#[ignore]
-fn write_generated_dataset() {
-    let dir = PathBuf::from(std::env::var("SS_GEN_DIR").unwrap());
-    let seed: u64 = std::env::var("SS_GEN_SEED").unwrap().parse().unwrap();
-    let events: usize = std::env::var("SS_GEN_EVENTS").unwrap().parse().unwrap();
-    generate(&dir, seed, events);
-    if std::env::var("SS_GEN_LONG").is_ok() {
-        add_long_lines(&dir, seed);
-    }
-    if let Ok(shape) = std::env::var("SS_GEN_CHECK") {
-        let t: Vec<usize> = shape.split(',').map(|v| v.parse().unwrap()).collect();
-        let lk = load_lookups(&dir);
-        let want = naive::run(&dir, &lk);
-        // Shape: 0 three-phase, 1 one-pass, 2 dense, 3 indexed.
-        let shape = t.get(3).copied().unwrap_or(3);
-        let config = Config { onepass: shape == 1, dense: shape == 2, index: shape == 3, timing: true, ..cfg(t[0], t[1], t[2] as u32) };
-        check_shape(&dir, &config, &lk, &want);
-    }
 }
