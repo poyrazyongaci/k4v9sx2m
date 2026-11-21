@@ -6,14 +6,10 @@
 //!    its event key. One job meanwhile reads all links and builds the
 //!    user -> person map (union-find).
 //! 2. resolve: per event partition, dedup on the exact event key keeping the
-//!    smallest ingest, then scatter the survivors as 16-byte records by a
-//!    hash of their RAW user. Clicks get the same scatter. No link lookup.
-//! 3. person, in two passes over the same threads. The raw pass, per user
-//!    partition: group by user, ONE link lookup per user. A user in no link
-//!    is a whole person: sessionize, attribute clicks, aggregate, write
-//!    user_daily rows. Every linked user is forwarded, as one run of words,
-//!    to the partition of its person's name. The person pass, per partition
-//!    of forwarded runs: group the runs by person and do the same.
+//!    smallest ingest, then map the survivors' users to persons and scatter
+//!    16-byte records by person. Clicks get the same person scatter.
+//! 3. person: per person partition, group by person, sort by ts, sessionize,
+//!    attribute clicks, aggregate, and write user_daily row groups.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,7 +61,8 @@ struct Entry {
 
 const DEAD: u64 = u64::MAX;
 
-/// A valid click. `key` is the user key. `tc` is `ts_rel << 32 | campaign`, ts relative to the
+/// A valid click. `key` is the user key after parsing and the person key
+/// after resolve. `tc` is `ts_rel << 32 | campaign`, ts relative to the
 /// start of the click window.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -75,8 +72,6 @@ struct Click {
     tc: u64,
 }
 
-/// A surviving event on its way to the raw pass: `pkey` is the key of its
-/// raw user, `v` the entry's `w3`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Ev {
@@ -209,13 +204,11 @@ impl<'a> Fast<'a> {
 /// means the ID is its own person. Open addressing, 16-byte slots, on huge
 /// pages where the kernel gives them.
 ///
-/// A small blocked Bloom filter (two bits in one word per key) holds every
-/// linked ID: the ones in the table and the names of linked people, which
-/// are not in it. A filter miss is exact and means "in no link at all". A
-/// filter hit is always confirmed by the table; if the table has no entry,
-/// the ID is taken for the name of a linked person, which is harmless when
-/// the filter was wrong: such an ID only takes the longer road through the
-/// person pass.
+/// Most IDs that are looked up are their own person's name and so are not
+/// in the map at all. A small blocked Bloom filter (two bits in one word
+/// per key, about a megabyte at 20M events) answers "not in the map"
+/// from the cache, so only likely hits pay for a probe of the big table. A
+/// filter miss is exact; a filter hit is always confirmed by the table.
 #[derive(Clone, Copy)]
 pub struct LinkMap {
     slots: *mut [u64; 2],
@@ -371,23 +364,13 @@ impl LinkMap {
         }
         // Pass 2: the final map holds only IDs that are not their own name.
         let mut renamed: Vec<[u64; 2]> = Vec::with_capacity(keys.len());
-        let mut names: Vec<u64> = Vec::new();
         for id in 0..keys.len() as u32 {
             let root = find(&mut parent, id);
             if root != id {
                 renamed.push([keys[id as usize], keys[root as usize]]);
-            } else {
-                names.push(keys[id as usize]);
             }
         }
-        let map = LinkMap::with_slots((renamed.len() * 2).next_power_of_two().max(16), keys.len() * 2);
-        // The names of linked people are in the filter but not in the
-        // table, so a filter miss means "in no link at all": that ID is a
-        // whole person by itself.
-        for &key in &names {
-            let h = mix(key);
-            unsafe { *map.filter_word(h) |= Self::filter_bits(h) };
-        }
+        let map = LinkMap::with_slots((renamed.len() * 2).next_power_of_two().max(16), renamed.len());
         for block in renamed.chunks(16) {
             for pair in block {
                 map.prefetch_home(pair[0]);
@@ -730,7 +713,8 @@ impl<'a> Parser<'a> {
 
 // ---------------------------------------------------------------- phase 2
 
-struct Resolver {
+struct Resolver<'a> {
+    links: &'a LinkMap,
     table: Vec<u64>,
     ev: Scatter<Ev>,
     cl: Scatter<Click>,
@@ -742,9 +726,9 @@ const PTR_MASK: u64 = (1 << 48) - 1;
 /// Link lookups run in blocks of this many records, one stage at a time.
 const BLOCK: usize = 128;
 
-impl Resolver {
+impl<'a> Resolver<'a> {
     /// Dedup one event partition and scatter its surviving valid events by
-    /// raw user.
+    /// person.
     unsafe fn events(&mut self, lists: &[List<Entry>]) {
         let t = prof::start();
         let n: usize = lists.iter().map(|l| l.count()).sum();
@@ -789,13 +773,28 @@ impl Resolver {
             });
         }
         let t = prof::add(4, t);
+        // The link map is far bigger than the cache. Lookups go a block at
+        // a time, each stage for the whole block, so the misses of a block
+        // are all in flight together and every loop stays small.
+        let links = *self.links;
         let shift2 = self.shift2;
         let ev = &mut self.ev;
+        let mut hashes = [0u64; BLOCK];
+        let mut starts = [0usize; BLOCK];
         for list in lists {
             list.for_each_chunk(|chunk| {
-                for entry in chunk.iter() {
-                    if entry.w3 != DEAD {
-                        ev.push((mix(entry.ukey) >> shift2) as usize, Ev { pkey: entry.ukey, v: entry.w3 });
+                for block in chunk.chunks(BLOCK) {
+                    for (h, entry) in hashes.iter_mut().zip(block) {
+                        *h = links.stage1(entry.ukey);
+                    }
+                    for (at, &h) in starts.iter_mut().zip(&hashes[..block.len()]) {
+                        *at = links.stage2(h);
+                    }
+                    for (&at, entry) in starts.iter().zip(block) {
+                        if entry.w3 != DEAD {
+                            let pkey = links.stage3(at, entry.ukey);
+                            ev.push((mix(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+                        }
                     }
                 }
             });
@@ -817,10 +816,22 @@ impl Resolver {
 
     unsafe fn clicks(&mut self, block: &[Click]) {
         let t = prof::start();
+        let links = *self.links;
         let shift2 = self.shift2;
         let cl = &mut self.cl;
-        for click in block {
-            cl.push((mix(click.key) >> shift2) as usize, *click);
+        let mut hashes = [0u64; BLOCK];
+        let mut starts = [0usize; BLOCK];
+        for part in block.chunks(BLOCK) {
+            for (h, click) in hashes.iter_mut().zip(part) {
+                *h = links.stage1(click.key);
+            }
+            for (at, &h) in starts.iter_mut().zip(&hashes[..part.len()]) {
+                *at = links.stage2(h);
+            }
+            for (&at, click) in starts.iter().zip(part) {
+                let pkey = links.stage3(at, click.key);
+                cl.push((mix(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+            }
         }
         prof::add(6, t);
     }
@@ -850,23 +861,7 @@ struct PersonPhase<'a> {
     bought: Vec<u64>,
     ccounts: Vec<u32>,
     cids: Vec<u32>,
-    cl: Vec<[u64; 2]>,
-    // The raw pass: one link lookup per raw user.
-    links: LinkMap,
-    shift2: u32,
-    /// Per raw user: the partition of its person, or `LOCAL` for a user
-    /// in no link, who is a whole person and is finished where it is.
-    gpart: Vec<u32>,
-    gperson: Vec<u64>,
-    /// Forwarded users, as runs of words: `[events | clicks << 32, person,
-    /// purchases]`, then the event times two a word, the purchase values
-    /// and the `(click tc, click id)` pairs.
-    fwd: Option<Scatter<u64>>,
-    // The person pass: the chunks of a partition, and its clicks as they
-    // come with `(local person id, clicks)` per run.
-    chunks: Vec<(*const u64, usize)>,
-    cbuf: Vec<u64>,
-    cruns: Vec<(u32, u32)>,
+    cl: Vec<(u64, u64)>,
     // sliding window of campaigns with a click in reach
     cnt: Vec<u32>,
     pos: Vec<u32>,
@@ -879,8 +874,6 @@ struct PersonPhase<'a> {
     /// Summed sessions and revenue of the rows emitted, for the self-check.
     check: (u64, u64),
 }
-
-const LOCAL: u32 = u32::MAX;
 
 /// Events are never sorted by time. They are put in order of their time
 /// bin only: `ts_rel >> BIN_SHIFT`, bins of 2^20 ms. Two events of one bin
@@ -914,16 +907,8 @@ fn sort_u64(v: &mut [u64]) {
 }
 
 impl<'a> PersonPhase<'a> {
-    fn new(fast: &'a Fast<'a>, out: UserOut<'a>, links: LinkMap, bitsf: u32) -> Self {
+    fn new(fast: &'a Fast<'a>, out: UserOut<'a>) -> Self {
         PersonPhase {
-            links,
-            shift2: 64 - bitsf,
-            gpart: Vec::new(),
-            gperson: Vec::new(),
-            fwd: Some(Scatter::new(1 << bitsf, CHUNK_BYTES)),
-            chunks: Vec::new(),
-            cbuf: Vec::new(),
-            cruns: Vec::new(),
             fast,
             tab_keys: Vec::new(),
             tab_ids: Vec::new(),
@@ -969,9 +954,12 @@ impl<'a> PersonPhase<'a> {
         }
     }
 
-    /// Empty tables for a partition of at most `n` events.
-    #[inline(always)]
-    fn begin(&mut self, n: usize) {
+    unsafe fn partition(&mut self, evs: &[List<Ev>], cls: &[List<Click>]) {
+        let t = prof::start();
+        let n: usize = evs.iter().map(|l| l.count()).sum();
+        if n == 0 {
+            return;
+        }
         let cap = (n / 8).next_power_of_two().max(256);
         self.tab_keys.clear();
         self.tab_keys.resize(cap, 0);
@@ -986,45 +974,50 @@ impl<'a> PersonPhase<'a> {
         self.words.clear();
         self.words.reserve(n);
         self.buys.clear();
-    }
+        let words = self.words.as_mut_ptr();
+        let mut at = 0usize;
 
-    /// The local id of `key`. A new id starts with a count of zero.
-    #[inline(always)]
-    unsafe fn intern(&mut self, key: u64) -> u32 {
-        let mut mask = self.tab_keys.len() - 1;
-        let mut i = (mix(key) >> 8) as usize & mask;
-        loop {
-            let k = *self.tab_keys.get_unchecked(i);
-            if k == key {
-                return *self.tab_ids.get_unchecked(i);
-            }
-            if k == 0 {
-                if (self.pkeys.len() + 1) * 2 > self.tab_keys.len() {
-                    self.grow_table();
-                    mask = self.tab_keys.len() - 1;
-                    i = (mix(key) >> 8) as usize & mask;
-                    continue;
+        // Pass 1: a local id per person, how many events each person has
+        // and each time bin has, and one word per event.
+        for list in evs {
+            list.for_each_chunk(|chunk| {
+                for rec in chunk.iter() {
+                    let mut mask = self.tab_keys.len() - 1;
+                    let mut i = (mix(rec.pkey) >> 8) as usize & mask;
+                    let id = loop {
+                        let k = *self.tab_keys.get_unchecked(i);
+                        if k == rec.pkey {
+                            break *self.tab_ids.get_unchecked(i);
+                        }
+                        if k == 0 {
+                            if (self.pkeys.len() + 1) * 2 > self.tab_keys.len() {
+                                self.grow_table();
+                                mask = self.tab_keys.len() - 1;
+                                i = (mix(rec.pkey) >> 8) as usize & mask;
+                                continue;
+                            }
+                            let id = self.pkeys.len() as u32;
+                            *self.tab_keys.get_unchecked_mut(i) = rec.pkey;
+                            *self.tab_ids.get_unchecked_mut(i) = id;
+                            self.pkeys.push(rec.pkey);
+                            self.counts.push(0);
+                            break id;
+                        }
+                        i = (i + 1) & mask;
+                    };
+                    *self.counts.get_unchecked_mut(id as usize) += 1;
+                    *self.bins.get_unchecked_mut((rec.v >> (32 + BIN_SHIFT)) as usize) += 1;
+                    *words.add(at) = (rec.v & !0xFFFF_FFFF) | u64::from(id);
+                    at += 1;
+                    if rec.v as u32 != 0 {
+                        self.buys.push((rec.v, id));
+                    }
                 }
-                let id = self.pkeys.len() as u32;
-                *self.tab_keys.get_unchecked_mut(i) = key;
-                *self.tab_ids.get_unchecked_mut(i) = id;
-                self.pkeys.push(key);
-                self.counts.push(0);
-                return id;
-            }
-            i = (i + 1) & mask;
+            });
         }
-    }
-
-    /// From `words` (one per event, input order), the event count per time
-    /// bin in `bins` and per id in `counts`, and `buys`: every id's event
-    /// times in bin order in `ev`, and its purchases in `bought`.
-    /// `counts[i]` and `bcounts[i]` become the end offsets of id `i`.
-    #[inline(always)]
-    unsafe fn order(&mut self) {
-        let n = self.words.len();
-        let ids = self.pkeys.len();
-        // The whole partition into bin order.
+        self.words.set_len(n);
+        let people = self.pkeys.len();
+        // Pass 2: the whole partition into bin order.
         let mut sum = 0u32;
         for c in self.bins.iter_mut() {
             let k = *c;
@@ -1039,7 +1032,8 @@ impl<'a> PersonPhase<'a> {
             *self.binned.get_unchecked_mut(*w as usize) = word;
             *w += 1;
         }
-        // A stable scatter by id, so each id's events are in bin order.
+        // Pass 3: a stable scatter by person, so each person's events are
+        // in bin order.
         // counts -> start offsets (counts[i] becomes the write cursor).
         let mut sum = 0u32;
         for c in self.counts.iter_mut() {
@@ -1048,18 +1042,18 @@ impl<'a> PersonPhase<'a> {
             sum += k;
         }
         self.ev.clear();
-        // Room for one more: a forwarded run reads its times as whole words.
-        self.ev.reserve(n + 2);
+        self.ev.reserve(n);
         self.ev.set_len(n);
         for &word in &self.binned {
             let w = self.counts.get_unchecked_mut(word as u32 as usize);
             *self.ev.get_unchecked_mut(*w as usize) = (word >> 32) as u32;
             *w += 1;
         }
+        // counts[i] is now the end offset of person i.
 
-        // The purchases, id after id.
+        // The purchases, person after person.
         self.bcounts.clear();
-        self.bcounts.resize(ids, 0);
+        self.bcounts.resize(people, 0);
         for &(_, id) in &self.buys {
             *self.bcounts.get_unchecked_mut(id as usize) += 1;
         }
@@ -1077,87 +1071,15 @@ impl<'a> PersonPhase<'a> {
             *self.bought.get_unchecked_mut(*w as usize) = v;
             *w += 1;
         }
-    }
 
-    /// The raw pass, over a partition of records keyed by RAW user. One
-    /// link lookup per user, not per event. A user in no link is a whole
-    /// person and is finished here. Every other user is forwarded as one
-    /// run to the partition of its person's name; for the name itself that
-    /// is this partition, in the person pass.
-    unsafe fn partition_raw(&mut self, evs: &[List<Ev>], cls: &[List<Click>]) {
-        let t = prof::start();
-        let n: usize = evs.iter().map(|l| l.count()).sum();
+        // Clicks of people that have events here; the rest cannot matter.
         let nc: usize = cls.iter().map(|l| l.count()).sum();
-        if n == 0 && nc == 0 {
-            return;
-        }
-        self.begin(n);
-        // A local id per user, how many events each user has and each time
-        // bin has, and one word per event.
-        let words = self.words.as_mut_ptr();
-        let mut at = 0usize;
-        for list in evs {
-            list.for_each_chunk(|chunk| {
-                for rec in chunk.iter() {
-                    let id = self.intern(rec.pkey);
-                    *self.counts.get_unchecked_mut(id as usize) += 1;
-                    *self.bins.get_unchecked_mut((rec.v >> (32 + BIN_SHIFT)) as usize) += 1;
-                    *words.add(at) = (rec.v & !0xFFFF_FFFF) | u64::from(id);
-                    at += 1;
-                    if rec.v as u32 != 0 {
-                        self.buys.push((rec.v, id));
-                    }
-                }
-            });
-        }
-        self.words.set_len(n);
-        let users = self.pkeys.len();
-        let t = prof::add(10, t);
-
-        // Who is linked. A block of lookups a stage, so their cache misses
-        // overlap.
-        let links = self.links;
-        let shift2 = self.shift2;
-        self.gpart.clear();
-        self.gpart.resize(users, LOCAL);
-        self.gperson.clear();
-        self.gperson.resize(users, 0);
-        {
-            let mut hashes = [0u64; BLOCK];
-            let mut starts = [0usize; BLOCK];
-            let mut g = 0usize;
-            for block in self.pkeys.chunks(BLOCK) {
-                for (h, &key) in hashes.iter_mut().zip(block) {
-                    *h = links.stage1(key);
-                }
-                for (at, &h) in starts.iter_mut().zip(&hashes[..block.len()]) {
-                    *at = links.stage2(h);
-                }
-                for (&at, &key) in starts.iter().zip(block) {
-                    if at != links.nowhere {
-                        let person = links.stage3(at, key);
-                        *self.gperson.get_unchecked_mut(g) = person;
-                        *self.gpart.get_unchecked_mut(g) = (mix(person) >> shift2) as u32;
-                    }
-                    g += 1;
-                }
-            }
-        }
-        let t = prof::add(11, t);
-
-        self.order();
-        let t = prof::add(12, t);
-
-        // Clicks, user after user. One whose user has no events here may
-        // still belong to a linked person with events elsewhere: it goes
-        // there as a run of no events and one click.
         self.ccounts.clear();
-        self.ccounts.resize(users + 1, 0);
+        self.ccounts.resize(people + 1, 0);
         self.cl.clear();
         if nc > 0 {
             self.cids.clear();
             self.cids.reserve(nc);
-            let fwd = self.fwd.as_mut().unwrap_unchecked();
             let mask = self.tab_keys.len() - 1;
             for list in cls {
                 list.for_each_chunk(|chunk| {
@@ -1176,17 +1098,6 @@ impl<'a> PersonPhase<'a> {
                         self.cids.push(id);
                         if id != u32::MAX {
                             *self.ccounts.get_unchecked_mut(id as usize) += 1;
-                        } else {
-                            let at = links.start(mix(rec.key));
-                            if at != links.nowhere {
-                                let person = links.stage3(at, rec.key);
-                                let part = (mix(person) >> shift2) as usize;
-                                fwd.push(part, 1 << 32);
-                                fwd.push(part, person);
-                                fwd.push(part, 0);
-                                fwd.push(part, rec.tc);
-                                fwd.push(part, rec.ckey);
-                            }
                         }
                     }
                 });
@@ -1207,192 +1118,12 @@ impl<'a> PersonPhase<'a> {
                         at += 1;
                         if id != u32::MAX {
                             let w = self.ccounts.get_unchecked_mut(id as usize);
-                            *self.cl.get_unchecked_mut(*w as usize) = [rec.tc, rec.ckey];
+                            *self.cl.get_unchecked_mut(*w as usize) = (rec.tc, rec.ckey);
                             *w += 1;
                         }
                     }
                 });
             }
-        }
-        let t = prof::add(13, t);
-
-        // Forward the linked users: times, purchases and clicks.
-        {
-            let fwd = self.fwd.as_mut().unwrap_unchecked();
-            let mut ev_start = 0usize;
-            let mut cl_start = 0usize;
-            let mut buy_start = 0usize;
-            for g in 0..users {
-                let ev_end = *self.counts.get_unchecked(g) as usize;
-                let cl_end = if nc > 0 { *self.ccounts.get_unchecked(g) as usize } else { 0 };
-                let buy_end = *self.bcounts.get_unchecked(g) as usize;
-                let part = *self.gpart.get_unchecked(g);
-                if part != LOCAL {
-                    let part = part as usize;
-                    let evc = ev_end - ev_start;
-                    fwd.push(part, evc as u64 | ((cl_end - cl_start) as u64) << 32);
-                    fwd.push(part, *self.gperson.get_unchecked(g));
-                    fwd.push(part, (buy_end - buy_start) as u64);
-                    // Two times a word; an odd count drags one stray time
-                    // along, which the reader skips.
-                    let times = self.ev.as_ptr().add(ev_start) as *const u64;
-                    fwd.push_words(part, std::slice::from_raw_parts(times, evc.div_ceil(2)));
-                    fwd.push_words(part, self.bought.get_unchecked(buy_start..buy_end));
-                    if cl_end > cl_start {
-                        let pairs = self.cl.as_ptr().add(cl_start) as *const u64;
-                        fwd.push_words(part, std::slice::from_raw_parts(pairs, (cl_end - cl_start) * 2));
-                    }
-                }
-                ev_start = ev_end;
-                cl_start = cl_end;
-                buy_start = buy_end;
-            }
-        }
-        let t = prof::add(15, t);
-
-        // Finish the unlinked ones.
-        let mut ev_start = 0usize;
-        let mut cl_start = 0usize;
-        let mut buy_start = 0usize;
-        for g in 0..users {
-            let ev_end = self.counts[g] as usize;
-            let cl_end = if nc > 0 { self.ccounts[g] as usize } else { 0 };
-            let buy_end = self.bcounts[g] as usize;
-            if self.gpart[g] == LOCAL {
-                self.person(g, ev_start, ev_end, cl_start, cl_end, buy_start, buy_end);
-            }
-            ev_start = ev_end;
-            cl_start = cl_end;
-            buy_start = buy_end;
-        }
-        let t = prof::add(14, t);
-
-        // This partition's chunks are dead: they become forwarding chunks.
-        let fwd = self.fwd.as_mut().unwrap_unchecked();
-        let bytes = fwd.chunk_bytes();
-        for list in evs {
-            list.release(|chunk| fwd.recycle(chunk, bytes));
-        }
-        for list in cls {
-            list.release(|chunk| fwd.recycle(chunk, bytes));
-        }
-        let t = prof::add(16, t);
-        if self.out.flush_full() {
-            prof::add(9, t);
-        }
-    }
-
-    /// The person pass, over a partition of forwarded runs keyed by person.
-    /// One table probe per run. A run never crosses from one list to the
-    /// next, but it may cross chunks.
-    unsafe fn partition(&mut self, runs: &[List<u64>]) {
-        let t = prof::start();
-        self.chunks.clear();
-        for list in runs {
-            list.chunks_oldest_first(&mut self.chunks);
-        }
-        let total: usize = self.chunks.iter().map(|c| c.1).sum();
-        if total == 0 {
-            return;
-        }
-        self.begin(total);
-        // A word holds two event times.
-        self.words.reserve(total * 2);
-        self.ccounts.clear();
-        self.cbuf.clear();
-        self.cbuf.reserve(total);
-        self.cruns.clear();
-        let words = self.words.as_mut_ptr();
-        let cbuf = self.cbuf.as_mut_ptr();
-        let (mut n, mut nc) = (0usize, 0usize);
-        // What the next word is: 0 the counts, 1 the person, 2 the number
-        // of purchases, then the run's times, purchases and clicks.
-        let mut stage = 0u32;
-        let mut head = 0u64;
-        let mut id = 0u32;
-        let (mut left_ev, mut left_buy, mut left_cl) = (0usize, 0usize, 0usize);
-        for at in 0..self.chunks.len() {
-            let (ptr, len) = self.chunks[at];
-            let mut i = 0usize;
-            while i < len {
-                if left_ev > 0 {
-                    // Two times a word.
-                    let take = left_ev.div_ceil(2).min(len - i);
-                    let times = ptr.add(i) as *const u32;
-                    let count = (take * 2).min(left_ev);
-                    for k in 0..count {
-                        let ts = *times.add(k);
-                        *self.bins.get_unchecked_mut((ts >> BIN_SHIFT) as usize) += 1;
-                        *words.add(n) = u64::from(ts) << 32 | u64::from(id);
-                        n += 1;
-                    }
-                    i += take;
-                    left_ev -= count;
-                    continue;
-                }
-                if left_buy > 0 {
-                    let take = left_buy.min(len - i);
-                    for k in i..i + take {
-                        self.buys.push((*ptr.add(k), id));
-                    }
-                    i += take;
-                    left_buy -= take;
-                    continue;
-                }
-                if left_cl > 0 {
-                    let take = left_cl.min(len - i);
-                    sys::copy_words(ptr.add(i), cbuf.add(nc), take);
-                    nc += take;
-                    i += take;
-                    left_cl -= take;
-                    continue;
-                }
-                let w = *ptr.add(i);
-                i += 1;
-                if stage == 0 {
-                    head = w;
-                    stage = 1;
-                } else if stage == 1 {
-                    id = self.intern(w);
-                    if self.ccounts.len() < self.pkeys.len() {
-                        self.ccounts.push(0);
-                    }
-                    stage = 2;
-                } else {
-                    let (evc, clc) = (head as u32, (head >> 32) as u32);
-                    *self.counts.get_unchecked_mut(id as usize) += evc;
-                    if clc > 0 {
-                        *self.ccounts.get_unchecked_mut(id as usize) += clc;
-                        self.cruns.push((id, clc));
-                    }
-                    left_ev = evc as usize;
-                    left_buy = w as usize;
-                    left_cl = clc as usize * 2;
-                    stage = 0;
-                }
-            }
-        }
-        self.words.set_len(n);
-        let people = self.pkeys.len();
-        self.order();
-
-        // Clicks, person after person.
-        let mut sum = 0u32;
-        for c in self.ccounts.iter_mut() {
-            let k = *c;
-            *c = sum;
-            sum += k;
-        }
-        self.cl.clear();
-        self.cl.reserve(sum as usize);
-        self.cl.set_len(sum as usize);
-        let cl = self.cl.as_mut_ptr() as *mut u64;
-        let mut from = cbuf as *const u64;
-        for &(id, clc) in &self.cruns {
-            let w = self.ccounts.get_unchecked_mut(id as usize);
-            sys::copy_words(from, cl.add(*w as usize * 2), clc as usize * 2);
-            *w += clc;
-            from = from.add(clc as usize * 2);
         }
 
         let t = prof::add(7, t);
@@ -1401,7 +1132,7 @@ impl<'a> PersonPhase<'a> {
         let mut buy_start = 0usize;
         for p in 0..people {
             let ev_end = self.counts[p] as usize;
-            let cl_end = self.ccounts[p] as usize;
+            let cl_end = if nc > 0 { self.ccounts[p] as usize } else { 0 };
             let buy_end = self.bcounts[p] as usize;
             self.person(p, ev_start, ev_end, cl_start, cl_end, buy_start, buy_end);
             ev_start = ev_end;
@@ -1452,7 +1183,7 @@ impl<'a> PersonPhase<'a> {
         if cl.len() > 1 {
             // By ts, then by click id descending: the last click at or
             // before a session start is the latest with the smallest id.
-            cl.sort_unstable_by(|a, b| (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| cmp_ids(b[1], a[1])));
+            cl.sort_unstable_by(|a, b| (a.0 >> 32).cmp(&(b.0 >> 32)).then_with(|| cmp_ids(b.1, a.1)));
         }
         if buy_end - buy_start > 1 {
             // The time is the top half of a value.
@@ -1538,7 +1269,7 @@ impl<'a> PersonPhase<'a> {
     /// is the person's clicks in order, `win` the range of them in reach of
     /// the previous session; sessions come in order of their start.
     #[inline(always)]
-    unsafe fn credit(&mut self, cl: &[[u64; 2]], win: &mut (usize, usize), start: u64, day: usize, revenue: u64) {
+    unsafe fn credit(&mut self, cl: &[(u64, u64)], win: &mut (usize, usize), start: u64, day: usize, revenue: u64) {
         let ndays = self.fast.ndays;
         let mut credit = self.fast.ncamp;
         if !cl.is_empty() {
@@ -1547,8 +1278,8 @@ impl<'a> PersonPhase<'a> {
             // Click times are relative to window_start - 7 days, so a
             // session start S is S + reach on that clock.
             let upto = start + reach;
-            while hi < cl.len() && (cl.get_unchecked(hi)[0] >> 32) <= upto {
-                let c = cl.get_unchecked(hi)[0] as u32 as usize;
+            while hi < cl.len() && (cl.get_unchecked(hi).0 >> 32) <= upto {
+                let c = cl.get_unchecked(hi).0 as u32 as usize;
                 if *self.cnt.get_unchecked(c) == 0 {
                     *self.pos.get_unchecked_mut(c) = self.active.len() as u32;
                     self.active.push(c as u32);
@@ -1556,8 +1287,8 @@ impl<'a> PersonPhase<'a> {
                 *self.cnt.get_unchecked_mut(c) += 1;
                 hi += 1;
             }
-            while lo < hi && (cl.get_unchecked(lo)[0] >> 32) < start {
-                let c = cl.get_unchecked(lo)[0] as u32 as usize;
+            while lo < hi && (cl.get_unchecked(lo).0 >> 32) < start {
+                let c = cl.get_unchecked(lo).0 as u32 as usize;
                 *self.cnt.get_unchecked_mut(c) -= 1;
                 if *self.cnt.get_unchecked(c) == 0 {
                     let at = *self.pos.get_unchecked(c) as usize;
@@ -1569,7 +1300,7 @@ impl<'a> PersonPhase<'a> {
                 lo += 1;
             }
             if hi > lo {
-                credit = cl.get_unchecked(hi - 1)[0] as u32 as usize;
+                credit = cl.get_unchecked(hi - 1).0 as u32 as usize;
             }
             for &c in &self.active {
                 self.agg.get_unchecked_mut(c as usize * ndays + day)[3] += 1;
@@ -1643,8 +1374,6 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let bits1 = bits_for(estimate, 48_000, cfg.p1_bits);
     let bits2 = bits_for(estimate, 48_000, cfg.p2_bits);
     let (parts1, parts2) = (1usize << bits1, 1usize << bits2);
-    // Partitions of the person pass, which sees the linked users only.
-    let bitsf = std::env::var("ENGINE_PF_BITS").ok().and_then(|v| v.parse::<u32>().ok()).map_or(bits2, |b| b.clamp(1, 14));
 
     // Jobs: the links job first, then event chunks (largest files first),
     // then click chunks.
@@ -1752,6 +1481,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
             .map(|_| {
                 scope.spawn(|| unsafe {
                     let mut r = Resolver {
+                        links,
                         table: Vec::new(),
                         ev: Scatter::new(parts2, CHUNK_BYTES),
                         cl: Scatter::new(parts2, CHUNK_BYTES),
@@ -1785,8 +1515,6 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     timer.lap("resolve", std::mem::take(&mut *cpu_total.lock().unwrap()));
 
     // ---- phase 3: biggest partitions first, so the tail is short jobs.
-    // Both passes run on the same threads, so a thread keeps its tables
-    // and its output file.
     let mut order: Vec<usize> = (0..parts2).collect();
     let weight = |p: usize| -> u32 { ev_lists.iter().map(|t| t[p].chunks).sum() };
     order.sort_by_key(|&p| std::cmp::Reverse(weight(p)));
@@ -1794,13 +1522,6 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let ev_lists = &ev_lists;
     let cl_lists = &cl_lists;
     let order = &order;
-    // The raw pass forwards into per-thread lists; the person pass starts
-    // when every thread has handed its lists in.
-    let barrier = std::sync::Barrier::new(threads);
-    let forwarded: Mutex<Vec<Vec<List<u64>>>> = Mutex::new(Vec::new());
-    let order2: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
-    let next2 = AtomicUsize::new(0);
-    let (barrier, forwarded, order2, next2) = (&barrier, &forwarded, &order2, &next2);
     let collected: Mutex<Vec<UserRow>> = Mutex::new(Vec::new());
     let collected_ref = &collected;
     let mut agg = vec![[0u64; 4]; (fast.ncamp + 1) * fast.ndays];
@@ -1816,7 +1537,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                 scope.spawn(move || unsafe {
                     let user_out =
                         UserOut::new(out_dir.as_deref(), t, lk, fast.ws_day, fast.ndays, cfg.collect.then_some(collected_ref));
-                    let mut phase = PersonPhase::new(fast, user_out, *links, bitsf);
+                    let mut phase = PersonPhase::new(fast, user_out);
                     let mut evs: Vec<List<Ev>> = Vec::with_capacity(threads);
                     let mut cls: Vec<List<Click>> = Vec::with_capacity(threads);
                     loop {
@@ -1828,25 +1549,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                         evs.extend(ev_lists.iter().map(|t| t[p]));
                         cls.clear();
                         cls.extend(cl_lists.iter().map(|t| t[p]));
-                        phase.partition_raw(&evs, &cls);
-                    }
-                    forwarded.lock().unwrap().push(phase.fwd.take().unwrap().finish());
-                    barrier.wait();
-                    let all = forwarded.lock().unwrap().clone();
-                    let order = order2.get_or_init(|| {
-                        let mut order: Vec<usize> = (0..1usize << bitsf).collect();
-                        order.sort_by_key(|&p| std::cmp::Reverse(all.iter().map(|t| t[p].chunks).sum::<u32>()));
-                        order
-                    });
-                    let mut runs: Vec<List<u64>> = Vec::with_capacity(threads);
-                    loop {
-                        let at = next2.fetch_add(1, Ordering::Relaxed);
-                        let Some(&p) = order.get(at) else {
-                            break;
-                        };
-                        runs.clear();
-                        runs.extend(all.iter().map(|t| t[p]));
-                        phase.partition(&runs);
+                        phase.partition(&evs, &cls);
                     }
                     let t0 = prof::start();
                     phase.out.finish();
