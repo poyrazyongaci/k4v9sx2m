@@ -20,6 +20,7 @@ fn cfg(threads: usize, chunk: usize, bits: u32) -> Config {
         dense: false,
         dense_slots: None,
         fused: true,
+        post: false,
     }
 }
 
@@ -83,7 +84,7 @@ fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) -> boo
 
 fn fixtures_dir() -> Option<PathBuf> {
     let dir = std::env::var("SESSIONS_FIXTURES").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from("/Users/yamanakbas/Developer/buildathon-2026/tracks/shopping-sessions/kit/starter-duckdb/starter-duckdb/fixtures")
+        PathBuf::from("fixtures")
     });
     dir.is_dir().then_some(dir)
 }
