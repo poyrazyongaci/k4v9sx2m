@@ -141,7 +141,7 @@ struct Ev {
 }
 
 const CHUNK_BYTES: usize = 16384;
-const CLICK_BLOCK: usize = 16384;
+pub(crate) const CLICK_BLOCK: usize = 16384;
 const WINDOW: usize = 1 << 16;
 const WINDOW_SLACK: usize = 4096;
 
@@ -470,6 +470,7 @@ impl LinkMap {
     /// `build`, and the memory of its work tables (node ids, keys,
     /// parents, renamed pairs): dead, mostly faulted in already, and never
     /// unmapped or reused, as `(address, bytes)` regions.
+    #[cfg(test)]
     fn build_with_spare(pairs: &[(u64, u64)]) -> (LinkMap, Vec<(usize, usize)>) {
         Self::build_with_room(pairs, 8)
     }
@@ -578,7 +579,202 @@ impl LinkMap {
         give(renamed, &mut spare);
         (map, spare)
     }
+
+    /// What `build_with_spare` makes, on one thread, with the cache misses
+    /// of many pairs in flight at once.
+    ///
+    /// A node is a slot of an open-addressing table: its ID, and its
+    /// parent (0 for a root, else the parent's slot plus one), in one
+    /// 16-byte slot, so a step of `find` is one miss. Unions link the root
+    /// with the larger ID under the one with the smaller, so a root is the
+    /// smallest ID of its set, the person's name; each link is noted as
+    /// (ID, parent then). The map then puts each noted ID under its root's
+    /// ID. Both passes run as software pipelines: while one pair or note
+    /// does its dependent work, the lines of the next few dozen are
+    /// already on their way.
+    fn build_serial(pairs: &[(u64, u64)]) -> (LinkMap, Vec<(usize, usize)>) {
+        Self::build_serial_with_room(pairs, 8)
+    }
+
+    fn build_serial_with_room(pairs: &[(u64, u64)], room: usize) -> (LinkMap, Vec<(usize, usize)>) {
+        Self::build_serial_tuned::<32, 16, 48, 32, 16>(pairs, room)
+    }
+
+    fn build_serial_tuned<const DH: usize, const DI: usize, const MA: usize, const MC: usize, const MB: usize>(
+        pairs: &[(u64, u64)],
+        room: usize,
+    ) -> (LinkMap, Vec<(usize, usize)>) {
+        const RING: usize = 64;
+        const { assert!(DI <= DH && DH < RING && MB <= MC && MC <= MA && MA < RING) };
+        let total = pairs.len();
+        if total == 0 {
+            return (LinkMap::with_slots(4, 0, true), Vec::new());
+        }
+        // Bound: at most two distinct IDs a pair, so at most 2 * total keys
+        // go in, and the table has 2 * total + 1 slots or more: an empty
+        // slot always remains, which ends every probe. Real links form
+        // trees (about one new ID a pair), so it is under half full.
+        let t0 = Instant::now();
+        let cap = (total * 2 + 1).next_power_of_two().max(16);
+        // Slot numbers are noted as u32.
+        assert!(cap <= 1 << 32, "too many links");
+        let mask = cap - 1;
+        let nodes = sys::anon(cap * 16) as *mut [u64; 2];
+        let home = |key: u64| (link_hash(key) >> 17) as usize & mask;
+        // Every slot index below is `& mask` or a parent pointer, which is
+        // a slot index plus one, so all accesses are inside the `cap` slots.
+        // A hit and a new key are a coin toss, so both end the probe on one
+        // branch, and the key is stored either way.
+        let intern = |key: u64| -> usize {
+            let mut i = home(key);
+            loop {
+                let k = unsafe { (*nodes.add(i))[0] };
+                if (k == key) | (k == 0) {
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+            unsafe { (*nodes.add(i))[0] = key };
+            i
+        };
+        // Most nodes are a root or one step below one: those two cases take
+        // no branch that depends on which. Deeper paths go out of line.
+        let find_far = |mut x: usize| -> usize {
+            loop {
+                let up = unsafe { (*nodes.add(x))[1] };
+                if up == 0 {
+                    return x;
+                }
+                let p = up as usize - 1;
+                let above = unsafe { (*nodes.add(p))[1] };
+                if above != 0 {
+                    // Path halving.
+                    unsafe { (*nodes.add(x))[1] = above };
+                }
+                x = p;
+            }
+        };
+        let find = |x: usize| -> usize {
+            let up = unsafe { (*nodes.add(x))[1] };
+            let p = std::hint::select_unpredictable(up == 0, x, (up as usize).wrapping_sub(1));
+            // A root reads its own parent word again: 0.
+            if unsafe { (*nodes.add(p))[1] } == 0 {
+                return p;
+            }
+            find_far(x)
+        };
+        // Bound: a pair makes at most one link, so at most `total` notes;
+        // reserved up front, so pushes never reallocate (a plain `push`,
+        // correct either way).
+        let mut made: Vec<(u64, u32)> = Vec::with_capacity(total);
+        let union = |made: &mut Vec<(u64, u32)>, na: usize, nb: usize| {
+            let (ra, rb) = (find(na), find(nb));
+            if ra != rb {
+                let (ka, kb) = unsafe { ((*nodes.add(ra))[0], (*nodes.add(rb))[0]) };
+                let lt = cmp_ids(ka, kb).is_lt();
+                let small = std::hint::select_unpredictable(lt, ra, rb);
+                let large = std::hint::select_unpredictable(lt, rb, ra);
+                let key = std::hint::select_unpredictable(lt, kb, ka);
+                unsafe { (*nodes.add(large))[1] = small as u64 + 1 };
+                made.push((key, small as u32));
+            }
+        };
+        // Pass 1, a pipeline of three stages over the pairs: ask for the
+        // homes of pair i + DH, intern pair i + DH - DI and ask for one step
+        // up from each of its nodes, union pair i.
+        let mut ring = [(0usize, 0usize); RING];
+        let n = pairs.len();
+        for i in 0..n + DH {
+            if let Some(&(a, b)) = pairs.get(i) {
+                prefetch(unsafe { nodes.add(home(a)) });
+                prefetch(unsafe { nodes.add(home(b)) });
+            }
+            if let Some(j) = i.checked_sub(DH - DI) {
+                if let Some(&(a, b)) = pairs.get(j) {
+                    let (na, nb) = (intern(a), intern(b));
+                    ring[j % RING] = (na, nb);
+                    for node in [na, nb] {
+                        let up = unsafe { (*nodes.add(node))[1] };
+                        prefetch(unsafe { nodes.add(std::hint::select_unpredictable(up == 0, node, (up as usize).wrapping_sub(1))) });
+                    }
+                }
+            }
+            if let Some(k) = i.checked_sub(DH) {
+                let (na, nb) = ring[k % RING];
+                union(&mut made, na, nb);
+            }
+        }
+        // Pass 2, the same pipeline over the notes: ask for the parent
+        // node of note i + MA, find the root of note i + MA - MB and ask
+        // for its bucket and filter word, place note i.
+        let t1 = Instant::now();
+        let count = made.len();
+        let buckets = (count * room / 4).next_power_of_two().max(16) / BUCKET;
+        let map = LinkMap::with_slots(buckets, count, true);
+        let mut ready = [(0u64, 0u64, 0u64); RING];
+        for i in 0..count + MA {
+            if let Some(&(_, up)) = made.get(i) {
+                prefetch(unsafe { nodes.add(up as usize) });
+            }
+            if let Some(j) = i.checked_sub(MA - MC) {
+                if let Some(&(_, up)) = made.get(j) {
+                    let up = up as usize;
+                    let above = unsafe { (*nodes.add(up))[1] };
+                    prefetch(unsafe { nodes.add(std::hint::select_unpredictable(above == 0, up, (above as usize).wrapping_sub(1))) });
+                }
+            }
+            if let Some(j) = i.checked_sub(MA - MB) {
+                if let Some(&(key, up)) = made.get(j) {
+                    let h = link_hash(key);
+                    let name = unsafe { (*nodes.add(find(up as usize)))[0] };
+                    ready[j % RING] = (key, name, h);
+                    prefetch(map.bucket(map.home_of(h)));
+                    prefetch(map.filter_word(h));
+                }
+            }
+            if let Some(k) = i.checked_sub(MA) {
+                let (key, name, h) = ready[k % RING];
+                let mut i = map.home_of(h);
+                unsafe {
+                    // Buckets fill from the front and nothing is ever
+                    // removed, so the last key tells whether one is
+                    // full. The map has more key room than notes
+                    // (`room` >= 5 quarters of them), so a bucket with
+                    // room is always found.
+                    let (b, free) = loop {
+                        let b = map.bucket(i);
+                        let free = Self::matches(b, 0);
+                        if free != 0 {
+                            break (b, free);
+                        }
+                        i = (i + 1) & map.mask;
+                    };
+                    // `free` is a nonzero mask of BUCKET bits: j < BUCKET.
+                    let j = free.trailing_zeros() as usize;
+                    *b.add(j) = key;
+                    *b.add(BUCKET + j) = name;
+                    *map.filter_word(h) |= Self::filter_bits(h);
+                }
+            }
+        }
+        if prof::ON.load(Ordering::Relaxed) {
+            let t2 = Instant::now();
+            eprintln!(
+                "[engine]   links serial: union {:.1} ms, map {:.1} ms; pairs {total}, node cap {cap}, renamed {count}",
+                (t1 - t0).as_secs_f64() * 1e3,
+                (t2 - t1).as_secs_f64() * 1e3
+            );
+        }
+        let mut spare = vec![(nodes as usize, cap * 16)];
+        let bytes = made.capacity() * std::mem::size_of::<(u64, u32)>();
+        if bytes >= crate::alloc::BIG {
+            let v = std::mem::ManuallyDrop::new(made);
+            spare.push((v.as_ptr() as usize, bytes));
+        }
+        (map, spare)
+    }
 }
+
 
 /// A raw pointer that threads may share; what it points at is atomic.
 #[derive(Clone, Copy)]
@@ -4180,7 +4376,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                                     parser.run_chunk(*m, 0, m.len, Kind::Links);
                                 }
                                 let t = prof::add(2, t);
-                                let (map, spare) = LinkMap::build_with_spare(&parser.st.pairs);
+                                let (map, spare) = LinkMap::build_serial(&parser.st.pairs);
                                 prof::add(3, t);
                                 *link_map.lock().unwrap() = Some(map);
                                 *link_spare.lock().unwrap() = spare;
@@ -4492,6 +4688,165 @@ mod link_tests {
                     .count();
                 assert!(pairs_n < 100_000 || far > 20, "round {round} room {room}: only {far} keys overflowed");
             }
+        }
+    }
+
+    /// The plain union-find answer for `pairs`: key -> person name.
+    fn reference(pairs: &[(u64, u64)]) -> HashMap<u64, u64> {
+        let mut parent: HashMap<u64, u64> = HashMap::new();
+        for &(a, b) in pairs {
+            parent.entry(a).or_insert(a);
+            parent.entry(b).or_insert(b);
+            let (ra, rb) = (root(&parent, a), root(&parent, b));
+            if ra != rb {
+                let (lo, hi) = if cmp_ids(ra, rb).is_lt() { (ra, rb) } else { (rb, ra) };
+                parent.insert(hi, lo);
+            }
+        }
+        parent.keys().map(|&k| (k, root(&parent, k))).collect()
+    }
+
+    /// Every key of `want`, and keys not in it, looked up through the
+    /// staged lookup of `map`.
+    fn check_map(map: &LinkMap, want: &HashMap<u64, u64>, extra: &[u64], what: &str) {
+        let probes: Vec<u64> = want.keys().copied().chain(extra.iter().copied()).collect();
+        for block in probes.chunks(BLOCK) {
+            let hashes: Vec<u64> = block.iter().map(|&k| map.stage1(k)).collect();
+            let starts: Vec<usize> = hashes.iter().map(|&h| map.stage2(h)).collect();
+            for (&k, &at) in block.iter().zip(&starts) {
+                let w = want.get(&k).copied().unwrap_or(k);
+                assert_eq!(map.stage3(at, k), w, "{what}: key {k:#x}");
+            }
+        }
+    }
+
+    /// The serial link build (and the parallel one at 1, 2, 3 and 8
+    /// threads) against a plain union-find, on random and adversarial
+    /// link sets: chains in random and sorted order, stars, cycles,
+    /// duplicates both ways round, self links, IDs that take the FALLBACK
+    /// key, IDs that all share one home slot, a single pair, and a
+    /// component that holds every ID.
+    #[test]
+    fn link_builds_match_union_find() {
+        let mut state = 99u64;
+        let mut sets: Vec<(String, Vec<(u64, u64)>)> = Vec::new();
+        let packed = |n: u64| 1 + (n.wrapping_mul(0x0001_0000_0100_0001) % (1 << 62));
+        // Random sets of several densities.
+        for (n, universe) in [(1usize, 2u64), (2, 3), (50, 40), (5000, 6000), (5000, 1500), (100_000, 150_000)] {
+            let p = (0..n).map(|_| (packed(rng(&mut state) % universe), packed(rng(&mut state) % universe))).collect();
+            sets.push((format!("random {n}/{universe}"), p));
+        }
+        // A long chain in random order, and in both sorted orders.
+        let mut chain: Vec<(u64, u64)> = (0..3000u64).map(|i| (packed(i), packed(i + 1))).collect();
+        sets.push(("chain up".into(), chain.clone()));
+        sets.push(("chain down".into(), chain.iter().rev().map(|&(a, b)| (b, a)).collect()));
+        for i in (1..chain.len()).rev() {
+            chain.swap(i, (rng(&mut state) % (i as u64 + 1)) as usize);
+        }
+        sets.push(("chain shuffled".into(), chain));
+        // Stars around the smallest and around the largest ID.
+        sets.push(("star low".into(), (1..4000u64).map(|i| (packed(i), packed(0))).collect()));
+        sets.push(("star high".into(), (0..4000u64).map(|i| (packed(5000), packed(i))).collect()));
+        // Cycles, duplicates either way round, self links.
+        let mut c: Vec<(u64, u64)> = Vec::new();
+        for ring in 0..300u64 {
+            let len = 2 + ring % 9;
+            for i in 0..len {
+                let (a, b) = (packed(ring * 16 + i), packed(ring * 16 + (i + 1) % len));
+                c.push((a, b));
+                c.push((b, a));
+                c.push((a, a));
+                c.push((a, b));
+            }
+        }
+        sets.push(("cycles with repeats and self links".into(), c));
+        sets.push(("self links only".into(), (0..500u64).map(|i| (packed(i), packed(i))).collect()));
+        // Long IDs (FALLBACK keys) mixed with short ones; a long ID can be
+        // the smallest of its person.
+        let long: Vec<u64> = (0..400).map(|i| ids::pack_slice(format!("{}{:012}", ["a", "u", "z"][i % 3], i * 7919).as_bytes())).collect();
+        let short: Vec<u64> = (0..400).map(|i| ids::pack_slice(format!("u{i:07}").as_bytes())).collect();
+        let mut m: Vec<(u64, u64)> = Vec::new();
+        for _ in 0..3000 {
+            let pick = |s: &mut u64| if rng(s) % 2 == 0 { long[(rng(s) % 400) as usize] } else { short[(rng(s) % 400) as usize] };
+            m.push((pick(&mut state), pick(&mut state)));
+        }
+        sets.push(("fallback keys".into(), m));
+        // Keys that all share one home in any table of up to 2^16 slots or
+        // buckets: the probes run through long full stretches.
+        let mut same: Vec<u64> = Vec::new();
+        let mut k = 1u64;
+        while same.len() < 600 {
+            if (link_hash(k) >> 17) & 0xFFFF == 0x1234 {
+                same.push(k);
+            }
+            k += 1;
+        }
+        let p: Vec<(u64, u64)> = (0..1500).map(|_| (same[(rng(&mut state) % 600) as usize], same[(rng(&mut state) % 600) as usize])).collect();
+        sets.push(("one home".into(), p));
+        sets.push(("one home, all distinct".into(), same.chunks(2).map(|w| (w[0], w[1])).collect()));
+        // All distinct pairs of distinct IDs: 2 * pairs keys, the most the
+        // node table can be asked to hold; 2 * 8192 is a power of two.
+        sets.push(("all distinct".into(), (0..8192u64).map(|i| (packed(2 * i), packed(2 * i + 1))).collect()));
+        sets.push(("no pairs".into(), Vec::new()));
+
+        for (what, pairs) in &sets {
+            let want = reference(pairs);
+            let mut extra: Vec<u64> = (0..2000).map(|_| 1 + rng(&mut state) % (1 << 62)).collect();
+            extra.extend((0..2000u64).map(packed));
+            for room in [8, 5] {
+                let (map, spare) = LinkMap::build_serial_with_room(pairs, room);
+                check_map(&map, &want, &extra, &format!("serial room {room}, {what}"));
+                for &(at, len) in &spare {
+                    assert!(at != 0 && len > 0, "{what}: spare region");
+                }
+            }
+            for threads in [1, 2, 3, 8] {
+                let lists: Vec<Vec<(u64, u64)>> = (0..threads).map(|t| pairs.iter().skip(t).step_by(threads).copied().collect()).collect();
+                check_map(&LinkMap::build_parallel(&lists, threads), &want, &extra, &format!("parallel {threads}, {what}"));
+            }
+        }
+    }
+
+    /// Timing of the link builds on the links of a dataset:
+    /// `LINKBENCH=<data dir> cargo test --release link_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn link_bench() {
+        let Some(dir) = std::env::var_os("LINKBENCH") else {
+            return;
+        };
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
+        for path in list_csv(&std::path::Path::new(&dir).join("links")) {
+            let text = std::fs::read(&path).unwrap();
+            for line in text.split(|&c| c == b'\n').skip(1) {
+                let f: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+                if f.len() != 2 {
+                    continue;
+                }
+                let strip = |s: &[u8]| -> Vec<u8> { if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' { s[1..s.len() - 1].to_vec() } else { s.to_vec() } };
+                let (a, b) = (strip(f[0]), strip(f[1]));
+                if a.is_empty() || b.is_empty() {
+                    continue;
+                }
+                pairs.push((ids::pack_slice(&a), ids::pack_slice(&b)));
+            }
+        }
+        prof::ON.store(true, Ordering::Relaxed);
+        let which = std::env::var("LINKBENCH_WHICH").unwrap_or_else(|_| "old,serial".into());
+        for name in which.split(',') {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let map = match name {
+                    "old" => LinkMap::build_with_spare(&pairs).0,
+                    "par1" => LinkMap::build_parallel(std::slice::from_ref(&pairs), 1),
+                    "serial" => LinkMap::build_serial(&pairs).0,
+                    _ => panic!("unknown build {name}"),
+                };
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(map);
+            }
+            eprintln!("link_bench {name}: {best:.1} ms, {} pairs", pairs.len());
         }
     }
 }

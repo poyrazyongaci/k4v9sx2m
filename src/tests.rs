@@ -1148,3 +1148,55 @@ fn dense_long_window_falls_back() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The click parser writes into a block of `CLICK_BLOCK` clicks through a
+/// raw cursor; the long-line path pushes into the same block between
+/// windows. Bound: a block never holds more than `CLICK_BLOCK` clicks and
+/// its length is exact after every window. Here: one thread, one chunk,
+/// more than two blocks of clicks, long click lines around each block end,
+/// and the result against the reference.
+#[test]
+fn click_blocks_fill_across_long_lines() {
+    use crate::engine::CLICK_BLOCK;
+    let root = std::env::temp_dir().join(format!("sessions-clickblock-{}", std::process::id()));
+    let dir = root.join("d");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = days_from_civil(2027, 3, 1) * DAY_MS;
+    let we = ws + 14 * DAY_MS;
+    std::fs::write(dir.join("manifest.json"), format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(we))).unwrap();
+    std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\n").unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+    let users = 300u64;
+    let mut events = String::from("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n");
+    for u in 0..users {
+        for j in 0..3i64 {
+            let t = ws + (u as i64 * 7_919_000 + j * 40_000_000) % (we - ws - DAY_MS);
+            events.push_str(&format!("e{u}x{j},w{u},{t},{}Z,view,p1,\n", utc(t - t.rem_euclid(1000) + 1000)));
+        }
+    }
+    let total = 2 * CLICK_BLOCK + 3000;
+    let mut clicks = String::from("click_id,user_id,campaign_id,ts\n");
+    let mut long = 0;
+    for k in 0..total {
+        // Long lines just before, at and after each block end.
+        if (k + 2) % CLICK_BLOCK < 5 {
+            let id: String = std::iter::repeat_n('k', 70_000 + k % 7).collect();
+            clicks.push_str(&format!("{id},w{},c_{},{}\n", k as u64 % users, 1 + k % 3, ws + (k as i64 * 37_000) % (we - ws)));
+            long += 1;
+        }
+        let t = ws - 3 * DAY_MS + (k as i64 * 61_000) % (we - ws);
+        clicks.push_str(&format!("q{k},w{},c_{},{t}\n", (k as u64 * 7) % users, 1 + k % 3));
+    }
+    assert!(long >= 10);
+    std::fs::create_dir_all(dir.join("events")).unwrap();
+    std::fs::write(dir.join("events/part-0.csv"), events).unwrap();
+    std::fs::create_dir_all(dir.join("clicks")).unwrap();
+    std::fs::write(dir.join("clicks/part-0.csv"), clicks).unwrap();
+    std::fs::create_dir_all(dir.join("links")).unwrap();
+    std::fs::write(dir.join("links/part-0.csv"), "user_id_a,user_id_b\nw1,w2\n").unwrap();
+    let a = compare(&dir, &cfg(1, 64 << 20, 1));
+    assert_eq!(compare(&dir, &cfg(2, 300_000, 2)), a);
+    assert!(a[3] > 100, "credited {}", a[3]);
+    let _ = std::fs::remove_dir_all(&root);
+}
