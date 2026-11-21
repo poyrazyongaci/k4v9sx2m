@@ -9,14 +9,32 @@ use crate::engine::{self, Config};
 use crate::naive;
 
 fn cfg(threads: usize, chunk: usize, bits: u32) -> Config {
-    Config { threads, timing: false, collect: true, chunk_bytes: chunk, p1_bits: Some(bits), p2_bits: Some(bits) }
+    Config { threads, timing: false, collect: true, chunk_bytes: chunk, p1_bits: Some(bits), p2_bits: Some(bits), onepass: true }
 }
 
 fn compare(data: &Path, config: &Config) -> [i64; 5] {
     let lk = load_lookups(data);
     let want = naive::run(data, &lk);
-    let mut got = engine::run(data, None, &lk, config, std::time::Instant::now()).expect("fast engine declined");
+    // Both shapes of the engine, one-pass and three-phase.
+    let other = Config { onepass: !config.onepass, ..*config };
+    for config in [config, &other] {
+        check_shape(data, config, &lk, &want);
+    }
+    [
+        want.user.len() as i64,
+        want.user.iter().filter(|r| r.top.is_some()).count() as i64,
+        want.user.iter().map(|r| r.sessions).sum(),
+        want.camp.iter().filter(|r| r.campaign != b"organic").map(|r| r.sessions).sum(),
+        want.camp.iter().map(|r| r.assisted).sum(),
+    ]
+}
+
+fn check_shape(data: &Path, config: &Config, lk: &Lookups, want: &Tables) {
+    let mut got = engine::run(data, None, lk, config, std::time::Instant::now()).expect("fast engine declined");
     got.sort();
+    let data = Path::new(data);
+    let shape = if config.onepass { "one-pass" } else { "three-phase" };
+    let data = &data.join(shape);
     if got.user != want.user {
         for (a, b) in got.user.iter().zip(&want.user) {
             if a != b {
@@ -33,13 +51,6 @@ fn compare(data: &Path, config: &Config) -> [i64; 5] {
         }
         panic!("{}: campaign_daily rows {} vs {}", data.display(), got.camp.len(), want.camp.len());
     }
-    [
-        want.user.len() as i64,
-        want.user.iter().filter(|r| r.top.is_some()).count() as i64,
-        want.user.iter().map(|r| r.sessions).sum(),
-        want.camp.iter().filter(|r| r.campaign != b"organic").map(|r| r.sessions).sum(),
-        want.camp.iter().map(|r| r.assisted).sum(),
-    ]
 }
 
 fn fixtures_dir() -> Option<PathBuf> {
@@ -675,5 +686,245 @@ fn click_reach_edges_match_reference() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     assert!(credited > 2_000 && assists > credited, "credited {credited}, assists {assists}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A field, quoted one time in four.
+fn quoted(r: &mut Rng, field: &str) -> String {
+    if r.chance(4) {
+        format!("\"{field}\"")
+    } else {
+        field.to_string()
+    }
+}
+
+fn shuffle<T>(r: &mut Rng, items: &mut [T]) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, r.below(i as u64 + 1) as usize);
+    }
+}
+
+/// Copies of one event in every arrangement dedup must get right, in the
+/// one-pass shape (person records marked dropped in place) and the
+/// three-phase one: copies naming two IDs of one person or two persons
+/// (so two person partitions); an earliest copy that is invalid in each
+/// way (empty user, bad ts, bad type, empty product, bad price, late) with
+/// later valid copies; a later invalid copy; equal ingest_ts; ingests that
+/// are not whole seconds, far from the window or not timestamps (the exact
+/// out-of-line path); a key with thousands of copies; copies spread over
+/// files and chunks and read in any order. Users sit at the end of a link
+/// chain hundreds of links long, and clicks come from IDs with no events.
+#[test]
+fn duplicate_copies_match_reference() {
+    let root = std::env::temp_dir().join(format!("sessions-dups-{}", std::process::id()));
+    let mut sessions = 0;
+    for seed in 0..8u64 {
+        let mut r = Rng(seed + 3000);
+        let dir = root.join(format!("d{seed}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = days_from_civil(2026, 10, 1) * DAY_MS;
+        let we = ws + 14 * DAY_MS;
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!("{{\"window_start\": \"{}Z\", \"window_end\": \"{}Z\"}}\n", utc(ws), utc(we)),
+        )
+        .unwrap();
+        std::fs::write(dir.join("products.csv"), "product_id,category\np1,shoes\np2,books\np3,toys\n").unwrap();
+        std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,search\nc_2,social\nc_3,email\n").unwrap();
+
+        // People: some with two or three linked IDs, one chain of 400 IDs
+        // linked one after the next (named by an upper-case ID that only
+        // the links know), and people of one ID.
+        let mut links: Vec<String> = Vec::new();
+        let mut persons: Vec<Vec<String>> = Vec::new();
+        for j in 0..30 {
+            let ids: Vec<String> = (0..2 + r.below(2)).map(|i| format!("m{j}x{i}")).collect();
+            for w in ids.windows(2) {
+                links.push(format!("{},{}", w[1], w[0]));
+            }
+            persons.push(ids);
+        }
+        let chain: Vec<String> = (0..400).map(|k| format!("ch{k:03}")).collect();
+        for k in 0..399 {
+            links.push(format!("{},{}", chain[k + 1], chain[k]));
+        }
+        links.push(format!("{},Ach", chain[399]));
+        persons.push(chain[300..].to_vec());
+        for j in 0..40 {
+            persons.push(vec![format!("s{j}")]);
+        }
+        // An ID linked to a person but used only by clicks.
+        links.push("m0x9,m0x0".to_string());
+        shuffle(&mut r, &mut links);
+
+        let user = |r: &mut Rng| -> (usize, String) {
+            let p = r.below(persons.len() as u64) as usize;
+            (p, persons[p][r.below(persons[p].len() as u64) as usize].clone())
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let line = |r: &mut Rng, id: &str, user: &str, ts: &str, ingest: &str, kind: &str, prod: &str, price: &str| -> String {
+            [id, user, ts, ingest, kind, prod, price].iter().map(|f| quoted(r, f)).collect::<Vec<_>>().join(",")
+        };
+        for n in 0..3000u64 {
+            let id = format!("e{n}");
+            let t = ws + r.below((we - ws) as u64 - 2 * DAY_MS as u64) as i64 + DAY_MS;
+            let ts = if r.chance(2) { format!("{t}") } else { format!("{}Z", utc(t - t.rem_euclid(1000))) };
+            let t = if ts.ends_with('Z') { t - t.rem_euclid(1000) } else { t };
+            let kind = if r.chance(4) { "purchase" } else if r.chance(2) { "cart" } else { "view" };
+            let prod = format!("p{}", 1 + r.below(4));
+            let price = format!("{}", 100 + r.below(900));
+            let (p, u) = user(&mut r);
+            let alt = user(&mut r).1;
+            // Whole seconds after ts, up to 10 minutes.
+            let ingest = t - t.rem_euclid(1000) + 1000 * (1 + r.below(600) as i64);
+            let f1 = |ms: i64| format!("{}Z", utc(ms));
+            let mut copies: Vec<String> = Vec::new();
+            match n % 10 {
+                0 => copies.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price)),
+                1 => {
+                    // Identical copies, later ingests.
+                    for c in 0..2 + r.below(3) as i64 {
+                        let at = ingest + c * 1000 * (1 + r.below(600) as i64);
+                        copies.push(line(&mut r, &id, &u, &ts, &f1(at), kind, &prod, &price));
+                    }
+                }
+                2 => {
+                    // Later copies name another ID of the same person, or
+                    // another person; any of them may be the earliest.
+                    let other = if r.chance(2) && persons[p].len() > 1 {
+                        persons[p][r.below(persons[p].len() as u64) as usize].clone()
+                    } else {
+                        user(&mut r).1
+                    };
+                    let mut at = ingest;
+                    for c in 0..2 + r.below(3) {
+                        let who = if (c + n) % 2 == 0 { &u } else { &other };
+                        copies.push(line(&mut r, &id, who, &ts, &f1(at), kind, &prod, &price));
+                        at += 1000 * (1 + r.below(300) as i64);
+                    }
+                }
+                3 => {
+                    // The earliest copy is invalid in one way; later copies
+                    // are valid. The event must be dropped.
+                    let first = match n / 10 % 6 {
+                        0 => line(&mut r, &id, "", &ts, &f1(ingest), kind, &prod, &price),
+                        1 => line(&mut r, &id, &u, "2026-13-03T10:00:00Z", &f1(ingest), kind, &prod, &price),
+                        2 => line(&mut r, &id, &u, &ts, &f1(ingest), "Purchase", &prod, &price),
+                        3 => line(&mut r, &id, &u, &ts, &f1(ingest), kind, "", &price),
+                        4 => line(&mut r, &id, &u, &ts, &f1(ingest), "purchase", &prod, "12.5"),
+                        // Late: its own ts is two days before its ingest.
+                        _ => line(&mut r, &id, &u, &format!("{}", ingest - 2 * DAY_MS), &f1(ingest), kind, &prod, &price),
+                    };
+                    copies.push(first);
+                    for c in 1..2 + r.below(3) as i64 {
+                        copies.push(line(&mut r, &id, &u, &ts, &f1(ingest + c * 1000), kind, &prod, &price));
+                    }
+                }
+                4 => {
+                    // Equal ingests: identical copies, quoted differently,
+                    // and a later copy.
+                    for _ in 0..2 + r.below(3) {
+                        copies.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price));
+                    }
+                    copies.push(line(&mut r, &id, &alt, &ts, &f1(ingest + 1000), kind, &prod, &price));
+                }
+                5 => {
+                    // Ingests that are not whole seconds (F3 with
+                    // milliseconds), F2, and F1, a millisecond apart or
+                    // equal; equal ones are identical.
+                    let mut at = ingest - 1000;
+                    for c in 0..2 + r.below(4) {
+                        let field = match (c + n / 10) % 3 {
+                            0 => format!("{at}"),
+                            1 => format!("{}+01:00", utc(at - at.rem_euclid(1000) + 3_600_000)),
+                            _ => f1(at),
+                        };
+                        // One user: two forms may name the same instant, and copies
+                        // with equal ingests must be identical.
+                        let who = u.clone();
+                        copies.push(line(&mut r, &id, &who, &ts, &field, kind, &prod, &price));
+                        at += [1, 999, 1000, 1001][r.below(4) as usize];
+                    }
+                }
+                6 => {
+                    // An ingest that is no timestamp sorts last: with a
+                    // valid copy, or alone.
+                    copies.push(line(&mut r, &id, &u, &ts, "garbage", kind, &prod, &price));
+                    if r.chance(2) {
+                        copies.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price));
+                    }
+                }
+                7 => {
+                    // A valid earliest copy and later invalid ones: kept.
+                    copies.push(line(&mut r, &id, &u, &ts, &f1(ingest), kind, &prod, &price));
+                    copies.push(line(&mut r, &id, "", &ts, &f1(ingest + 1000), kind, &prod, &price));
+                    copies.push(line(&mut r, &id, &u, &ts, &f1(ingest + 2000), "Cart", &prod, &price));
+                }
+                8 => {
+                    // Ingests far from the window (outside the note clock):
+                    // decades before, which wins, and decades after.
+                    let far = if r.chance(2) { days_from_civil(1940, 5, 1) * DAY_MS } else { days_from_civil(2200, 1, 1) * DAY_MS };
+                    copies.push(line(&mut r, &id, &u, &ts, &f1(far + 7000), kind, &prod, &price));
+                    copies.push(line(&mut r, &id, &alt, &ts, &f1(ingest), kind, &prod, &price));
+                    copies.push(line(&mut r, &id, &u, &ts, &format!("{}", far + 7001), kind, &prod, &price));
+                }
+                _ => {
+                    // Copies with milliseconds against whole seconds.
+                    copies.push(line(&mut r, &id, &u, &ts, &format!("{}", ingest + 1), kind, &prod, &price));
+                    copies.push(line(&mut r, &id, &alt, &ts, &f1(ingest), kind, &prod, &price));
+                }
+            }
+            lines.extend(copies);
+        }
+        // One key with thousands of copies, all ingests distinct, users all
+        // over; the earliest copy is valid on even seeds and invalid on odd.
+        let hot_t = ws + 3 * DAY_MS + 12_345;
+        let mut order: Vec<i64> = (0..3000).collect();
+        shuffle(&mut r, &mut order);
+        for c in order {
+            let kind = if c == 0 && seed % 2 == 1 { "Purchase" } else if c % 7 == 3 { "bogus" } else { "view" };
+            let u = user(&mut r).1;
+            lines.push(line(&mut r, "hot", &u, &format!("{hot_t}"), &format!("{}Z", utc(hot_t - 12_345 + 60_000 + c * 1000)), kind, "p1", ""));
+        }
+        shuffle(&mut r, &mut lines);
+        let mut bodies: Vec<Vec<u8>> = vec![Vec::new(); 3];
+        for l in &lines {
+            let f = r.below(3) as usize;
+            bodies[f].extend_from_slice(l.as_bytes());
+            bodies[f].push(b'\n');
+        }
+        write_parts(&dir.join("events"), "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", bodies, false);
+
+        let mut clicks = String::new();
+        for k in 0..600 {
+            let who = match r.below(4) {
+                0 => format!("g{}", r.below(20)),
+                1 => "m0x9".to_string(),
+                _ => user(&mut r).1,
+            };
+            let t = ws - 3 * DAY_MS + r.below(16 * DAY_MS as u64) as i64;
+            clicks.push_str(&format!("k{k},{who},c_{},{t}\n", 1 + r.below(3)));
+        }
+        write_parts(&dir.join("clicks"), "click_id,user_id,campaign_id,ts", vec![clicks.into_bytes()], false);
+        let half = links.len() / 2;
+        let link_bodies = vec![links[..half].join("\n").into_bytes(), (links[half..].join("\n") + "\n").into_bytes()];
+        write_parts(&dir.join("links"), "user_id_a,user_id_b", link_bodies.into_iter().map(|mut b| {
+            if b.last() != Some(&b'\n') {
+                b.push(b'\n');
+            }
+            b
+        }).collect(), false);
+
+        let (threads, chunk, bits) = match seed % 4 {
+            0 => (1, 4 << 20, 1),
+            1 => (4, 256, 4),
+            2 => (3, 5000, 2),
+            _ => (8, 1024, 3),
+        };
+        sessions += compare(&dir, &cfg(threads, chunk, bits))[2];
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(sessions > 10_000, "only {sessions} sessions");
     let _ = std::fs::remove_dir_all(&root);
 }

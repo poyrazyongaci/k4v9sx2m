@@ -49,7 +49,15 @@ fn main() {
         sys::release_all(cfg.threads);
     }
     if timing {
-        eprintln!("[engine] exit at {:.1} ms, epoch {:.3}", started.elapsed().as_secs_f64() * 1e3, epoch());
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        eprintln!(
+            "[engine] exit at {:.1} ms, epoch {:.3}, peak rss {} KB, minor faults {}",
+            started.elapsed().as_secs_f64() * 1e3,
+            epoch(),
+            ru.ru_maxrss,
+            ru.ru_minflt
+        );
     }
     sys::exit_now(0);
 }

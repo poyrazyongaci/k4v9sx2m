@@ -268,6 +268,47 @@ struct Part {
     end: *mut u8,
     head: *mut ChunkHdr,
     chunks: u32,
+    /// Number of the current chunk in the directory, for a named scatter.
+    id: u32,
+}
+
+/// Bits of a record name that hold the slot in its chunk.
+pub const SLOT_BITS: u32 = 10;
+/// Chunk numbers a directory can hand out. `u32::MAX` is never a name.
+pub const DIR_CHUNKS: usize = (1 << (32 - SLOT_BITS)) - 1;
+
+/// A numbered list of chunks shared by the scatters of all threads, so a
+/// record can be named in 32 bits: chunk number, then slot in the chunk.
+/// The table is lazily committed anonymous memory.
+pub struct Directory {
+    chunks: *const AtomicUsize,
+    next: AtomicUsize,
+}
+unsafe impl Send for Directory {}
+unsafe impl Sync for Directory {}
+
+impl Directory {
+    pub fn new() -> Self {
+        Directory { chunks: anon(DIR_CHUNKS * 8) as *const AtomicUsize, next: AtomicUsize::new(0) }
+    }
+    fn add(&self, chunk: *mut ChunkHdr) -> u32 {
+        use std::sync::atomic::Ordering;
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        if id >= DIR_CHUNKS {
+            // The caller bounds the chunk count before it starts.
+            die("chunk directory is full");
+        }
+        unsafe { (*self.chunks.add(id)).store(chunk as usize, Ordering::Relaxed) };
+        id as u32
+    }
+    /// The record a name stands for. Call only after the scatters that
+    /// wrote the records have finished.
+    #[inline(always)]
+    pub unsafe fn record<T>(&self, name: u32) -> *mut T {
+        use std::sync::atomic::Ordering;
+        let chunk = (*self.chunks.add((name >> SLOT_BITS) as usize)).load(Ordering::Relaxed) as *mut u8;
+        (chunk.add(HDR) as *mut T).add((name & ((1 << SLOT_BITS) - 1)) as usize)
+    }
 }
 
 /// Copy `lines` cache lines from an aligned staging buffer to an aligned
@@ -306,12 +347,22 @@ pub struct Scatter<T> {
     chunk_bytes: usize,
     /// Records per chunk; a multiple of `per`.
     cap: usize,
+    /// Where chunks get their numbers; null for a scatter without names.
+    dir: *const Directory,
+    /// Named scatter: the name of the next record of each partition.
+    names: Vec<u32>,
     _t: PhantomData<T>,
 }
 unsafe impl<T> Send for Scatter<T> {}
 
 impl<T: Copy> Scatter<T> {
     pub fn new(parts: usize, chunk_bytes: usize) -> Self {
+        Self::with_lines(parts, chunk_bytes, 4)
+    }
+
+    /// Like `new`, with at most `max_lines` cache lines of records in each
+    /// staging buffer (rounded up to a whole record count).
+    pub fn with_lines(parts: usize, chunk_bytes: usize, max_lines: usize) -> Self {
         let size = std::mem::size_of::<T>();
         let mut per = 1;
         while (per * size) % 64 != 0 {
@@ -320,7 +371,7 @@ impl<T: Copy> Scatter<T> {
         // A longer staging buffer flushes less often, which mostly saves
         // mispredicted flush branches; keep all buffers within ~256 KB so
         // they stay in L2 next to the parser's own data.
-        let lines = (STAGE_BUDGET / (parts * per * size)).clamp(1, 4);
+        let lines = (STAGE_BUDGET / (parts * per * size)).clamp(1, max_lines.max(1));
         per *= lines;
         assert!(per <= 255);
         let stage_bytes = per * size;
@@ -328,7 +379,7 @@ impl<T: Copy> Scatter<T> {
         let cap = (chunk_bytes - HDR) / stage_bytes * per;
         let mut arena = Arena::new();
         let stage = arena.alloc(parts * stage_bytes);
-        let empty = Part { dst: std::ptr::null_mut(), end: std::ptr::null_mut(), head: std::ptr::null_mut(), chunks: 0 };
+        let empty = Part { dst: std::ptr::null_mut(), end: std::ptr::null_mut(), head: std::ptr::null_mut(), chunks: 0, id: 0 };
         Scatter {
             parts: vec![empty; parts],
             fill: vec![0; parts],
@@ -339,8 +390,20 @@ impl<T: Copy> Scatter<T> {
             free: Vec::new(),
             chunk_bytes,
             cap,
+            dir: std::ptr::null(),
+            names: Vec::new(),
             _t: PhantomData,
         }
+    }
+
+    /// A scatter whose records have names (see `push_named`). `dir` must
+    /// outlive it.
+    pub fn named(parts: usize, chunk_bytes: usize, max_lines: usize, dir: &Directory) -> Self {
+        let mut scatter = Self::with_lines(parts, chunk_bytes, max_lines);
+        assert!(scatter.cap < 1 << SLOT_BITS);
+        scatter.dir = dir;
+        scatter.names = vec![scatter.cap as u32; parts];
+        scatter
     }
 
     /// Give a dead chunk of exactly `bytes` bytes to this scatter to reuse.
@@ -378,6 +441,41 @@ impl<T: Copy> Scatter<T> {
         }
     }
 
+    /// Like `push`, and returns the name of the record: where it will be
+    /// once its staging buffer has been written out (by a later push or by
+    /// `finish`), as chunk number and slot. The chunk is chosen when the
+    /// first record of a staging buffer arrives, so the name is final from
+    /// the start. A scatter must use either `push` or `push_named`
+    /// throughout.
+    ///
+    /// The name of the next record of each partition is kept in `names`
+    /// (4 bytes a partition, so it stays in L1 with `fill`); the partition
+    /// itself is read only when a staging buffer is written out. A slot
+    /// equal to `cap` means the chunk is full, or there is none yet.
+    #[inline(always)]
+    pub unsafe fn push_named(&mut self, p: usize, value: T) -> u32 {
+        let n = *self.fill.get_unchecked(p) as usize;
+        let mut at = *self.names.get_unchecked(p);
+        if (at & ((1 << SLOT_BITS) - 1)) as usize == self.cap {
+            // Only at the start of a staging buffer: `cap` is a multiple
+            // of `per`.
+            self.grow(p);
+            at = *self.names.get_unchecked(p);
+        }
+        *self.names.get_unchecked_mut(p) = at + 1;
+        let buf = self.stage.add(p * self.stage_bytes);
+        (buf as *mut T).add(n).write(value);
+        if n + 1 == self.per {
+            *self.fill.get_unchecked_mut(p) = 0;
+            let part = self.parts.as_mut_ptr().add(p);
+            stream_lines(buf, (*part).dst, self.stage_bytes / 64);
+            (*part).dst = (*part).dst.add(self.stage_bytes);
+        } else {
+            *self.fill.get_unchecked_mut(p) = (n + 1) as u8;
+        }
+        at
+    }
+
     #[cold]
     #[inline(never)]
     unsafe fn grow(&mut self, p: usize) {
@@ -394,8 +492,14 @@ impl<T: Copy> Scatter<T> {
         (*chunk).len = 0;
         part.head = chunk;
         part.chunks += 1;
+        if !self.dir.is_null() {
+            part.id = (*self.dir).add(chunk);
+        }
         part.dst = (chunk as *mut u8).add(HDR);
         part.end = part.dst.add(self.cap * size);
+        if !self.dir.is_null() {
+            self.names[p] = self.parts[p].id << SLOT_BITS;
+        }
     }
 
     pub fn finish(mut self) -> Vec<List<T>> {
@@ -448,7 +552,7 @@ pub fn prefetch<T>(p: *const T) {
 pub mod prof {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    pub const NAMES: [&str; 10] = [
+    pub const NAMES: [&str; 11] = [
         "parse.scan",
         "parse.fields",
         "links.parse",
@@ -459,9 +563,10 @@ pub mod prof {
         "person.group",
         "person.sessions",
         "person.flush",
+        "parse.lookup",
     ];
     pub static ON: AtomicBool = AtomicBool::new(false);
-    static NANOS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    static NANOS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
     #[inline(always)]
     pub fn start() -> f64 {
@@ -482,6 +587,11 @@ pub mod prof {
         } else {
             0.0
         }
+    }
+
+    /// Seconds charged to `slot` so far.
+    pub fn get(slot: usize) -> f64 {
+        NANOS[slot].load(Ordering::Relaxed) as f64 / 1e9
     }
 
     pub fn report() {

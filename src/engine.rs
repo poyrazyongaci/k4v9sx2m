@@ -10,9 +10,17 @@
 //!    16-byte records by person. Clicks get the same person scatter.
 //! 3. person: per person partition, group by person, sort by ts, sessionize,
 //!    attribute clicks, aggregate, and write user_daily row groups.
+//!
+//! The one-pass shape (`ENGINE_ONEPASS=1`, off by default) replaces 1 and 2:
+//! the links are joined first, on all threads; the parsers then look every
+//! event's person up at once and write a valid copy straight to its person
+//! partition as a 16-byte record, and leave a 16-byte note (event key,
+//! ingest, record name) for every copy in its event-key partition. Dedup
+//! walks only the notes and marks the record of every losing copy dropped
+//! in place. Clicks go straight to their person partitions too.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -32,6 +40,8 @@ pub struct Config {
     pub chunk_bytes: usize,
     pub p1_bits: Option<u32>,
     pub p2_bits: Option<u32>,
+    /// The one-pass shape (see the top of this file).
+    pub onepass: bool,
 }
 
 impl Config {
@@ -44,6 +54,7 @@ impl Config {
             chunk_bytes: num("ENGINE_CHUNK_KB").map_or(4 << 20, |kb| (kb as usize) << 10),
             p1_bits: num("ENGINE_P1_BITS"),
             p2_bits: num("ENGINE_P2_BITS"),
+            onepass: std::env::var("ENGINE_ONEPASS").is_ok_and(|v| v == "1"),
         }
     }
 }
@@ -60,6 +71,39 @@ struct Entry {
 }
 
 const DEAD: u64 = u64::MAX;
+
+/// What dedup needs of one event copy (one-pass shape): its key, when it
+/// was ingested, and the name of its person record (`NO_RECORD` for an
+/// invalid copy, which has none).
+///
+/// `ingest` is whole seconds from `ingest_base` (2^31 seconds before the
+/// window start), which keeps the order of the millisecond values; an
+/// ingest that is not a timestamp (`i64::MAX` after parsing) is
+/// `u32::MAX` and sorts last. A copy whose ingest is not a whole second
+/// after the base, or too far from it, leaves a `Wide` note instead, with
+/// the exact value; those are compared exactly, out of line.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Note {
+    ekey: u64,
+    ingest: u32,
+    rec: u32,
+}
+
+const NO_RECORD: u32 = u32::MAX;
+
+/// Where the ingest clock of the notes starts: 2^31 seconds before the
+/// window start, so ingests within 68 years either side fit.
+fn note_base(ws: i64) -> i64 {
+    ws.saturating_sub(1000 << 31)
+}
+
+#[derive(Clone, Copy)]
+struct Wide {
+    ekey: u64,
+    ingest: i64,
+    rec: u32,
+}
 
 /// A valid click. `key` is the user key after parsing and the person key
 /// after resolve. `tc` is `ts_rel << 32 | campaign`, ts relative to the
@@ -472,6 +516,230 @@ impl LinkMap {
     }
 }
 
+/// A raw pointer that threads may share; what it points at is atomic.
+#[derive(Clone, Copy)]
+struct Shared<T>(*const T);
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+impl<T> Shared<T> {
+    /// Element `i`. The caller keeps `i` inside the allocation.
+    #[inline(always)]
+    fn at(&self, i: usize) -> &T {
+        unsafe { &*self.0.add(i) }
+    }
+    #[inline(always)]
+    fn ptr(&self, i: usize) -> *const T {
+        unsafe { self.0.add(i) }
+    }
+}
+
+/// Pairs (or linked nodes) a job of the parallel link build takes.
+const LINK_STEP: usize = 4096;
+/// The link build works in groups of this many, one stage at a time.
+const LINK_GROUP: usize = 32;
+
+fn link_jobs<T>(lists: &[Vec<T>]) -> Vec<(usize, usize)> {
+    let mut jobs = Vec::new();
+    for (l, list) in lists.iter().enumerate() {
+        let mut at = 0;
+        while at < list.len() {
+            jobs.push((l, at));
+            at += LINK_STEP;
+        }
+    }
+    jobs
+}
+
+impl LinkMap {
+    /// Join all pairs and build the map on `threads` threads: what `build`
+    /// makes, for the one-pass shape, where nothing else runs meanwhile.
+    ///
+    /// Two parallel steps. (1) Every ID is interned in a shared
+    /// open-addressing table; its slot number is its node. Each pair is a
+    /// union in a lock-free union-find whose links always go from the root
+    /// with the larger ID to the root with the smaller, so pointers only
+    /// ever lead to smaller IDs: no cycle can form whatever the
+    /// interleaving, and when all unions are done a root is the smallest
+    /// ID of its set, the person's name. Every successful link makes one
+    /// node a non-root, and the thread that made it notes the node. (2)
+    /// Each noted node goes into the final map under its root's ID; threads
+    /// race only for the free slots of a bucket, which fill from the front.
+    fn build_parallel(lists: &[Vec<(u64, u64)>], threads: usize) -> LinkMap {
+        Self::build_parallel_with_room(lists, threads, 8)
+    }
+
+    fn build_parallel_with_room(lists: &[Vec<(u64, u64)>], threads: usize, room: usize) -> LinkMap {
+        let total: usize = lists.iter().map(|l| l.len()).sum();
+        if total == 0 {
+            return LinkMap::with_slots(4, 0, true);
+        }
+        let t0 = Instant::now();
+        // At most two IDs a pair, so the table never fills. Real links form
+        // trees (about one new ID a pair), so it is about half full; 3x
+        // measured the same time with 35 MB more memory at 20M events.
+        let cap = (total * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        // A node is two words: its ID, and its parent. Fresh anonymous
+        // memory is zero: key 0 is an empty slot, parent 0 is "root", any
+        // other parent is that node's slot number plus one.
+        let nodes = Shared(sys::anon(cap * 16) as *const [AtomicU64; 2]);
+        let home = |key: u64| (mix(key) >> 17) as usize & mask;
+        let intern = |key: u64| -> usize {
+            let mut i = home(key);
+            loop {
+                let slot = &nodes.at(i)[0];
+                let k = slot.load(Ordering::Relaxed);
+                if k == key {
+                    return i;
+                }
+                if k == 0 {
+                    match slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => return i,
+                        Err(now) if now == key => return i,
+                        Err(_) => {}
+                    }
+                }
+                i = (i + 1) & mask;
+            }
+        };
+        let find = |mut x: usize| -> usize {
+            loop {
+                let px = &nodes.at(x)[1];
+                let up = px.load(Ordering::Relaxed);
+                if up == 0 {
+                    return x;
+                }
+                let above = nodes.at(up as usize - 1)[1].load(Ordering::Relaxed);
+                if above != 0 {
+                    // Path halving. Losing the race is harmless: the old
+                    // pointer is still an ancestor.
+                    let _ = px.compare_exchange(up, above, Ordering::Relaxed, Ordering::Relaxed);
+                }
+                x = up as usize - 1;
+            }
+        };
+        let key_of = |node: usize| nodes.at(node)[0].load(Ordering::Relaxed);
+        let jobs = link_jobs(lists);
+        let next = AtomicUsize::new(0);
+        // Per thread: each node it linked, as (its ID, its new parent).
+        let mut linked: Vec<Vec<(u64, u32)>> = Vec::new();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads.clamp(1, jobs.len()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut made: Vec<(u64, u32)> = Vec::with_capacity(total / threads.max(1) + 1024);
+                        let mut ends = [(0usize, 0usize); LINK_GROUP];
+                        while let Some(&(l, at)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let list = &lists[l];
+                            for block in list[at..list.len().min(at + LINK_STEP)].chunks(LINK_GROUP) {
+                                // The table is far bigger than the cache: each
+                                // stage runs for the whole group, so its misses
+                                // overlap. Homes first, then the nodes, then
+                                // one step up from each node.
+                                for &(a, b) in block {
+                                    prefetch(nodes.ptr(home(a)));
+                                    prefetch(nodes.ptr(home(b)));
+                                }
+                                for (end, &(a, b)) in ends.iter_mut().zip(block) {
+                                    *end = (intern(a), intern(b));
+                                }
+                                for &(na, nb) in &ends[..block.len()] {
+                                    for node in [na, nb] {
+                                        let up = nodes.at(node)[1].load(Ordering::Relaxed);
+                                        if up != 0 {
+                                            prefetch(nodes.ptr(up as usize - 1));
+                                        }
+                                    }
+                                }
+                                for &(na, nb) in &ends[..block.len()] {
+                                    loop {
+                                        let (ra, rb) = (find(na), find(nb));
+                                        if ra == rb {
+                                            break;
+                                        }
+                                        let (ka, kb) = (key_of(ra), key_of(rb));
+                                        let (small, large, key) = if cmp_ids(ka, kb).is_lt() { (ra, rb, kb) } else { (rb, ra, ka) };
+                                        // Only a root can be linked, and only once.
+                                        if nodes.at(large)[1]
+                                            .compare_exchange(0, small as u64 + 1, Ordering::Relaxed, Ordering::Relaxed)
+                                            .is_ok()
+                                        {
+                                            made.push((key, small as u32));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // A thread of its own: all its time is the build's.
+                        prof::add(3, 0.0);
+                        made
+                    })
+                })
+                .collect();
+            for h in handles {
+                linked.push(h.join().unwrap());
+            }
+        });
+        let t1 = Instant::now();
+        let count: usize = linked.iter().map(|l| l.len()).sum();
+        let buckets = (count * room / 4).next_power_of_two().max(16) / BUCKET;
+        let map = LinkMap::with_slots(buckets, count, true);
+        let jobs = link_jobs(&linked);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.clamp(1, jobs.len().max(1)) {
+                scope.spawn(|| unsafe {
+                    let mut ready = [(0u64, 0u64, 0u64); LINK_GROUP];
+                    while let Some(&(l, at)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let list = &linked[l];
+                        for block in list[at..list.len().min(at + LINK_STEP)].chunks(LINK_GROUP) {
+                            // The node's parent when it was linked; it may have
+                            // been linked on since, `find` goes the rest.
+                            for &(_, up) in block {
+                                prefetch(nodes.ptr(up as usize));
+                            }
+                            for (out, &(key, up)) in ready.iter_mut().zip(block) {
+                                let h = mix(key);
+                                *out = (key, key_of(find(up as usize)), h);
+                                prefetch(map.bucket(map.home_of(h)));
+                                prefetch(map.filter_word(h));
+                            }
+                            for &(key, name, h) in &ready[..block.len()] {
+                                let mut i = map.home_of(h);
+                                'place: loop {
+                                    let b = map.bucket(i) as *const AtomicU64;
+                                    for j in 0..BUCKET {
+                                        let slot = &*b.add(j);
+                                        if slot.load(Ordering::Relaxed) == 0
+                                            && slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                                        {
+                                            (*b.add(BUCKET + j)).store(name, Ordering::Relaxed);
+                                            break 'place;
+                                        }
+                                    }
+                                    i = (i + 1) & map.mask;
+                                }
+                                (*(map.filter_word(h) as *const AtomicU64)).fetch_or(Self::filter_bits(h), Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    prof::add(3, 0.0);
+                });
+            }
+        });
+        if prof::ON.load(Ordering::Relaxed) {
+            let t2 = Instant::now();
+            eprintln!(
+                "[engine]   links wall: union {:.1} ms, map {:.1} ms; pairs {total}, node cap {cap}, renamed {count}",
+                (t1 - t0).as_secs_f64() * 1e3,
+                (t2 - t1).as_secs_f64() * 1e3
+            );
+        }
+        map
+    }
+}
+
 // ---------------------------------------------------------------- phase 1
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -495,6 +763,142 @@ struct ParseState<'a> {
     shift1: u32,
     clicks: Vec<Vec<Click>>,
     pairs: Vec<(u64, u64)>,
+    /// The one-pass shape: where parsed copies and clicks go instead of
+    /// `entries` and `clicks`.
+    emit: Option<Box<Emit>>,
+}
+
+/// Where a one-pass parser sends what it parsed: person lookups in blocks,
+/// then the scatters by person and by event key.
+struct Emit {
+    links: LinkMap,
+    notes: Scatter<Note>,
+    ev: Scatter<Ev>,
+    cl: Scatter<Click>,
+    shift1: u32,
+    shift2: u32,
+    /// Start of the ingest clock of the notes, in epoch milliseconds.
+    ingest_base: i64,
+    /// Notes whose ingest does not fit a `Note` (never under the rules).
+    wide: Vec<Wide>,
+    /// Event copies and clicks waiting for their lookup.
+    nevents: usize,
+    nclicks: usize,
+    /// Lookups per block (at most `BLOCK`).
+    limit: usize,
+    events: [Entry; EMIT_BLOCK],
+    clicks: [Click; EMIT_BLOCK],
+}
+
+impl Emit {
+    fn new(links: LinkMap, notes: Scatter<Note>, ev: Scatter<Ev>, cl: Scatter<Click>, shift1: u32, shift2: u32, ws: i64) -> Box<Emit> {
+        Box::new(Emit {
+            links,
+            notes,
+            ev,
+            cl,
+            shift1,
+            shift2,
+            ingest_base: note_base(ws),
+            wide: Vec::new(),
+            nevents: 0,
+            nclicks: 0,
+            limit: std::env::var("ENGINE_LOOKUP_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(EMIT_BLOCK).clamp(1, EMIT_BLOCK),
+            events: [Entry { ekey: 0, ukey: 0, ingest: 0, w3: DEAD }; EMIT_BLOCK],
+            clicks: [Click { key: 0, ckey: 0, tc: 0 }; EMIT_BLOCK],
+        })
+    }
+
+    #[inline(always)]
+    unsafe fn event(&mut self, entry: Entry) {
+        *self.events.get_unchecked_mut(self.nevents) = entry;
+        self.nevents += 1;
+        if self.nevents == self.limit {
+            self.flush_events();
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn click(&mut self, click: Click) {
+        *self.clicks.get_unchecked_mut(self.nclicks) = click;
+        self.nclicks += 1;
+        if self.nclicks == self.limit {
+            self.flush_clicks();
+        }
+    }
+
+    /// Look up the persons of the waiting event copies and write them out:
+    /// a person record for each valid copy, a note for every copy.
+    ///
+    /// The link map is far bigger than the cache. Lookups go a block at a
+    /// time, each stage for the whole block, so the misses of a block are
+    /// all in flight together and every loop stays small.
+    #[inline(never)]
+    unsafe fn flush_events(&mut self) {
+        let t = prof::start();
+        let n = self.nevents;
+        self.nevents = 0;
+        let links = self.links;
+        let (shift1, shift2) = (self.shift1, self.shift2);
+        let base = self.ingest_base;
+        let block = std::slice::from_raw_parts(self.events.as_ptr(), n);
+        let mut hashes = [0u64; EMIT_BLOCK];
+        let mut starts = [0usize; EMIT_BLOCK];
+        for (h, entry) in hashes.iter_mut().zip(block) {
+            *h = links.stage1(entry.ukey);
+        }
+        for (at, &h) in starts.iter_mut().zip(&hashes[..n]) {
+            *at = links.stage2(h);
+        }
+        for (&at, entry) in starts.iter().zip(block) {
+            let mut rec = NO_RECORD;
+            if entry.w3 != DEAD {
+                let pkey = links.stage3(at, entry.ukey);
+                rec = self.ev.push_named((mix1(pkey) >> shift2) as usize, Ev { pkey, v: entry.w3 });
+            }
+            // Exact as u64 whenever `ingest >= base`.
+            let since = (entry.ingest as u64).wrapping_sub(base as u64);
+            let seconds = since / 1000;
+            let whole = (entry.ingest >= base) & (since % 1000 == 0) & (seconds < u64::from(u32::MAX));
+            let none = entry.ingest == i64::MAX;
+            if whole | none {
+                let ingest = if none { u32::MAX } else { seconds as u32 };
+                self.notes.push(event_part(entry.ekey, shift1), Note { ekey: entry.ekey, ingest, rec });
+            } else {
+                self.wide_note(entry.ekey, entry.ingest, rec);
+            }
+        }
+        prof::add(10, t);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wide_note(&mut self, ekey: u64, ingest: i64, rec: u32) {
+        self.wide.push(Wide { ekey, ingest, rec });
+    }
+
+    #[inline(never)]
+    unsafe fn flush_clicks(&mut self) {
+        let t = prof::start();
+        let n = self.nclicks;
+        self.nclicks = 0;
+        let links = self.links;
+        let shift2 = self.shift2;
+        let block = std::slice::from_raw_parts(self.clicks.as_ptr(), n);
+        let mut hashes = [0u64; EMIT_BLOCK];
+        let mut starts = [0usize; EMIT_BLOCK];
+        for (h, click) in hashes.iter_mut().zip(block) {
+            *h = links.stage1(click.key);
+        }
+        for (at, &h) in starts.iter_mut().zip(&hashes[..n]) {
+            *at = links.stage2(h);
+        }
+        for (&at, click) in starts.iter().zip(block) {
+            let pkey = links.stage3(at, click.key);
+            self.cl.push((mix1(pkey) >> shift2) as usize, Click { key: pkey, ckey: click.ckey, tc: click.tc });
+        }
+        prof::add(10, t);
+    }
 }
 
 const VIEW: u32 = u32::from_le_bytes(*b"view");
@@ -502,13 +906,19 @@ const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
 impl<'a> ParseState<'a> {
+    /// The event lines of a window. `ONE` is the one-pass shape: every
+    /// copy goes to `emit` for its person lookup, not to `entries`.
     #[inline(never)]
-    unsafe fn events(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+    unsafe fn events<const ONE: bool>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
         let cache = &mut self.cache;
         let entries = &mut self.entries;
+        let emit: *mut Emit = match &mut self.emit {
+            Some(e) => &mut **e,
+            None => std::ptr::null_mut(),
+        };
         let known = scan.clean;
         for_each_line_b::<7>(scan, limit, |b| {
             let id_len = b.len(0);
@@ -550,17 +960,25 @@ impl<'a> ParseState<'a> {
                     w3 = (ts_rel << 32) | (price << 8) | u64::from(cat);
                 }
             }
-            let part = event_part(ekey, shift1);
-            entries.push(part, Entry { ekey, ukey, ingest, w3 });
+            if ONE {
+                (*emit).event(Entry { ekey, ukey, ingest, w3 });
+            } else {
+                let part = event_part(ekey, shift1);
+                entries.push(part, Entry { ekey, ukey, ingest, w3 });
+            }
         })
     }
 
     #[inline(never)]
-    unsafe fn clicks(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+    unsafe fn clicks<const ONE: bool>(&mut self, base: *const u8, scan: &Scan, limit: u32) -> u32 {
         let fast = self.fast;
         let (cws, cwlen) = (fast.cws, fast.cwlen);
         let cache = &mut self.cache;
         let clicks = &mut self.clicks;
+        let emit: *mut Emit = match &mut self.emit {
+            Some(e) => &mut **e,
+            None => std::ptr::null_mut(),
+        };
         let known = scan.clean;
         for_each_line_b::<4>(scan, limit, |b| {
             let id_len = b.len(0);
@@ -579,10 +997,15 @@ impl<'a> ParseState<'a> {
             }
             let ckey = ids::pack_in(base.add(b.start(0)), id_len, known);
             let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
+            let click = Click { key: ukey, ckey, tc: (rel << 32) | u64::from(camp) };
+            if ONE {
+                (*emit).click(click);
+                return;
+            }
             if clicks.last().is_none_or(|b| b.len() == CLICK_BLOCK) {
                 clicks.push(Vec::with_capacity(CLICK_BLOCK));
             }
-            clicks.last_mut().unwrap_unchecked().push(Click { key: ukey, ckey, tc: (rel << 32) | u64::from(camp) });
+            clicks.last_mut().unwrap_unchecked().push(click);
         })
     }
 
@@ -636,8 +1059,11 @@ impl<'a> ParseState<'a> {
                     }
                 }
                 let w3 = if valid { (ts_rel << 32) | pc } else { DEAD };
-                let part = event_part(ekey, self.shift1);
-                self.entries.push(part, Entry { ekey, ukey, ingest: ingest.unwrap_or(i64::MAX), w3 });
+                let entry = Entry { ekey, ukey, ingest: ingest.unwrap_or(i64::MAX), w3 };
+                match &mut self.emit {
+                    Some(emit) => emit.event(entry),
+                    None => self.entries.push(event_part(ekey, self.shift1), entry),
+                }
             }
             Kind::Clicks => {
                 let Some(f) = split_long::<4>(line) else {
@@ -656,6 +1082,10 @@ impl<'a> ParseState<'a> {
                     return;
                 }
                 let click = Click { key: ids::pack_slice(f[1]), ckey: ids::pack_slice(f[0]), tc: (rel << 32) | u64::from(camp) };
+                if let Some(emit) = &mut self.emit {
+                    emit.click(click);
+                    return;
+                }
                 if self.clicks.last().is_none_or(|b| b.len() == CLICK_BLOCK) {
                     self.clicks.push(Vec::with_capacity(CLICK_BLOCK));
                 }
@@ -675,9 +1105,12 @@ impl<'a> ParseState<'a> {
 
     #[inline(always)]
     unsafe fn consume(&mut self, kind: Kind, base: *const u8, scan: &Scan, limit: u32) -> u32 {
+        let one = self.emit.is_some();
         match kind {
-            Kind::Events => self.events(base, scan, limit),
-            Kind::Clicks => self.clicks(base, scan, limit),
+            Kind::Events if one => self.events::<true>(base, scan, limit),
+            Kind::Events => self.events::<false>(base, scan, limit),
+            Kind::Clicks if one => self.clicks::<true>(base, scan, limit),
+            Kind::Clicks => self.clicks::<false>(base, scan, limit),
             Kind::Links => self.links(base, scan, limit),
         }
     }
@@ -816,6 +1249,11 @@ const EMIT_AHEAD: usize = 1024;
 const CLICK_AHEAD: usize = 1024;
 /// Link lookups run in blocks of this many records, one stage at a time.
 const BLOCK: usize = 128;
+/// Lookups a one-pass parser runs as one block. Inside the parser the
+/// lookups compete with the input reads and three scatters; measured at
+/// 20M events, blocks of 64, 128, 256 and 1024 cost 3940, 3470, 3300 and
+/// about 3250 CPU ms of parse (2048 and 4096 no better).
+const EMIT_BLOCK: usize = 1024;
 
 impl<'a> Resolver<'a> {
     /// Dedup one event partition and scatter its surviving valid events by
@@ -957,6 +1395,157 @@ impl<'a> Resolver<'a> {
             }
         }
         prof::add(6, t);
+    }
+}
+
+// ---------------------------------------------------------------- one-pass dedup
+
+/// Notes per chunk fit in this many bits of a dedup slot.
+const NOTE_OFF_BITS: u32 = 10;
+const NOTE_OFF_MASK: u32 = (1 << NOTE_OFF_BITS) - 1;
+const _: () = assert!((CHUNK_BYTES - 64) / std::mem::size_of::<Note>() <= 1 << NOTE_OFF_BITS);
+
+struct Deduper<'a> {
+    dir: &'a sys::Directory,
+    table: Vec<u32>,
+    /// The note chunks of the partition at hand, by number from 1.
+    bases: Vec<*mut Note>,
+    ingest_base: i64,
+}
+
+impl<'a> Deduper<'a> {
+    /// Mark the person record a losing copy wrote, if it wrote one.
+    #[inline(always)]
+    unsafe fn drop_record(&self, rec: u32) {
+        if rec != NO_RECORD {
+            (*self.dir.record::<Ev>(rec)).v = DEAD;
+        }
+    }
+
+    /// Dedup one event-key partition: of the copies of one event, the one
+    /// with the smallest ingest stays, and the person record of every other
+    /// copy is marked dropped. If the copy that stays is invalid it has no
+    /// record, so the event is gone, as the rules ask: dedup comes before
+    /// validation. Copies with equal ingest are identical; the first seen
+    /// stays. The table is the one `Resolver::events` uses.
+    unsafe fn partition(&mut self, lists: &[List<Note>], wide: &[Wide]) {
+        let t = prof::start();
+        let n: usize = lists.iter().map(|l| l.count()).sum();
+        if n + wide.len() == 0 {
+            return;
+        }
+        let chunks: usize = lists.iter().map(|l| l.chunks as usize).sum();
+        let pos_bits = usize::BITS - chunks.leading_zeros() + NOTE_OFF_BITS;
+        let pos_mask = if pos_bits >= 32 { u32::MAX } else { (1u32 << pos_bits) - 1 };
+        let cap = (n * 2).next_power_of_two().max(64);
+        self.table.clear();
+        self.table.resize(cap, 0);
+        self.bases.clear();
+        self.bases.push(std::ptr::null_mut());
+        let mask = cap - 1;
+        let table = self.table.as_mut_ptr();
+        for list in lists {
+            list.for_each_chunk_ahead(|chunk, next| {
+                let end = chunk.as_ptr().add(chunk.len()) as usize;
+                let first = (self.bases.len() as u32) << NOTE_OFF_BITS;
+                self.bases.push(chunk.as_mut_ptr());
+                let bases = self.bases.as_ptr();
+                for (k, note) in chunk.iter().enumerate() {
+                    let ahead = note as *const Note as usize + DEDUP_AHEAD;
+                    let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
+                    prefetch(ahead as *const u8);
+                    let h = mix1(note.ekey);
+                    let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
+                    let me = first | k as u32;
+                    let mut i = (h >> 20) as usize & mask;
+                    loop {
+                        let slot = *table.add(i);
+                        if slot == 0 {
+                            *table.add(i) = tag | me;
+                            break;
+                        }
+                        if slot & !pos_mask == tag {
+                            let at = slot & pos_mask;
+                            let other = (*bases.add((at >> NOTE_OFF_BITS) as usize)).add((at & NOTE_OFF_MASK) as usize);
+                            if (*other).ekey == note.ekey {
+                                // Same event: the smaller ingest stays.
+                                if note.ingest < (*other).ingest {
+                                    self.drop_record((*other).rec);
+                                    *table.add(i) = tag | me;
+                                } else {
+                                    self.drop_record(note.rec);
+                                }
+                                break;
+                            }
+                        }
+                        i = (i + 1) & mask;
+                    }
+                }
+            });
+        }
+        if !wide.is_empty() {
+            self.wide(wide, pos_bits, pos_mask, mask);
+        }
+        prof::add(4, t);
+    }
+
+    /// The copies whose ingest did not fit a note, against the winners of
+    /// the table and each other, with exact ingest values.
+    #[cold]
+    #[inline(never)]
+    unsafe fn wide(&mut self, wide: &[Wide], pos_bits: u32, pos_mask: u32, mask: usize) {
+        use std::collections::HashMap;
+        // Per key: the exact ingest and record of the copy that stays so
+        // far, from the table or from this list.
+        let mut best: HashMap<u64, (i64, u32)> = HashMap::new();
+        let table = self.table.as_ptr();
+        let exact = |ingest: u32| -> i64 {
+            if ingest == u32::MAX {
+                i64::MAX
+            } else {
+                self.ingest_base + i64::from(ingest) * 1000
+            }
+        };
+        for w in wide {
+            let current = match best.get(&w.ekey) {
+                Some(&b) => Some(b),
+                None => {
+                    // The winner among the notes, if the key has any.
+                    let h = mix1(w.ekey);
+                    let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
+                    let mut i = (h >> 20) as usize & mask;
+                    let mut found = None;
+                    loop {
+                        let slot = *table.add(i);
+                        if slot == 0 {
+                            break;
+                        }
+                        if slot & !pos_mask == tag {
+                            let at = slot & pos_mask;
+                            let other = (*self.bases.as_ptr().add((at >> NOTE_OFF_BITS) as usize)).add((at & NOTE_OFF_MASK) as usize);
+                            if (*other).ekey == w.ekey {
+                                found = Some((exact((*other).ingest), (*other).rec));
+                                break;
+                            }
+                        }
+                        i = (i + 1) & mask;
+                    }
+                    found
+                }
+            };
+            let stays = match current {
+                None => (w.ingest, w.rec),
+                Some((ingest, rec)) if w.ingest < ingest => {
+                    self.drop_record(rec);
+                    (w.ingest, w.rec)
+                }
+                Some(kept) => {
+                    self.drop_record(w.rec);
+                    kept
+                }
+            };
+            best.insert(w.ekey, stays);
+        }
     }
 }
 
@@ -2407,6 +2996,10 @@ impl<'a> PersonPhase<'a> {
         for list in evs {
             list.for_each_chunk(|chunk| {
                 for rec in chunk.iter() {
+                    if rec.v == DEAD {
+                        // Dropped by the one-pass dedup.
+                        continue;
+                    }
                     let mut i = (person_hash(rec.pkey) >> shift) as usize;
                     let id = loop {
                         let id1 = *tab.add(i) as usize;
@@ -2438,6 +3031,8 @@ impl<'a> PersonPhase<'a> {
                 }
             });
         }
+        // Records the dedup dropped are not counted from here on.
+        let n = at;
         self.words.set_len(n);
         self.keys.set_len(people + 1);
         self.counts.set_len(people);
@@ -2904,6 +3499,170 @@ impl Timer {
     }
 }
 
+struct Inputs<'a> {
+    events: &'a [Mapped],
+    clicks: &'a [Mapped],
+    links: &'a [Mapped],
+}
+
+/// The one-pass shape up to the person phase: links joined on all threads,
+/// then parse with person lookups and notes, then dedup of the notes.
+/// Returns the person partitions of events and clicks per thread.
+#[allow(clippy::too_many_arguments)]
+fn front_onepass(
+    fast: &Fast,
+    cfg: &Config,
+    inputs: &Inputs,
+    jobs: &[Job],
+    (bits1, bits2): (u32, u32),
+    drop_pages: bool,
+    cpu_total: &Mutex<f64>,
+    timer: &mut Timer,
+) -> (Vec<Vec<List<Ev>>>, Vec<Vec<List<Click>>>) {
+    let threads = cfg.threads;
+    let (parts1, parts2) = (1usize << bits1, 1usize << bits2);
+    let knob = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    // Staging buffer sizes, in units of whole records filling cache lines
+    // (64 bytes for 16-byte records, 192 for clicks).
+    let (note_lines, ev_lines, cl_lines) = (knob("ENGINE_NOTE_LINES", 3), knob("ENGINE_EV_LINES", 3), knob("ENGINE_CL_LINES", 1));
+    let new_parser = |emit: Option<Box<Emit>>| Parser {
+        st: ParseState {
+            fast,
+            cache: DateCache::new(),
+            entries: Scatter::new(1, CHUNK_BYTES),
+            shift1: 64 - bits1,
+            clicks: Vec::new(),
+            pairs: Vec::new(),
+            emit,
+        },
+        scan: Scan::new(WINDOW),
+    };
+
+    // ---- links: read and joined before anything else, so that the
+    // parsers can send every event and click straight to its person.
+    let link_chunk = cfg.chunk_bytes.min(1 << 18);
+    let link_bytes: usize = inputs.links.iter().map(|m| m.len).sum();
+    let mut link_jobs: Vec<Job> = Vec::new();
+    for (file, m) in inputs.links.iter().enumerate() {
+        let mut start = 0;
+        while start < m.len {
+            let end = if m.len - start < link_chunk * 3 / 2 { m.len } else { start + link_chunk };
+            link_jobs.push(Job { kind: Kind::Links, file, start, end });
+            start = end;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let mut pair_lists: Vec<Vec<(u64, u64)>> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads.min(link_jobs.len()))
+            .map(|_| {
+                scope.spawn(|| unsafe {
+                    let t = prof::start();
+                    let mut parser = new_parser(None);
+                    // Twice a fair share of pairs at 20 bytes a line, so the
+                    // list rarely moves (fresh memory is only address space
+                    // until it is written).
+                    parser.st.pairs.reserve(link_bytes / 10 / threads.max(1));
+                    while let Some(job) = link_jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        parser.run_chunk(inputs.links[job.file], job.start, job.end, Kind::Links);
+                    }
+                    prof::add(2, t);
+                    *cpu_total.lock().unwrap() += sys::thread_cpu();
+                    parser.st.pairs
+                })
+            })
+            .collect();
+        for h in handles {
+            pair_lists.push(h.join().unwrap());
+        }
+    });
+    let build_cpu = prof::get(3);
+    let links = LinkMap::build_parallel(&pair_lists, threads);
+    drop(pair_lists);
+    timer.lap("links", std::mem::take(&mut *cpu_total.lock().unwrap()) + prof::get(3) - build_cpu);
+
+    // ---- parse
+    let directory = sys::Directory::new();
+    let directory = &directory;
+    let next = AtomicUsize::new(0);
+    let mut note_lists: Vec<Vec<List<Note>>> = Vec::new();
+    let mut ev_lists: Vec<Vec<List<Ev>>> = Vec::new();
+    let mut cl_lists: Vec<Vec<List<Click>>> = Vec::new();
+    let mut wide: Vec<Wide> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| unsafe {
+                    let emit = Emit::new(
+                        links,
+                        Scatter::with_lines(parts1, CHUNK_BYTES, note_lines),
+                        Scatter::named(parts2, CHUNK_BYTES, ev_lines, directory),
+                        Scatter::with_lines(parts2, CHUNK_BYTES, cl_lines),
+                        64 - bits1,
+                        64 - bits2,
+                        fast.ws,
+                    );
+                    let mut parser = new_parser(Some(emit));
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let files = if job.kind == Kind::Events { inputs.events } else { inputs.clicks };
+                        parser.run_chunk(files[job.file], job.start, job.end, job.kind);
+                        sys::drop_pages(files[job.file], job.start, job.end, drop_pages);
+                    }
+                    let mut emit = parser.st.emit.take().unwrap_unchecked();
+                    if emit.nevents > 0 {
+                        emit.flush_events();
+                    }
+                    if emit.nclicks > 0 {
+                        emit.flush_clicks();
+                    }
+                    *cpu_total.lock().unwrap() += sys::thread_cpu();
+                    let emit = *emit;
+                    (emit.notes.finish(), emit.ev.finish(), emit.cl.finish(), emit.wide)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (notes, ev, cl, odd) = h.join().unwrap();
+            note_lists.push(notes);
+            ev_lists.push(ev);
+            cl_lists.push(cl);
+            wide.extend(odd);
+        }
+    });
+    timer.lap("parse", std::mem::take(&mut *cpu_total.lock().unwrap()));
+
+    // ---- dedup of the notes
+    let mut wide_parts: Vec<Vec<Wide>> = Vec::new();
+    if !wide.is_empty() {
+        wide_parts.resize(parts1, Vec::new());
+        for w in wide {
+            wide_parts[event_part(w.ekey, 64 - bits1)].push(w);
+        }
+    }
+    let (note_lists, wide_parts) = (&note_lists, &wide_parts);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| unsafe {
+                let mut dedup = Deduper { dir: directory, table: Vec::new(), bases: Vec::new(), ingest_base: note_base(fast.ws) };
+                let mut lists: Vec<List<Note>> = Vec::with_capacity(threads);
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    if at >= parts1 {
+                        break;
+                    }
+                    lists.clear();
+                    lists.extend(note_lists.iter().map(|t| t[at]));
+                    dedup.partition(&lists, wide_parts.get(at).map_or(&[][..], |v| &v[..]));
+                }
+                *cpu_total.lock().unwrap() += sys::thread_cpu();
+            });
+        }
+    });
+    timer.lap("resolve", std::mem::take(&mut *cpu_total.lock().unwrap()));
+    (ev_lists, cl_lists)
+}
+
 /// Run the fast engine. Returns `None` without doing any work when the
 /// dataset breaks a precondition (see `Fast::new`). With `cfg.collect` the
 /// rows come back in memory; otherwise they are written under `out`.
@@ -2934,9 +3693,16 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let bits2 = bits_for(estimate, 48_000, cfg.p2_bits);
     let (parts1, parts2) = (1usize << bits1, 1usize << bits2);
 
-    // Jobs: the links job first, then event chunks (largest files first),
-    // then click chunks.
-    let mut jobs: Vec<Job> = vec![Job { kind: Kind::Links, file: 0, start: 0, end: 0 }];
+    // The one-pass shape names person records in 32 bits through a chunk
+    // directory. Bound the chunks it can need: every record is a valid
+    // event line of at least 16 bytes, a chunk holds over 1000 records, and
+    // each thread leaves at most one part-filled chunk a partition.
+    let max_chunks = (event_bytes / 16 / 1000) as usize + threads * (parts2 + 1) + 16;
+    let onepass = cfg.onepass && max_chunks < sys::DIR_CHUNKS;
+
+    // Jobs: the links job first (unless the links are joined before), then
+    // event chunks (largest files first), then click chunks.
+    let mut jobs: Vec<Job> = if onepass { Vec::new() } else { vec![Job { kind: Kind::Links, file: 0, start: 0, end: 0 }] };
     for (kind, files) in [(Kind::Events, &event_files), (Kind::Clicks, &click_files)] {
         let mut order: Vec<usize> = (0..files.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(files[i].len));
@@ -2952,14 +3718,19 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     }
     timer.lap("setup", 0.0);
 
-    // ---- phase 1
     // Parsed chunks are unmapped by the worker that parsed them. Measured
     // neutral on time at 20M, a little faster at 60M, and it halves peak
     // RSS (the kernel no longer tears the mappings down inside exit).
     let drop_pages = std::env::var("ENGINE_DROP").map_or(true, |v| v != "0");
+    let cpu_total = Mutex::new(0.0f64);
+    let inputs = Inputs { events: &event_files, clicks: &click_files, links: &link_files };
+    let (ev_lists, cl_lists, unmapper) = if onepass {
+        let (ev, cl) = front_onepass(fast, cfg, &inputs, &jobs, (bits1, bits2), drop_pages, &cpu_total, &mut timer);
+        (ev, cl, None)
+    } else {
+    // ---- phase 1
     let next = AtomicUsize::new(0);
     let link_map: Mutex<Option<LinkMap>> = Mutex::new(None);
-    let cpu_total = Mutex::new(0.0f64);
     let mut entry_lists: Vec<Vec<List<Entry>>> = Vec::new();
     let mut click_blocks: Vec<Vec<Click>> = Vec::new();
     std::thread::scope(|scope| {
@@ -2974,6 +3745,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
                             shift1: 64 - bits1,
                             clicks: Vec::new(),
                             pairs: Vec::new(),
+                            emit: None,
                         },
                         scan: Scan::new(WINDOW),
                     };
@@ -3073,6 +3845,8 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
         }
     });
     timer.lap("resolve", std::mem::take(&mut *cpu_total.lock().unwrap()));
+    (ev_lists, cl_lists, unmapper)
+    };
 
     // ---- phase 3: biggest partitions first, so the tail is short jobs.
     let mut order: Vec<usize> = (0..parts2).collect();
