@@ -55,7 +55,7 @@ impl Config {
         let num = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok());
         Config {
             threads: sys::threads(),
-            timing: std::env::var_os("ENGINE_TIMING").is_some(),
+            timing: cfg!(feature = "diag") || std::env::var_os("ENGINE_TIMING").is_some(),
             collect: false,
             chunk_bytes: num("ENGINE_CHUNK_KB").map_or(4 << 20, |kb| (kb as usize) << 10),
             p1_bits: num("ENGINE_P1_BITS"),
@@ -3614,6 +3614,8 @@ impl Timer {
     fn lap(&mut self, name: &str, cpu: f64) {
         if self.on {
             let now = Instant::now();
+            #[cfg(feature = "diag")]
+            crate::diag::phase(name, (now - self.last).as_secs_f64() * 1e3, cpu * 1e3);
             eprintln!(
                 "[engine] {name:<10} wall {:7.1} ms  cpu {:7.1} ms  (at {:7.1} ms)",
                 (now - self.last).as_secs_f64() * 1e3,

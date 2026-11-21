@@ -363,14 +363,21 @@ impl DenseEmit {
         for &h in &hashes[..n.min(ahead)] {
             table.prefetch(h);
         }
+        // The probes first, all of them, then the scatters: the probes'
+        // misses do not wait behind the scatters' streaming stores.
+        let mut persons = [0u32; DENSE_BLOCK];
         for (k, entry) in block.iter().enumerate() {
             if k + ahead < n {
                 table.prefetch(*hashes.get_unchecked(k + ahead));
             }
-            let h = *hashes.get_unchecked(k);
+            if entry.w3 != DEAD {
+                *persons.get_unchecked_mut(k) = self.person(entry.ukey, *hashes.get_unchecked(k));
+            }
+        }
+        for (k, entry) in block.iter().enumerate() {
             let mut rec = NO_RECORD;
             if entry.w3 != DEAD {
-                let person = self.person(entry.ukey, h);
+                let person = *persons.get_unchecked(k);
                 let part = (person >> sbits) as usize;
                 let idx = person & smask;
                 let ts = entry.w3 >> 32;

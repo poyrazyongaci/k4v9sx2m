@@ -1,5 +1,7 @@
 mod alloc;
 mod common;
+#[cfg(feature = "diag")]
+mod diag;
 mod engine;
 mod ids;
 mod naive;
@@ -18,9 +20,13 @@ use std::path::PathBuf;
 static GLOBAL: alloc::Bump = alloc::Bump;
 
 fn main() {
+    #[cfg(feature = "diag")]
+    diag::start();
     let started = std::time::Instant::now();
+    #[cfg(feature = "diag")]
+    diag::mark();
     let epoch = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-    let timing = std::env::var_os("ENGINE_TIMING").is_some();
+    let timing = cfg!(feature = "diag") || std::env::var_os("ENGINE_TIMING").is_some();
     if timing {
         eprintln!("[engine] start epoch {:.3}", epoch());
     }
@@ -59,5 +65,7 @@ fn main() {
             ru.ru_minflt
         );
     }
+    #[cfg(feature = "diag")]
+    diag::after(&out, &lookups, started);
     sys::exit_now(0);
 }
