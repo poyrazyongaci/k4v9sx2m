@@ -89,6 +89,24 @@ struct Entry {
 
 const DEAD: u64 = u64::MAX;
 
+/// An event key as a map key: equal when the IDs are equal.
+#[derive(Clone, Copy)]
+struct EventId(u64);
+
+impl PartialEq for EventId {
+    fn eq(&self, other: &Self) -> bool {
+        ids::same_event(self.0, other.0)
+    }
+}
+
+impl Eq for EventId {}
+
+impl std::hash::Hash for EventId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(ids::event_hash_part(self.0));
+    }
+}
+
 /// What dedup needs of one event copy (one-pass shape): its key, when it
 /// was ingested, and the name of its person record (`NO_RECORD` for an
 /// invalid copy, which has none).
@@ -184,7 +202,7 @@ fn person_part(pkey: u64, shift2: u32) -> usize {
 /// bits the dedup table uses inside a partition.
 #[inline(always)]
 fn event_part(ekey: u64, shift1: u32) -> usize {
-    (ekey.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
+    (ids::event_hash_part(ekey).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
 }
 
 /// Lookup tables derived from the catalogs for the fast paths.
@@ -1191,7 +1209,7 @@ impl<'a> ParseState<'a> {
             if id_len == 0 {
                 return;
             }
-            let ekey = ids::pack_in(base.add(b.start(0)), id_len, known);
+            let ekey = ids::event_key(base.add(b.start(0)), id_len, known);
             let user_len = b.len(1);
             let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
             let (ts, ingest) = parse_ts_ingest(base.add(b.start(2)), b.len(2), base.add(b.start(3)), b.len(3), cache);
@@ -1332,7 +1350,7 @@ impl<'a> ParseState<'a> {
                 if f[0].is_empty() {
                     return;
                 }
-                let ekey = ids::pack_slice(f[0]);
+                let ekey = ids::event_key_slice(f[0]);
                 let ukey = ids::pack_slice(f[1]);
                 let ingest = parse_ts_naive(f[3]);
                 let ts = parse_ts_naive(f[2]).unwrap_or(BAD);
@@ -1730,7 +1748,7 @@ impl<'a> Resolver<'a> {
                 for k in from..to {
                     let entry = &mut *data.add(k);
                     prefetch(ahead.wrapping_add(k));
-                    let h = mix1(entry.ekey);
+                    let h = mix1(ids::event_hash_part(entry.ekey));
                     // Low hash bits, apart from the home bits (20 and up).
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let me = first | k as u32;
@@ -1744,7 +1762,7 @@ impl<'a> Resolver<'a> {
                         if slot & !pos_mask == tag {
                             let at = slot & pos_mask;
                             let other = (*bases.add((at >> OFF_BITS) as usize)).add((at & OFF_MASK) as usize);
-                            if (*other).ekey == entry.ekey {
+                            if ids::same_event((*other).ekey, entry.ekey) {
                                 // Same event: the smaller ingest stays. On
                                 // a tie the copies are identical.
                                 if entry.ingest < (*other).ingest {
@@ -1938,7 +1956,7 @@ impl<'a> Deduper<'a> {
                     let ahead = note as *const Note as usize + DEDUP_AHEAD;
                     let ahead = if ahead < end || next.is_null() { ahead } else { next as usize + (ahead - end) };
                     prefetch(ahead as *const u8);
-                    let h = mix1(note.ekey);
+                    let h = mix1(ids::event_hash_part(note.ekey));
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let me = first | k as u32;
                     let mut i = (h >> 20) as usize & mask;
@@ -1951,7 +1969,7 @@ impl<'a> Deduper<'a> {
                         if slot & !pos_mask == tag {
                             let at = slot & pos_mask;
                             let other = (*bases.add((at >> NOTE_OFF_BITS) as usize)).add((at & NOTE_OFF_MASK) as usize);
-                            if (*other).ekey == note.ekey {
+                            if ids::same_event((*other).ekey, note.ekey) {
                                 // Same event: the smaller ingest stays.
                                 if note.ingest < (*other).ingest {
                                     self.drop_record((*other).rec);
@@ -1981,7 +1999,7 @@ impl<'a> Deduper<'a> {
         use std::collections::HashMap;
         // Per key: the exact ingest and record of the copy that stays so
         // far, from the table or from this list.
-        let mut best: HashMap<u64, (i64, u32)> = HashMap::new();
+        let mut best: HashMap<EventId, (i64, u32)> = HashMap::new();
         let table = self.table.as_ptr();
         let exact = |ingest: u32| -> i64 {
             if ingest == u32::MAX {
@@ -1991,11 +2009,11 @@ impl<'a> Deduper<'a> {
             }
         };
         for w in wide {
-            let current = match best.get(&w.ekey) {
+            let current = match best.get(&EventId(w.ekey)) {
                 Some(&b) => Some(b),
                 None => {
                     // The winner among the notes, if the key has any.
-                    let h = mix1(w.ekey);
+                    let h = mix1(ids::event_hash_part(w.ekey));
                     let tag = ((h as u32) << (pos_bits & 31)) & !pos_mask;
                     let mut i = (h >> 20) as usize & mask;
                     let mut found = None;
@@ -2007,7 +2025,7 @@ impl<'a> Deduper<'a> {
                         if slot & !pos_mask == tag {
                             let at = slot & pos_mask;
                             let other = (*self.bases.as_ptr().add((at >> NOTE_OFF_BITS) as usize)).add((at & NOTE_OFF_MASK) as usize);
-                            if (*other).ekey == w.ekey {
+                            if ids::same_event((*other).ekey, w.ekey) {
                                 found = Some((exact((*other).ingest), (*other).rec));
                                 break;
                             }
@@ -2028,7 +2046,7 @@ impl<'a> Deduper<'a> {
                     kept
                 }
             };
-            best.insert(w.ekey, stays);
+            best.insert(EventId(w.ekey), stays);
         }
     }
 }
