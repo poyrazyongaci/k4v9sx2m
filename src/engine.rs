@@ -1502,16 +1502,22 @@ impl Lines for Fused<'_> {
             let nl = if N == 7 { fuse::event_line(p, &mut b, &mut known) } else { fuse::click_line(p, &mut b, &mut known) };
             let mut used = nl as usize + 1;
             if nl == fuse::REFUSED {
-                // One call site for `f`, so it is inlined.
-                (used, known) = refused_line::<N>(scan, m, pos, &mut b);
-                if used == 0 {
-                    return pos;
+                // A line too wide for the narrow reader (a long ID) first.
+                let wide = fuse::wide_line::<N>(p, &mut b, &mut known);
+                if wide != fuse::REFUSED {
+                    used = wide as usize + 1;
+                } else {
+                    // One call site for `f`, so it is inlined.
+                    (used, known) = refused_line::<N>(scan, m, pos, &mut b);
+                    if used == 0 {
+                        return pos;
+                    }
+                    if !known {
+                        pos += used;
+                        continue;
+                    }
+                    known = scan.clean;
                 }
-                if !known {
-                    pos += used;
-                    continue;
-                }
-                known = scan.clean;
             }
             f(p, &b, known);
             pos += used;
@@ -5108,6 +5114,25 @@ mod fused_tests {
             src.run::<N>(|p, bb, k| collect::<N>(p, buf.as_ptr(), bb, k, &mut staged))
         };
         assert_eq!(used, line.len() + 1);
+        // The wide reader on the same line: it may refuse, and what it
+        // accepts it splits as stage 1 and 2 do.
+        let mut wb = Bounds::new();
+        let mut wknown = false;
+        let wnl = unsafe { fuse::wide_line::<N>(buf.as_ptr(), &mut wb, &mut wknown) };
+        if wnl != fuse::REFUSED {
+            assert_eq!(wnl as usize, line.len(), "wide line end of {:?}", String::from_utf8_lossy(line));
+            assert_eq!(staged.len(), 1, "wide accepted a malformed line {:?}", String::from_utf8_lossy(line));
+            for i in 0..N {
+                let f = &buf[wb.start(i)..wb.start(i) + wb.len(i)];
+                assert_eq!(f, &staged[0].1[i][..], "wide field {i} of {:?}", String::from_utf8_lossy(line));
+                if wknown && i < 2 {
+                    assert!(f.iter().all(|&c| (1..=127).contains(&c)), "wide known but not plain");
+                }
+            }
+        } else {
+            // It takes every well-formed line that ends within its reach.
+            assert!(staged.is_empty() || line.len() >= fuse::WIDE, "wide refused {:?}", String::from_utf8_lossy(line));
+        }
         if nl == fuse::REFUSED {
             return false;
         }
@@ -5180,7 +5205,7 @@ mod fused_tests {
         quotes::<4>(&CLICK);
     }
 
-    /// Lines of every length from 20 to 150 bytes, padded or cut in each
+    /// Lines of every length from 20 to 230 bytes, padded or cut in each
     /// field in turn, plain and quoted: commas and line breaks on every side
     /// of the 32, 64, 96 and 128 byte edges.
     fn lengths<const N: usize>(base: &[&str]) {
@@ -5189,7 +5214,7 @@ mod fused_tests {
         let mut accepted = 0;
         for k in 0..N {
             for quoted in [false, true] {
-                for total in 20..=150usize {
+                for total in 20..=230usize {
                     let mut f = fields.clone();
                     if quoted {
                         f[k] = [&b"\""[..], &f[k], b"\""].concat();
@@ -5214,7 +5239,7 @@ mod fused_tests {
                 }
             }
         }
-        eprintln!("{N} fields: {accepted} of {} lengths by the fast path", N * 2 * 131);
+        eprintln!("{N} fields: {accepted} of {} lengths by the fast path", N * 2 * 211);
         assert!(accepted > N * 2 * 131 / 4);
         check::<N>(&text, "lengths");
     }
@@ -5247,6 +5272,8 @@ mod fused_tests {
                         0 => 0,
                         1 => 1,
                         2 => 20 + rng(&mut state) % 60,
+                        3 | 4 if i < 2 => 33,
+                        5 if round % 7 == 0 => 60 + rng(&mut state) % 90,
                         _ => 3 + rng(&mut state) % 20,
                     };
                     let quoting = rng(&mut state) % 100;
