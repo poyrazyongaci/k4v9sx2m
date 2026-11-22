@@ -201,6 +201,10 @@ fn push_id(ids: &mut Vec<u8>, pkey: u64) {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), at.add(4), 9);
             ids.set_len(ids.len() + 4 + len);
         }
+    } else if pkey & ids::HEX != 0 {
+        let mut buf = [0u8; ids::HEX_LEN];
+        ids::unpack_hex(pkey, &mut buf);
+        plain_bytes(&buf, ids);
     } else {
         let mut bytes = Vec::new();
         ids::unpack(pkey, &mut bytes);

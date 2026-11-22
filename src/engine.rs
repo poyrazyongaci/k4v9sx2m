@@ -1163,6 +1163,11 @@ impl Emit {
     }
 }
 
+// With `--cfg ss_hot`: the section of `events`, 4096-byte aligned (see
+// `sys::layout`).
+#[cfg(all(ss_hot, target_arch = "x86_64"))]
+core::arch::global_asm!(".pushsection .text.hot_events,\"ax\",@progbits", ".p2align 12", ".popsection");
+
 const VIEW: u32 = u32::from_le_bytes(*b"view");
 const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -1172,7 +1177,9 @@ impl<'a> ParseState<'a> {
     /// copy goes to `emit` for its person lookup, not to `entries`; 2 is the
     /// dense shape, where it goes to `dense`.
     #[inline(never)]
+    #[cfg_attr(all(ss_hot, target_arch = "x86_64"), link_section = ".text.hot_events")]
     unsafe fn events<const MODE: u8, L: Lines>(&mut self, src: L) -> usize {
+        crate::layout_pad!(sys::layout::EVENTS_PAD);
         let fast = self.fast;
         let (ws, wlen) = (fast.ws, fast.wlen);
         let shift1 = self.shift1;
@@ -4285,6 +4292,7 @@ pub fn run(data: &Path, out: Option<&Path>, lk: &Lookups, cfg: &Config, started:
     let click_files: Vec<Mapped> = list_csv(&data.join("clicks")).iter().map(|p| sys::map_file(p)).collect();
     let link_files: Vec<Mapped> = list_csv(&data.join("links")).iter().map(|p| sys::map_file(p)).collect();
     let event_bytes: u64 = event_files.iter().map(|m| m.len as u64).sum();
+    ids::size_for(event_bytes + click_files.iter().chain(&link_files).map(|m| m.len as u64).sum::<u64>());
     let fast = Fast::new(lk, event_bytes)?;
     let fast = &fast;
     let threads = cfg.threads;
