@@ -202,7 +202,13 @@ fn person_part(pkey: u64, shift2: u32) -> usize {
 /// bits the dedup table uses inside a partition.
 #[inline(always)]
 fn event_part(ekey: u64, shift1: u32) -> usize {
-    (ids::event_hash_part(ekey).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
+    event_part_of(ids::event_hash_part(ekey), shift1)
+}
+
+/// `event_part` from the hash part of the key (`ids::event_key_part`).
+#[inline(always)]
+fn event_part_of(hash_part: u64, shift1: u32) -> usize {
+    (hash_part.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift1) as usize
 }
 
 /// Lookup tables derived from the catalogs for the fast paths.
@@ -1216,7 +1222,7 @@ impl<'a> ParseState<'a> {
             if id_len == 0 {
                 return;
             }
-            let ekey = ids::event_key(base.add(b.start(0)), id_len, known);
+            let (ekey, ehash) = ids::event_key_part(base.add(b.start(0)), id_len, known);
             let user_len = b.len(1);
             let ukey = ids::pack_in(base.add(b.start(1)), user_len, known);
             let (ts, ingest) = parse_ts_ingest(base.add(b.start(2)), b.len(2), base.add(b.start(3)), b.len(3), cache);
@@ -1256,7 +1262,7 @@ impl<'a> ParseState<'a> {
             } else if MODE == 1 {
                 (*emit).event(Entry { ekey, ukey, ingest, w3 });
             } else {
-                let part = event_part(ekey, shift1);
+                let part = event_part_of(ehash, shift1);
                 entries.push(part, Entry { ekey, ukey, ingest, w3 });
             }
         })
