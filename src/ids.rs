@@ -17,9 +17,14 @@
 //! whose probe run is full of others, or whose low half is 0 or 1 (the
 //! slot's empty and busy marks), goes to the interner instead: a property
 //! that never changes for that ID, so the choice is the same every time.
+//!
+//! Event IDs are the exception, see "event IDs" below: a long one of up to
+//! 128 bytes is not interned and not put in the table but copied, so equal
+//! IDs can have different keys, and event keys are compared with
+//! `same_event` and hashed through `event_hash_part`.
 
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering as Atomic, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
 use crate::ts::load64;
@@ -387,6 +392,266 @@ fn squeeze(x: u64) -> u64 {
     ((x & 0x0FFF_FFFF_0000_0000) >> 4) | (x & 0x0000_0000_0FFF_FFFF)
 }
 
+// ---- event IDs
+//
+// An event ID is only ever compared for equality with another event ID, and
+// nearly every one is new. So a long one takes no lock and no table: its
+// bytes are copied to a block the parsing thread owns, and the key names
+// the copy. Two copies of one ID get two different keys, so event keys are
+// compared with `same_event`, never with `==`, and hashed by
+// `event_hash_part`.
+//
+// The key of a copy: bit 63 set, bit 62 clear, bit 61 set, then 26 bits of
+// the ID's hash, then the place of the copy: 18 bits of block number and 17
+// bits of offset in 8-byte units. A copy is its length as a u64 followed by
+// the bytes.
+//
+// Only IDs of up to `EVENT_COPY_MAX` bytes are copied. A longer one is
+// interned like any other long ID, one record however often it comes: a
+// copy per line of an ID of megabytes would cost memory without bound. Its
+// key has bit 63 set and bits 62 and 61 clear (an address), so it is never
+// taken for the key of a copy, and it is one key per ID, compared whole.
+// The length alone picks the way, so one ID always goes the same way.
+//
+// The directory cannot fill up. A copy takes at most 15 bytes more than its
+// ID, and the line it comes from has 7 bytes or more besides the ID, so the
+// copies of one parse are at most twice the input (give or take a line per
+// file). A thread leaves a block only when the next copy does not fit, so
+// that block and the next hold more than a megabyte together: the blocks
+// are at most two per megabyte of copies, plus one per thread. The engine
+// takes less than 16 GiB of events (`Fast::new`), so one parse needs fewer
+// than 65,536 blocks plus the threads, and the directory has 262,144.
+
+/// Bytes of one block of event ID copies.
+const EVENT_BLOCK: usize = 1 << 20;
+const EVENT_OFF_BITS: u32 = 17;
+const EVENT_ID_BITS: u32 = 18;
+const EVENT_BLOCKS: usize = 1 << EVENT_ID_BITS;
+/// The bits of a long event key that say where the copy is.
+const EVENT_PLACE_BITS: u32 = EVENT_OFF_BITS + EVENT_ID_BITS;
+const EVENT_PLACE: u64 = (1 << EVENT_PLACE_BITS) - 1;
+/// The longest event ID that is copied. Longer ones are interned.
+const EVENT_COPY_MAX: usize = 128;
+/// Bits 63 to 61 of the key of a copy are 101: `FALLBACK`, not the mark of
+/// another kind of long key at bit 62, and this bit, which no address has.
+const EVENT_COPY: u64 = 1 << 61;
+/// The lowest hash bit a key keeps: 26 of them fit between mark and place.
+const EVENT_HASH_SHIFT: u32 = 64 - (61 - EVENT_PLACE_BITS);
+const _: () = assert!(EVENT_HASH_SHIFT == 38);
+const _: () = assert!(EVENT_BLOCK >> 3 == 1 << EVENT_OFF_BITS);
+
+static EVENT_DIR: [AtomicPtr<u8>; EVENT_BLOCKS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; EVENT_BLOCKS];
+static EVENT_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Tests cut the hash of a long event ID down with this mask, to force
+/// different IDs onto equal hash bits. Keys made under two masks do not
+/// mix, so a test that changes it holds `EVENT_MASK_GATE` alone and every
+/// other test that makes event keys holds it shared.
+#[cfg(test)]
+static EVENT_HASH_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+#[cfg(test)]
+pub static EVENT_MASK_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+pub fn set_event_hash_mask(mask: u64) {
+    EVENT_HASH_MASK.store(mask, Atomic::Relaxed);
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn event_hash(bytes: &[u8]) -> u64 {
+    hash(bytes) & EVENT_HASH_MASK.load(Atomic::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn event_hash(bytes: &[u8]) -> u64 {
+    hash(bytes)
+}
+
+/// The block this thread is filling: its number, base, bytes used and size.
+#[derive(Clone, Copy)]
+struct EventBlock {
+    id: usize,
+    base: *mut u8,
+    used: usize,
+    size: usize,
+}
+
+// A block is plain memory that is never freed, and one thread fills it at a
+// time.
+unsafe impl Send for EventBlock {}
+
+/// The block of a thread. When the thread ends, what is left of the block
+/// goes to `EVENT_SPARE` for the next thread that needs one, so a process
+/// that starts threads again and again (the tests) does not use a block,
+/// and a place in the directory, per thread.
+struct EventHere(std::cell::Cell<EventBlock>);
+
+impl Drop for EventHere {
+    fn drop(&mut self) {
+        let b = self.0.get();
+        if b.used < b.size {
+            EVENT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).push(b);
+        }
+    }
+}
+
+static EVENT_SPARE: Mutex<Vec<EventBlock>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static EVENT_HERE: EventHere =
+        const { EventHere(std::cell::Cell::new(EventBlock { id: 0, base: std::ptr::null_mut(), used: 0, size: 0 })) };
+}
+
+/// The key of an event ID. See the note above: compare with `same_event`.
+///
+/// # Safety
+/// As `pack_in`.
+#[inline(always)]
+pub unsafe fn event_key(p: *const u8, len: usize, known: bool) -> u64 {
+    if len <= 9 {
+        if known {
+            return pack_known(p, len);
+        }
+        // The same test as in `pack`.
+        let mask = *LEN_MASK.get_unchecked(len);
+        let v = load64(p) & mask;
+        let ninth = u64::from(*p.add(8)) & (0u64.wrapping_sub(u64::from(len == 9)));
+        let filled = v | (!mask & 0x0101_0101_0101_0101);
+        let bad = (filled.wrapping_sub(0x0101_0101_0101_0101) | filled | ninth) & 0x8080_8080_8080_8080;
+        if bad == 0 && (len != 9 || ninth != 0) {
+            return (squeeze(v.swap_bytes()) << 7) | ninth;
+        }
+    }
+    event_long(std::slice::from_raw_parts(p, len))
+}
+
+/// `event_key` of a slice with nothing readable past its end.
+pub fn event_key_slice(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 16];
+    if bytes.len() <= 9 {
+        buf[..bytes.len()].copy_from_slice(bytes);
+        unsafe { event_key(buf.as_ptr(), bytes.len(), false) }
+    } else {
+        event_long(bytes)
+    }
+}
+
+/// Copy a long event ID to this thread's block and name the copy. One
+/// longer than `EVENT_COPY_MAX` is interned instead.
+#[inline(never)]
+fn event_long(bytes: &[u8]) -> u64 {
+    if bytes.len() > EVENT_COPY_MAX {
+        let key = intern(bytes);
+        debug_assert!(key >> 61 == 4, "an interned key is an address");
+        return key;
+    }
+    let h = event_hash(bytes);
+    let need = (8 + bytes.len() + 7) & !7;
+    EVENT_HERE.with(|here| {
+        let here = &here.0;
+        let mut b = here.get();
+        if b.used + need > b.size {
+            b = event_block(need);
+        }
+        debug_assert!(b.used + need <= EVENT_BLOCK);
+        unsafe {
+            let rec = b.base.add(b.used);
+            (rec as *mut u64).write(bytes.len() as u64);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), rec.add(8), bytes.len());
+        }
+        let key = event_name(h, b.id, b.used);
+        b.used += need;
+        here.set(b);
+        key
+    })
+}
+
+/// The key of the copy at byte `used` of block `id`, of an ID with hash `h`.
+#[inline(always)]
+fn event_name(h: u64, id: usize, used: usize) -> u64 {
+    FALLBACK | EVENT_COPY | ((h >> EVENT_HASH_SHIFT) << EVENT_PLACE_BITS) | ((id as u64) << EVENT_OFF_BITS) | (used as u64 >> 3)
+}
+
+/// Whether an event key is the key of a copy.
+#[inline(always)]
+fn event_copied(key: u64) -> bool {
+    key >> 61 == 5
+}
+
+/// The block and the byte in it that the key of a copy names.
+#[inline(always)]
+fn event_place(key: u64) -> (usize, usize) {
+    let place = key & EVENT_PLACE;
+    ((place >> EVENT_OFF_BITS) as usize, ((place & ((1 << EVENT_OFF_BITS) - 1)) as usize) << 3)
+}
+
+/// A block with room for `need` bytes: one that an ended thread left, or a
+/// new one.
+#[cold]
+#[inline(never)]
+fn event_block(need: usize) -> EventBlock {
+    {
+        let mut spare = EVENT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = spare.iter().position(|b| b.used + need <= b.size) {
+            return spare.swap_remove(at);
+        }
+    }
+    let size = EVENT_BLOCK;
+    let id = EVENT_NEXT.fetch_add(1, Atomic::Relaxed);
+    assert!(id < EVENT_BLOCKS, "too many long event IDs");
+    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+    let base = unsafe { std::alloc::alloc(layout) };
+    if base.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    EVENT_DIR[id].store(base, Atomic::Release);
+    EventBlock { id, base, used: 0, size }
+}
+
+/// The bytes the key of a copy names. Another thread may ask: it got the key
+/// from the thread that made the copy, through a join or a lock, and that
+/// hand-over is what orders the copy's bytes before this read. The
+/// directory entry was stored before the copy was written.
+unsafe fn event_bytes(key: u64) -> &'static [u8] {
+    debug_assert!(event_copied(key));
+    let (id, at) = event_place(key);
+    let base = EVENT_DIR[id].load(Atomic::Acquire);
+    let rec = base.add(at);
+    let len = (rec as *const u64).read() as usize;
+    std::slice::from_raw_parts(rec.add(8), len)
+}
+
+/// Two keys of copies with equal hash bits: are the IDs equal?
+#[cold]
+#[inline(never)]
+fn event_long_eq(a: u64, b: u64) -> bool {
+    unsafe { event_bytes(a) == event_bytes(b) }
+}
+
+/// Whether two event keys are keys of the same event ID. Both must come
+/// from `event_key` or `event_key_slice`.
+#[inline(always)]
+pub fn same_event(a: u64, b: u64) -> bool {
+    // Equal keys are one ID: a packed one, an interned one, or one copy.
+    // Otherwise only two copies can be, and their marks and hash bits are
+    // then equal: the bits above the place.
+    a == b || ((a ^ b) >> EVENT_PLACE_BITS == 0 && event_copied(a) && event_long_eq(a, b))
+}
+
+/// What to hash of an event key, so that equal IDs hash equal: a packed or
+/// interned key whole, the key of a copy without the place of the copy. The
+/// hash bits of a copy are repeated at the low end, where the place was:
+/// a table that takes its slot from the low half of a product would
+/// otherwise never see the low bits of this value change.
+#[inline(always)]
+pub fn event_hash_part(key: u64) -> u64 {
+    let copy = 0u64.wrapping_sub(u64::from(event_copied(key)));
+    let part = key & !(copy & EVENT_PLACE);
+    part | (copy & (part >> EVENT_PLACE_BITS))
+}
+
 /// Safe wrapper for tests and cold paths.
 pub fn pack_slice(bytes: &[u8]) -> u64 {
     let mut buf = [0u8; 16];
@@ -479,6 +744,204 @@ mod tests {
                 _ => b"0123456789abcdefghijklmnopqrstuvwxyzAZ _\t\r"[(rng(state) % 42) as usize],
             })
             .collect()
+    }
+
+    fn gate() -> std::sync::RwLockReadGuard<'static, ()> {
+        EVENT_MASK_GATE.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Short event IDs get the packed key. Long ones get a key per copy:
+    /// equal IDs are the same event and hash equal, whichever thread made
+    /// the key, and no two different IDs are the same event.
+    #[test]
+    fn event_keys_are_ids() {
+        let _gate = gate();
+        let mut state = 11;
+        let mut ids: Vec<Vec<u8>> = (0..3000).map(|_| sample(&mut state)).collect();
+        // Long IDs: a shared prefix with one byte changed, a prefix of
+        // another, lengths around the 8 byte steps of a copy, and bytes of
+        // every value.
+        for len in [10usize, 15, 16, 17, 23, 24, 25, 32, 33, 34, 64, 120, 127, 128, 129, 136, 300, 4096] {
+            let base: Vec<u8> = (0..len).map(|i| b'a' + (i % 23) as u8).collect();
+            for at in [0, len / 2, len - 1] {
+                let mut other = base.clone();
+                other[at] ^= 1;
+                ids.push(other);
+            }
+            ids.push(base[..len - 1].to_vec());
+            let mut more = base.clone();
+            more.push(0);
+            ids.push(more);
+            ids.push((0..len).map(|i| (rng(&mut state) % 256) as u8 | u8::from(i == 0)).collect());
+            ids.push(base);
+        }
+        ids.sort();
+        ids.dedup();
+        let keys: Vec<u64> = ids.iter().map(|id| event_key_slice(id)).collect();
+        // A second key of every ID, made on another thread.
+        let again: Vec<u64> = std::thread::scope(|s| s.spawn(|| ids.iter().map(|id| event_key_slice(id)).collect()).join().unwrap());
+        let mut long = 0;
+        let mut interned = 0;
+        for (i, id) in ids.iter().enumerate() {
+            let short = id.len() <= 9 && id.iter().all(|&c| (1..=127).contains(&c));
+            if short {
+                assert_eq!(keys[i], pack_slice(id), "{id:?}");
+                assert_eq!(keys[i], again[i]);
+                assert_eq!(keys[i] & FALLBACK, 0);
+            } else if id.len() > EVENT_COPY_MAX {
+                interned += 1;
+                assert_eq!(keys[i], again[i], "two records of one ID: {id:?}");
+                assert_eq!(keys[i] >> 61, 4);
+                assert_eq!(event_hash_part(keys[i]), keys[i]);
+                let mut out = Vec::new();
+                unpack(keys[i], &mut out);
+                assert_eq!(out, *id);
+            } else {
+                long += 1;
+                assert_ne!(keys[i], again[i], "one copy for two keys: {id:?}");
+                assert_eq!(keys[i] >> 61, 5);
+                assert_eq!(unsafe { event_bytes(keys[i]) }, &id[..]);
+                assert_eq!(unsafe { event_bytes(again[i]) }, &id[..]);
+            }
+            assert!(same_event(keys[i], again[i]) && same_event(again[i], keys[i]), "{id:?}");
+            assert_eq!(event_hash_part(keys[i]), event_hash_part(again[i]), "{id:?}");
+            // The pointer form, with bytes after the field.
+            let mut buf = id.clone();
+            buf.extend_from_slice(b",tail of the line, sixteen bytes and more");
+            let k = unsafe { event_key(buf.as_ptr(), id.len(), false) };
+            assert!(same_event(k, keys[i]), "{id:?}");
+            assert_eq!(event_hash_part(k), event_hash_part(keys[i]));
+            if short && !id.contains(&b'"') && !id.contains(&b',') {
+                assert_eq!(unsafe { event_key(buf.as_ptr(), id.len(), true) }, keys[i]);
+            }
+        }
+        assert!(long > 500, "only {long} long IDs");
+        assert!(interned >= 20, "only {interned} interned IDs");
+        for i in 0..ids.len() {
+            for j in 0..ids.len() {
+                assert_eq!(same_event(keys[i], again[j]), i == j, "{:?} {:?}", ids[i], ids[j]);
+            }
+        }
+    }
+
+    /// The copies of long event IDs through many blocks, an ID too long to
+    /// copy between them, on several threads at once.
+    #[test]
+    fn event_copies_through_block_changes() {
+        let _gate = gate();
+        let name = |t: usize, i: usize| -> Vec<u8> {
+            let mut id = format!("thread-{t}-event-{i}-").into_bytes();
+            id.resize(40 + (i * 7 + t) % 89, b'x');
+            id
+        };
+        let big = |t: usize, i: usize| -> Vec<u8> {
+            let mut id = name(t, i);
+            id.resize(EVENT_BLOCK + (EVENT_BLOCK >> 1) + i, b'y');
+            id
+        };
+        std::thread::scope(|s| {
+            for t in 0..6 {
+                s.spawn(move || {
+                    // About 6 MB of copies a thread, and two IDs of 1.5 MB.
+                    let keys: Vec<u64> =
+                        (0..60_000).map(|i| if i == 4000 || i == 4001 { event_key_slice(&big(t, i)) } else { event_key_slice(&name(t, i)) }).collect();
+                    for (i, &k) in keys.iter().enumerate() {
+                        if i == 4000 || i == 4001 {
+                            // Interned: a second key of it is the same key.
+                            assert!(!event_copied(k));
+                            assert_eq!(k, event_key_slice(&big(t, i)));
+                            continue;
+                        }
+                        assert!(event_copied(k));
+                        let bytes = unsafe { event_bytes(k) };
+                        assert_eq!(bytes, &name(t, i)[..], "thread {t}, ID {i}");
+                        if i % 16 == 0 {
+                            assert!(same_event(k, event_key_slice(bytes)));
+                        }
+                    }
+                    assert!(!same_event(keys[4000], keys[4001]));
+                    assert!(!same_event(keys[4000], keys[3999]) && !same_event(keys[4002], keys[4001]));
+                    let blocks: std::collections::HashSet<u32> = keys.iter().filter(|&&k| event_copied(k)).map(|&k| event_place(k).0 as u32).collect();
+                    assert!(blocks.len() >= 5, "only {} blocks", blocks.len());
+                });
+            }
+        });
+    }
+
+    /// The two kinds of long event key do not mix: an ID of the longest
+    /// copied length and one a byte longer, and keys that agree above the
+    /// place without being copies.
+    #[test]
+    fn event_copies_and_interned_keys_do_not_mix() {
+        let _gate = gate();
+        let at: Vec<u8> = (0..EVENT_COPY_MAX).map(|i| b'k' + (i % 5) as u8).collect();
+        let mut over = at.clone();
+        over.push(b'k');
+        let (a1, a2, o1, o2) = (event_key_slice(&at), event_key_slice(&at), event_key_slice(&over), event_key_slice(&over));
+        assert!(event_copied(a1) && event_copied(a2) && a1 != a2 && same_event(a1, a2));
+        assert!(!event_copied(o1) && o1 == o2 && same_event(o1, o2));
+        assert!(!same_event(a1, o1) && !same_event(o1, a1));
+        // Addresses in one megabyte agree in every bit above the place.
+        let (x, y) = (FALLBACK | 0x7F12_3456_7000, FALLBACK | 0x7F12_3456_8000);
+        assert!((x ^ y) >> EVENT_PLACE_BITS == 0 && !same_event(x, y) && !same_event(y, x));
+        assert_eq!(event_hash_part(x), x);
+        // Bit 62 belongs to another kind of key: never read as a copy.
+        let (x, y) = (FALLBACK | 3 << 61 | 0x10, FALLBACK | 3 << 61 | 0x20);
+        assert!(!event_copied(x) && !same_event(x, y) && event_hash_part(x) == x);
+        // A packed key with bit 61 set is not a copy either.
+        let x = 1u64 << 61 | 0x30;
+        assert!(!event_copied(x) && event_hash_part(x) == x && !same_event(x, x ^ 1));
+    }
+
+    /// With the hash cut to nothing or to two bits, different long IDs
+    /// share their hash bits and are still told apart.
+    #[test]
+    fn event_keys_with_equal_hash_bits() {
+        let _alone = EVENT_MASK_GATE.write().unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_event_hash_mask(u64::MAX);
+            }
+        }
+        let _reset = Reset;
+        for mask in [0u64, 3 << EVENT_HASH_SHIFT, 1 << 63] {
+            set_event_hash_mask(mask);
+            let ids: Vec<Vec<u8>> = (0..400).map(|i| format!("event-{i:05}-{}", "z".repeat(i % 50)).into_bytes()).collect();
+            let a: Vec<u64> = ids.iter().map(|id| event_key_slice(id)).collect();
+            let b: Vec<u64> = std::thread::scope(|s| s.spawn(|| ids.iter().map(|id| event_key_slice(id)).collect()).join().unwrap());
+            let mut shared = 0;
+            for i in 0..ids.len() {
+                for j in 0..ids.len() {
+                    assert_eq!(same_event(a[i], b[j]), i == j, "mask {mask:x}");
+                    shared += usize::from(i != j && event_hash_part(a[i]) == event_hash_part(b[j]));
+                }
+            }
+            assert!(shared > 30_000, "mask {mask:x}: only {shared} pairs share their hash bits");
+        }
+    }
+
+    /// The key holds every block number and offset the directory allows,
+    /// next to any hash, and gives them back.
+    #[test]
+    fn event_key_fields_do_not_overlap() {
+        for h in [0u64, u64::MAX, 0x8000_0000_0000_0000, 0x0000_000F_FFFF_FFFF, 0x1234_5678_9ABC_DEF0] {
+            for id in [0usize, 1, 0x7FFF, 0x8000, EVENT_BLOCKS - 1] {
+                for used in [0usize, 8, EVENT_BLOCK >> 1, EVENT_BLOCK - 16, EVENT_BLOCK - 8] {
+                    let key = event_name(h, id, used);
+                    assert_eq!(event_place(key), (id, used), "hash {h:x}");
+                    assert!(event_copied(key));
+                    let top = FALLBACK | EVENT_COPY | ((h >> 38) << 35);
+                    assert_eq!(event_hash_part(key), top | (top >> 35), "block {id}, byte {used}");
+                    assert_eq!(event_hash_part(key), event_hash_part(event_name(h, 0, 0)));
+                }
+            }
+        }
+        // Hashes that differ only below the bits the key keeps look equal;
+        // hashes that differ in a kept bit do not.
+        assert_eq!(event_hash_part(event_name(1 << 37, 3, 8)), event_hash_part(event_name(0, 4, 16)));
+        assert_ne!(event_hash_part(event_name(1 << 38, 3, 8)), event_hash_part(event_name(0, 3, 8)));
+        assert_ne!(event_hash_part(event_name(1 << 63, 3, 8)), event_hash_part(event_name(0, 3, 8)));
     }
 
     #[test]
